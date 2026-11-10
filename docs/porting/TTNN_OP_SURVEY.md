@@ -550,3 +550,17 @@ None of these was run. Each is a minimal probe to run LATER, under the brief's g
 
 **Housekeeping**
 - **Q19. No writes into the tt-metal tree.** After the first successful mesh open, run `find /home/ttuser/experiments/tt-metal -newer <marker> -type f` to confirm that `TT_METAL_LOGS_PATH`/`TT_METAL_CACHE`/cwd settings keep the runtime from writing `generated/`, kernel caches or `__pycache__` into the tree.
+
+---
+
+## ON-DEVICE RESULTS (2026-11-10, wheel `ttnn==0.81.1`, KMD 2.10.0, firmware bundle 19.13.1, Blackhole; all through `scripts/tt_run.sh` in the chip-masked namespace)
+
+| Probe | Result |
+|-------|--------|
+| Q1 single-process tray mesh | **Works.** `TT_VISIBLE_DEVICES` = 8 BDFs, no MGD, `open_mesh_device(MeshShape(2, 4))`: mesh shape 2x4, device ids 0..7, `/proc/self/fd` holds exactly the 8 tray-3 nodes, open 0.97 s (JIT cache warm; 3.3 s cold). UMD log: "Constructing control plane using auto-discovery". |
+| Q3 fabric on a tray subset | **Works.** `FABRIC_1D` before open, `ttnn.all_reduce` and `all_gather(cluster_axis=...)` run on the 8 chips; only warnings are "Board ... has 8 chips, but expected 32 chips for board type ubb_blackhole" and "No Physical Grouping Descriptor file". |
+| Q4 MPI | A plain `python` (no `mpirun`) opens the mesh; no stray `prte`/`pmix` seen in the job's process tree (not examined exhaustively). |
+| Q6/Q7 which nodes UMD opens | Superseded by ADR-0005 option II: the job's `/dev/tenstorrent` contains only the selected chips (verified for 1 chip and for 8). With 1 chip UMD logs "Opening local chip ids/PCIe ids: {0}/[16] and remote chip ids {}". |
+| Q8/Q19 | Moot: ttnn comes from the wheel in `.venv`, not from the tt-metal tree; private `TT_METAL_CACHE`/`TTNN_CONFIG_OVERRIDES` paths under `.run/`. |
+| Q9 reductions, Q10 matmul, Q11 eltwise, Q12 `elu_bw`, Q15 fp32 all-reduce | See `TOLERANCES.md` and `DECISIONS.md` (ADR-0001 block "MEASURED", ADR-0004 amendment A-1). Raw data: `docs/porting/measurements/`. |
+| Q2 (1x8), Q13, Q14, Q16, Q17, Q18 | **Not run yet** (needed from Phase 2 on: preallocated copies, row gather, trace, per-chip RNG, in-place storage writes). |

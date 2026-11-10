@@ -14,7 +14,7 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 0 | Environment, safety net, research, ADRs | in progress |
+| 0 | Environment, safety net, research, ADRs, device smoke + noise floors | done, **waiting for owner approval** (report sent) |
 | 1 | Reference + parity harness (host only) | pending |
 | 2 | 1-chip (1x1 mesh) forward | pending |
 | 3 | 1-chip backward, optimizer, PPO update | pending |

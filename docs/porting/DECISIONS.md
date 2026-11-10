@@ -24,12 +24,12 @@ phase boundary if the owner asks for `main`: replace `rsl_rl/` with that ref (BR
 `UPSTREAM_SEMANTICS.md` rows and re-run the parity/golden baselines. Still to compare with the version Isaac Lab pins
 (`pip show rsl-rl-lib` on the GPU host) before Phase 7.
 
-## ADR-0001 — Training backend (A: hand-written TTNN fwd/bwd, B: tt-train `ttml`)  — *Proposed: A*
-**Evidence (source-level; nothing is measured on hardware yet — `TTNN_OP_SURVEY.md`).**
+## ADR-0001 — Training backend (A: hand-written TTNN fwd/bwd, B: tt-train `ttml`)  — *Proposed: A (measurements done, see below; awaiting owner approval)*
+**Evidence (source-level survey: `TTNN_OP_SURVEY.md`; hardware measurements: the "MEASURED" block below).**
 - **B (`ttml`) is not viable for v1.** Not built here (`BUILD_TT_TRAIN=OFF`, no `_ttml`); no ELU/tanh/softplus/sqrt/log autograd
   ops, which an ELU-MLP + Gaussian policy needs; bf16-centric (fp32 only for optimizer master weights). Its AdamW(+fp32 master),
   `clip_grad_norm` and DDP `synchronize_gradients` (all-reduce, then multiply by 1/N) are useful design references only.
-- **A needs only ops that exist in v0.81.1:** fp32 matmul/linear (HiFi4 + `fp32_dest_acc_en`, approx off), `elu` + `elu_bw`, `exp/log/
+- **A needs only ops that exist in v0.81.1 (all present; see the measurements below):** fp32 matmul/linear (HiFi4 + `fp32_dest_acc_en`, approx off), `elu` + `elu_bw`, `exp/log/
   sqrt/rsqrt/square/reciprocal`, `where/clamp/minimum/maximum/lt/gt`, fp32 reductions (sum/mean/max, whole tensor), `ttnn.copy` /
   `fill` in place, row gather via `ttnn.gather`/`tosa_gather` (fp32 table, UINT32 index; `ttnn.embedding` is bf16-only so it is
   NOT used), `ttnn.all_reduce` (fp32 TILE, Sum) then ×1/N, and mesh trace capture/replay.
@@ -42,11 +42,25 @@ phase boundary if the owner asks for `main`: replace `rsl_rl/` with that ref (BR
   noise.
 - **Backward:** hand-written per-op VJPs (tt-rl's tape is a reusable oracle for matmul transpose flags, broadcast reductions);
   correctness is judged by gradient parity against upstream torch autograd (BRIEF 3.2), per parameter.
-**Main numerical risk.** fp32 matmul multiplies TF32-class operands (accumulation is fp32), so expect ~1e-3 relative error vs torch.
-This is measured first (noise-floor probe, survey Q10) and sets `TOLERANCES.md`. If parity needs more, the contingency is a split-fp32
-matmul (hi/lo operand decomposition, 2-3 matmuls) — decided only with the measurement in hand (BRIEF 2-9: tolerances are never
-loosened just because a test fails).
-**Decision.** Option A. ADR stays *Proposed* until the Phase 0 noise-floor measurements exist.
+**Main numerical risk — now MEASURED on chip 16 (2026-11-10; `TOLERANCES.md`, repros in `tests/tt/test_noise_floor*.py`).**
+- fp32 matmul with HiFi4 + `fp32_dest_acc_en` (the default config gives the same numbers) has rel_fro **1.17e-3** vs a float64 reference
+  (torch fp32: 2.4e-7), independent of shape (K = 48..1024, M up to 16384) and input distribution (normal / heavy-tailed). HiFi3 1.28e-3,
+  HiFi2 7.2e-3, LoFi 3.1e-2, no fp32 accumulation 8e-3.
+- The contingency "split-fp32 matmul" **does not recover fp32**: multi-pass operand splits (3-6 passes, several bit layouts, K-chunked
+  with exact `ttnn.add` of the partials) bottom out at **3.1e-4**, because even with both operands exactly representable (4 mantissa
+  bits) the matmul result carries a constant relative error of 2.6e-4, independent of K, of `packer_l1_acc` and of chunking
+  (TF32-class precision on the output path). So: no cheap way to fp32-exact matmul; ~4x better for 6x the matmuls is not worth it as
+  the default. The split stays available as a debugging aid only.
+- Everything else that the PPO step needs is fp32-accurate: `exp/log/sqrt/rsqrt/reciprocal/tanh/elu/elu_bw` <= 2 ULP (rel 1.4e-7),
+  `sum`/`mean` over rows ~1e-7, global norm via `sqrt(sum(square))` 2-4e-8, `max` exact, fp32 host<->device round trip bit exact.
+  **Do not use:** `ttnn.var` (rel 2.4e-4; compose the two-pass variance instead: 3.7e-8), the one-pass `E[x^2]-E[x]^2` (9e-4 with a
+  non-zero mean), `fast_and_approximate_mode=True` (exp 2e-2, tanh 2e-3), `ttnn.softplus` (rel 5e-4 at large negative x; not needed in v1).
+- Consequence for tests: component parity against upstream torch is bounded by the matmul noise floor (~1.2e-3 per matmul layer), not by
+  1e-6. Correctness of gradient formulas is therefore checked against an fp64 torch reference with the measured floors, and the
+  end-to-end claim is statistical (multi-seed learning curves, BRIEF Phase 4), exactly as the brief plans. The first mini-batch of an
+  update will see a policy ratio that differs from 1 by ~1e-3 (rollout and update forward use different matmul shapes), which PPO's
+  clipping tolerates; this is a property to document, not to tune away.
+**Decision.** Option A. Evidence now exists; recommended **Accepted** (owner approval requested at the Phase 0 stop).
 
 ## ADR-0002 — Plugin injection point and runner subclass  — *Proposed*
 **Context.** Upstream resolves the algorithm from `cfg["algorithm"]["class_name"]` via `resolve_callable`
@@ -82,7 +96,16 @@ The host has no NVIDIA GPU tooling (`ENV.md`), so Isaac Sim is assumed to run on
 env on the GPU host, ZeroMQ + raw float32 buffers; same-host would connect directly. Alternatives (gRPC, shared memory,
 Arrow Flight) and the measured round-trip/bandwidth are compared in Phase 7. Nothing is built before Phase 7.
 
-## ADR-0004 — Multi-chip statistics synchronisation  — *Proposed*
+## ADR-0004 — Multi-chip statistics synchronisation  — *Proposed (amendment A-1 below is new: gradient sum = gather + sum, not `all_reduce`)*
+**Amendment A-1 (hardware measurement, 2026-11-10, 2x4 mesh on FABRIC_1D, `tests/tt/test_noise_floor_mesh.py`).** The stock fp32
+`ttnn.all_reduce` is NOT fp32-accurate: rel_fro **5.5e-4** vs a float64 sum of the 8 shards (torch fp32 sum: 5.6e-8) at 8K..1M values per
+chip, in every variant (flat, or per mesh axis 1 then 0: 5.7e-4). It is bit-identical across chips and takes 0.23-0.40 ms. The alternative
+`all_gather(dim=0, cluster_axis=1)` then `all_gather(dim=0, cluster_axis=0)` (a pure copy; `all_gather` on a 2x4 mesh needs a
+`cluster_axis` under `FABRIC_1D`) followed by `ttnn.sum(dim=0)` gives **5.1e-8**, bit-identical across chips, 0.3-2.9 ms for 8K..1M values
+per chip; a fixed-order chain of `ttnn.add` gives 2.7e-8 (1.3-1.8 ms). Therefore every place this ADR (and ADR-0001) says "all-reduce then
+x 1/N" means: **gather along both mesh axes, sum in fp32, multiply by 1/N** (gradients, normalizer count/sum/second moment, KL). Gradient
+buffers of an RL MLP are small (1e5-1e6 values), so the 8x gather volume is irrelevant. `ttnn.all_reduce` stays a fallback only if a
+tolerance derived from 5.5e-4 is acceptable for that quantity.
 **Context.** What upstream multi-GPU actually synchronises (`UPSTREAM_MAP.md` §9):
 
 | What | Upstream | Source |

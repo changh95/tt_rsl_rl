@@ -1,10 +1,19 @@
 # TTNN issues, unsupported ops and workarounds
 
-Per BRIEF 2-7: for every TTNN bug or unsupported op, add a minimal repro script (under `docs/porting/repros/`), the
-observed vs expected behaviour, the tt-metal version, and the documented workaround. Never patch the tt-metal tree.
+Per BRIEF 2-7: for every TTNN bug or unsupported op, a minimal repro, the observed vs expected behaviour, the tt-metal version, and the
+documented workaround. Never patch the tt-metal tree. The repros are the device tests named below (each is a few lines of ttnn; run them
+through `scripts/tt_run.sh`, see the docstring of each file).
 
-Tested stack: tt-metal `v0.81.1` (`d80d9482`), tt-umd `889651e`.
+Tested stack: PyPI wheel `ttnn==0.81.1` (same version as tt-metal `v0.81.1`, `d80d9482`), tt-umd `889651e`, sfpi 7.89.0, KMD 2.10.0, firmware bundle 19.13.1, Blackhole.
 
-| # | Date | Op / feature | Symptom | Repro | Workaround | Status |
-|---|------|--------------|---------|-------|------------|--------|
-| *(none yet)* | | | | | | |
+| # | Date | Op / feature | Symptom (observed vs expected) | Repro | Workaround | Status |
+|---|------|--------------|--------------------------------|-------|------------|--------|
+| T-1 | 2026-11-10 | `ttnn.close_mesh_device` | The `/dev/tenstorrent/N` node stays open (visible in `/proc/self/fd`) after the mesh is closed; the UMD cluster is torn down at process exit ("Closing devices in cluster" is logged after the test body). Expected: node released at close | `tests/tt/test_smoke_device.py` (`fds_held_after_close`) | One open mesh per process; tests use a session-scoped mesh; `device.py` still verifies held nodes are a subset of the selection. Not a correctness problem | observed, by design? |
+| T-2 | 2026-11-10 | fp32 `ttnn.matmul` precision | rel_fro 1.2e-3 vs float64 with HiFi4 + `fp32_dest_acc_en` (torch fp32: 2.4e-7); the result carries a ~2.6e-4 floor even with exactly representable operands, independent of K, `packer_l1_acc` and chunking; operand splitting only reaches 3.1e-4. The docs say "FLOAT32 supported" without quantifying | `tests/tt/test_noise_floor.py`, `test_noise_floor_split.py` | Accept the floor; tolerances in `TOLERANCES.md`; correctness checks against fp64 with those floors | open (hardware property) |
+| T-3 | 2026-11-10 | `ttnn.var` (fp32, dim 0) | rel_fro 2.4e-4 (N=4096) / 1.3e-5 (N=65536) vs fp64; expected ~1e-7 like `mean`/`sum` | `tests/tt/test_noise_floor.py::test_reduction_noise_floor`, `test_noise_floor_split.py::test_variance_variants` | Compose `mean((x - mean(x))^2)` (two-pass): 3.7e-8. Do not use the one-pass form (9e-4 with non-zero mean) | open |
+| T-4 | 2026-11-10 | `ttnn.all_reduce` fp32 TILE (Sum) | rel_fro 5.5e-4 vs fp64 sum of 8 shards; docs say only "FLOAT32 takes a dedicated reduction path". Expected ~1e-7 | `tests/tt/test_smoke_tray.py::test_eight_chip_all_reduce_fabric_1d`, `test_noise_floor_mesh.py` | `all_gather` along both mesh axes + `ttnn.sum` (5.1e-8, bit-identical across chips). ADR-0004 amendment A-1 | open |
+| T-5 | 2026-11-10 | `ttnn.all_gather` on a 2x4 mesh under `FABRIC_1D` | `TT_FATAL ... fabric_is_2d \|\| cluster_axis.has_value() \|\| mesh_shape is 1D` when no `cluster_axis` is given (a 2D mesh needs one axis at a time) | `tests/tt/test_noise_floor_mesh.py` (first revision, see git history of that file) | `all_gather(dim=0, cluster_axis=1)` then `all_gather(dim=0, cluster_axis=0)`; `all_reduce` accepts `cluster_axis=None` | works as designed; documentation gap |
+| T-6 | 2026-11-10 | `fast_and_approximate_mode=True` | `exp` rel_fro 2.1e-2, `tanh` 2.4e-3 on fp32; `softplus`/`elu` reject the keyword (`TypeError`) | `tests/tt/test_noise_floor.py::test_eltwise_noise_floor` | Never set it on the TT path | by design |
+| T-7 | 2026-11-10 | `ttnn.softplus` fp32 | max_rel 4.9e-4 (large negative x), consistent with a naive `log(1 + exp(x))` | same | Not needed in v1; compose a stable form if ever required | open |
+| T-8 | 2026-11-10 | process niceness | Under `nice -n 10` each worker thread logs "Unable to set process priority to 0" (cosmetic, 16 lines per open) | `.run/logs/smoke8a.log` | Do not use `nice` for short jobs; ignore the warning otherwise | cosmetic |
+| T-9 | 2026-11-10 | UMD topology warning | "Board ... has 8 chips, but expected 32 chips for board type ubb_blackhole" and "No Physical Grouping Descriptor file found" at every open: expected for a tray subset of a 32-chip Galaxy board; no functional effect seen (2x4 mesh opens, FABRIC_1D collectives work) | every smoke log | Ignore; do not provide a descriptor file | informational |

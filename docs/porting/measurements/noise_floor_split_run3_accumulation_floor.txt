@@ -1,0 +1,12 @@
+floor K=32: {'fp32acc=True,packer_l1_acc=True': 0.00026108136242935424, 'fp32acc=True,packer_l1_acc=False': 0.00026108136242935424, 'fp32acc=False,packer_l1_acc=True': 0.0020984747610828225, 'K-chunked(32)+ttnn.add': 0.00026108136242935424}
+floor K=64: {'fp32acc=True,packer_l1_acc=True': 0.00026407844547740193, 'fp32acc=True,packer_l1_acc=False': 0.00026407844547740193, 'fp32acc=False,packer_l1_acc=True': 0.0027699550308301958, 'K-chunked(32)+ttnn.add': 0.00026407844547740193}
+floor K=128: {'fp32acc=True,packer_l1_acc=True': 0.00026337339287856395, 'fp32acc=True,packer_l1_acc=False': 0.00026337339287856395, 'fp32acc=False,packer_l1_acc=True': 0.003655409667451915, 'K-chunked(32)+ttnn.add': 0.00026337339287856395}
+floor K=256: {'fp32acc=True,packer_l1_acc=True': 0.00026313216985035255, 'fp32acc=True,packer_l1_acc=False': 0.00026313216985035255, 'fp32acc=False,packer_l1_acc=True': 0.0045853277013582355, 'K-chunked(32)+ttnn.add': 0.00026313216985035255}
+floor K=512: {'fp32acc=True,packer_l1_acc=True': 0.000264487438954388, 'fp32acc=True,packer_l1_acc=False': 0.000264487438954388, 'fp32acc=False,packer_l1_acc=True': 0.005769309292382802, 'K-chunked(32)+ttnn.add': 0.000264487438954388}
+floor K=2048: {'fp32acc=True,packer_l1_acc=True': 0.0002635345722892991, 'fp32acc=True,packer_l1_acc=False': 0.0002635345722892991, 'fp32acc=False,packer_l1_acc=True': 0.01012239285526416, 'K-chunked(32)+ttnn.add': 0.0002635345722892991}
+3x8/3x8 (6 mm/chunk) 128 {'rel_fro': 0.00031322947209705133, 'matmuls_total': 24}
+2x10/2x10 all (4 mm/chunk) 32 {'rel_fro': 0.0005734934457962218, 'matmuls_total': 64}
+2x10/2x10 all (4 mm/chunk) 128 {'rel_fro': 0.0005734887818747043, 'matmuls_total': 16}
+2x10/3x7 (6 mm/chunk) 32 {'rel_fro': 0.00031325458595441135, 'matmuls_total': 96}
+2x10/3x7 (6 mm/chunk) 128 {'rel_fro': 0.00031325584172466915, 'matmuls_total': 24}
+chunked_split: {'plain_HiFi4': 0.00116599902991451, '3x8/3x8 (6 mm/chunk) chunk=32': {'rel_fro': 0.0003132288385766996, 'matmuls_total': 96}, '3x8/3x8 (6 mm/chunk) chunk=128': {'rel_fro': 0.00031322947209705133, 'matmuls_total': 24}, '2x10/2x10 all (4 mm/chunk) chunk=32': {'rel_fro': 0.0005734934457962218, 'matmuls_total': 64}, '2x10/2x10 all (4 mm/chunk) chunk=128': {'rel_fro': 0.0005734887818747043, 'matmuls_total': 16}, '2x10/3x7 (6 mm/chunk) chunk=32': {'rel_fro': 0.00031325458595441135, 'matmuls_total': 96}, '2x10/3x7 (6 mm/chunk) chunk=128': {'rel_fro': 0.00031325584172466915, 'matmuls_total': 24}}

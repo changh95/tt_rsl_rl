@@ -1,0 +1,104 @@
+{
+  "t_open_s": 0.44,
+  "matmul": [
+    {
+      "mkn": [
+        64,
+        128,
+        96
+      ],
+      "fidelity": "MathFidelity.LoFi",
+      "max_abs": 1.4273231197783502,
+      "rel_fro": 0.03172517518835416,
+      "torch_fp32_rel_fro": 2.0577706061142627e-07
+    },
+    {
+      "mkn": [
+        64,
+        128,
+        96
+      ],
+      "fidelity": "MathFidelity.HiFi2",
+      "max_abs": 0.36041332973928775,
+      "rel_fro": 0.007197457635850472,
+      "torch_fp32_rel_fro": 2.0577706061142627e-07
+    },
+    {
+      "mkn": [
+        64,
+        128,
+        96
+      ],
+      "fidelity": "MathFidelity.HiFi3",
+      "max_abs": 0.06194760097952212,
+      "rel_fro": 0.0012727599470200325,
+      "torch_fp32_rel_fro": 2.0577706061142627e-07
+    },
+    {
+      "mkn": [
+        64,
+        128,
+        96
+      ],
+      "fidelity": "MathFidelity.HiFi4",
+      "max_abs": 0.05550839199514712,
+      "rel_fro": 0.0011611552622392556,
+      "torch_fp32_rel_fro": 2.0577706061142627e-07
+    },
+    {
+      "mkn": [
+        2048,
+        512,
+        256
+      ],
+      "fidelity": "MathFidelity.LoFi",
+      "max_abs": 3.3664474107190188,
+      "rel_fro": 0.03095925541829357,
+      "torch_fp32_rel_fro": 2.4109680769845386e-07
+    },
+    {
+      "mkn": [
+        2048,
+        512,
+        256
+      ],
+      "fidelity": "MathFidelity.HiFi2",
+      "max_abs": 0.9420942433066131,
+      "rel_fro": 0.007208399048259476,
+      "torch_fp32_rel_fro": 2.4109680769845386e-07
+    },
+    {
+      "mkn": [
+        2048,
+        512,
+        256
+      ],
+      "fidelity": "MathFidelity.HiFi3",
+      "max_abs": 0.15786877943942557,
+      "rel_fro": 0.001274711344035379,
+      "torch_fp32_rel_fro": 2.4109680769845386e-07
+    },
+    {
+      "mkn": [
+        2048,
+        512,
+        256
+      ],
+      "fidelity": "MathFidelity.HiFi4",
+      "max_abs": 0.14037457777926932,
+      "rel_fro": 0.0011671411403809638,
+      "torch_fp32_rel_fro": 2.4109680769845386e-07
+    }
+  ],
+  "arch": "Arch.BLACKHOLE",
+  "grid": "12-10",
+  "dram_grid": "8-1",
+  "device_ids": [
+    0
+  ],
+  "mesh_shape": "MeshShape([1, 1])",
+  "roundtrip_bit_exact": true,
+  "fds_held_after_close": [
+    "/dev/tenstorrent/16"
+  ]
+}

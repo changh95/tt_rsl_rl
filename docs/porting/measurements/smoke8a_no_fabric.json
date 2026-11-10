@@ -1,0 +1,36 @@
+{
+  "t_open_s": 0.97,
+  "shape": "MeshShape([2, 4])",
+  "num_devices": 8,
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "grid": "12-10",
+  "matmul_rel_fro_per_chip": [
+    0.0011563479077433187,
+    0.0011791936764340898,
+    0.0011769581855348675,
+    0.001166253840099978,
+    0.0011737866948277073,
+    0.0011707703217739838,
+    0.0011800910618108456,
+    0.0011735884669480483
+  ],
+  "fds_held_after_close": [
+    "/dev/tenstorrent/16",
+    "/dev/tenstorrent/17",
+    "/dev/tenstorrent/18",
+    "/dev/tenstorrent/19",
+    "/dev/tenstorrent/20",
+    "/dev/tenstorrent/21",
+    "/dev/tenstorrent/22",
+    "/dev/tenstorrent/23"
+  ]
+}

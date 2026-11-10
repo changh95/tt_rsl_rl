@@ -1,0 +1,36 @@
+{
+  "all_reduce": [
+    {
+      "values_per_chip": 8192,
+      "rel_fro_vs_fp64_max_over_chips": 0.0006503248153544519,
+      "torch_fp32_sum_rel": 5.668201425920911e-08,
+      "max_abs_spread_between_chips": 0.0,
+      "ms_per_all_reduce": 0.338
+    },
+    {
+      "values_per_chip": 131072,
+      "rel_fro_vs_fp64_max_over_chips": 0.0006421653642069536,
+      "torch_fp32_sum_rel": 5.627598994341017e-08,
+      "max_abs_spread_between_chips": 0.0,
+      "ms_per_all_reduce": 0.344
+    },
+    {
+      "values_per_chip": 2097152,
+      "rel_fro_vs_fp64_max_over_chips": 0.0006424326791575868,
+      "torch_fp32_sum_rel": 5.619371720640407e-08,
+      "max_abs_spread_between_chips": 0.0,
+      "ms_per_all_reduce": 0.564
+    }
+  ],
+  "t_open_s": 6.4,
+  "fds_held_after_close": [
+    "/dev/tenstorrent/16",
+    "/dev/tenstorrent/17",
+    "/dev/tenstorrent/18",
+    "/dev/tenstorrent/19",
+    "/dev/tenstorrent/20",
+    "/dev/tenstorrent/21",
+    "/dev/tenstorrent/22",
+    "/dev/tenstorrent/23"
+  ]
+}

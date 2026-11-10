@@ -5,7 +5,8 @@ Opens NO device. Run it only through the wrapper (the import then happens inside
 
     scripts/tt_run.sh --chips 16 --timeout 300 --tag probe -- python scripts/probe_ttnn_api.py [dotted.name ...]
 
-With no argument a default list is printed; with arguments (e.g. `ttnn.MeshDevice`) only those objects are described.
+With no argument a default list is printed; with arguments (names relative to the ttnn module, e.g. `all_reduce`) only those
+objects are described.
 """
 
 import inspect
@@ -13,12 +14,12 @@ import sys
 
 import ttnn
 
-DEFAULT = ["ttnn.WormholeComputeKernelConfig", "ttnn.MeshDevice", "ttnn.synchronize_device", "ttnn.all_reduce", "ttnn.ttnn.Tensor"]
+DEFAULT = ["WormholeComputeKernelConfig", "synchronize_device", "all_reduce", "ttnn.Tensor"]
 
 
 def resolve(dotted: str):
-    obj = sys.modules[dotted.split(".")[0]]
-    for part in dotted.split(".")[1:]:
+    obj = ttnn
+    for part in dotted.split("."):
         obj = getattr(obj, part, None)
         if obj is None:
             return None

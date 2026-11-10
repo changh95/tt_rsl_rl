@@ -1,0 +1,84 @@
+{
+  "n=256": {
+    "values_per_chip": 8192,
+    "torch_fp32_sum": 2.751433901612293e-08,
+    "all_reduce": {
+      "rel_fro": 0.0005583002113233642,
+      "chips_bitwise_identical": true,
+      "ms": 0.236
+    },
+    "all_reduce(axis1)+all_reduce(axis0)": {
+      "rel_fro": 0.0005734566513497205,
+      "chips_bitwise_identical": true,
+      "ms": 0.232
+    },
+    "all_gather(2 axes)+ttnn.sum": {
+      "rel_fro": 5.107748755441511e-08,
+      "chips_bitwise_identical": true,
+      "ms": 0.335
+    },
+    "all_gather+sequential_add": {
+      "rel_fro": 2.751433901612293e-08,
+      "chips_bitwise_identical": true,
+      "ms": 1.721
+    }
+  },
+  "n=4096": {
+    "values_per_chip": 131072,
+    "torch_fp32_sum": 2.7466880003477807e-08,
+    "all_reduce": {
+      "rel_fro": 0.0005498043289222026,
+      "chips_bitwise_identical": true,
+      "ms": 0.349
+    },
+    "all_reduce(axis1)+all_reduce(axis0)": {
+      "rel_fro": 0.0005677898519817556,
+      "chips_bitwise_identical": true,
+      "ms": 0.403
+    },
+    "all_gather(2 axes)+ttnn.sum": {
+      "rel_fro": 5.1196492939451046e-08,
+      "chips_bitwise_identical": true,
+      "ms": 0.413
+    },
+    "all_gather+sequential_add": {
+      "rel_fro": 2.7466880003477807e-08,
+      "chips_bitwise_identical": true,
+      "ms": 1.297
+    }
+  },
+  "n=32768": {
+    "values_per_chip": 1048576,
+    "torch_fp32_sum": 2.7389414502153812e-08,
+    "all_reduce": {
+      "rel_fro": 0.0005489421323729812,
+      "chips_bitwise_identical": true,
+      "ms": 0.315
+    },
+    "all_reduce(axis1)+all_reduce(axis0)": {
+      "rel_fro": 0.000567351943328186,
+      "chips_bitwise_identical": true,
+      "ms": 0.312
+    },
+    "all_gather(2 axes)+ttnn.sum": {
+      "rel_fro": 5.1018676620351966e-08,
+      "chips_bitwise_identical": true,
+      "ms": 2.918
+    },
+    "all_gather+sequential_add": {
+      "rel_fro": 2.7389414502153812e-08,
+      "chips_bitwise_identical": true,
+      "ms": 1.776
+    }
+  },
+  "fds_held": [
+    "/dev/tenstorrent/16",
+    "/dev/tenstorrent/17",
+    "/dev/tenstorrent/18",
+    "/dev/tenstorrent/19",
+    "/dev/tenstorrent/20",
+    "/dev/tenstorrent/21",
+    "/dev/tenstorrent/22",
+    "/dev/tenstorrent/23"
+  ]
+}

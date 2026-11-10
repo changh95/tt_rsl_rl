@@ -76,7 +76,13 @@ def test_one_chip_guarded_open_roundtrip_and_matmul():
                 print(f"matmul {m}x{k}x{n} {str(fid):>18}: rel_fro={rel:.3e} max_abs={mx:.3e}  (torch fp32: {base_rel:.3e})")
                 assert rel < 0.1, "garbage result (this is a sanity bound, not a tolerance)"
 
-    assert list_open_tt_nodes() == set(), "all device fds must be gone after close"
+    # Observed on the first run (2026-11-10): `close_mesh_device` does NOT release the /dev node; tt-metal tears the UMD cluster down at
+    # process exit ("Closing devices in cluster" is logged after the test body). So we record what is still held and only require it
+    # to stay inside the selection; one process = one open mesh, and tests share a session-scoped mesh rather than reopening.
+    still_held = sorted(list_open_tt_nodes())
+    report["fds_held_after_close"] = still_held
+    print("fds still held after close_mesh_device:", still_held)
+    assert set(still_held) <= {"/dev/tenstorrent/16"}
     RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / "smoke1_chip16.json").write_text(json.dumps(report, indent=2))
     print("pid", os.getpid(), "done")
