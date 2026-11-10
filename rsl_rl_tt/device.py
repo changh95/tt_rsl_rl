@@ -7,12 +7,15 @@
       the single source of truth; nothing about the tray is hard-coded here);
   (b) the job runs under `scripts/tt_run.sh` (tray lock held, `RSL_RL_TT_LOCK_HELD == TT_TRAY_ID`);
   (c) sysfs maps every selected `/dev/tenstorrent/N` to the BDF that `TT_VISIBLE_DEVICES` names (a symlink read, no device open);
-  (d) the requested mesh shape matches the number of selected chips.
+  (d) the requested mesh shape matches the number of selected chips;
+  (e) the `/dev/tenstorrent` this process can SEE lists exactly the selected chips (DECISIONS ADR-0005, option II).
 Only then `ttnn` is imported and the mesh opened. Right after opening it reads `/proc/self/fd`: if this process holds any
 `/dev/tenstorrent/*` node outside the selected chips, the mesh is closed immediately and `TrayGuardError` is raised.
 
-Known limit (docs/porting/TTNN_OP_SURVEY.md 11.3): UMD enumeration briefly open()s and closes EVERY node on the host before it
-filters by TT_VISIBLE_DEVICES. The fd check cannot see those closed probes; hard isolation needs OS-level help (DECISIONS ADR-0005).
+Why (e): UMD enumeration (docs/porting/TTNN_OP_SURVEY.md 11.3) open()s and closes EVERY node it can see before it filters by
+TT_VISIBLE_DEVICES, and the fd check cannot see those closed probes. `scripts/tt_run.sh` therefore starts every job in a private
+user+mount namespace in which `/dev/tenstorrent` contains only the selected chips (`scripts/ns_mask_dev.sh`), so other trays' nodes
+do not exist for the job. Check (e) refuses to continue when that mask is absent, e.g. when the file is run without tt_run.sh.
 
 Closing is guaranteed by `TrayMesh.close()` (context manager / `finally`) and by an `atexit` hook. No other module may call
 `ttnn.open_*` / `Create*Device` (tests/tt/test_repo_invariants.py enforces this).
@@ -172,6 +175,27 @@ def list_open_tt_nodes(fd_dir: str = "/proc/self/fd") -> set[str]:
     return nodes
 
 
+def list_visible_dev_nodes(dev_dir: str = DEV_PREFIX.rstrip("/")) -> set[str]:
+    """Entries of `/dev/tenstorrent` as this process sees them (a directory listing; no node is opened)."""
+    try:
+        return {f"{dev_dir}/{name}" for name in os.listdir(dev_dir)}
+    except FileNotFoundError:
+        return set()
+
+
+def verify_dev_view(cfg: TrayConfig, visible: set[str]) -> None:
+    """The job's /dev/tenstorrent must show exactly the selected chips (namespace mask, ADR-0005 option II)."""
+    extra = sorted(visible - cfg.selected_nodes)
+    missing = sorted(cfg.selected_nodes - visible)
+    if extra:
+        raise TrayGuardError(
+            f"/dev/tenstorrent shows nodes that this job may not use: {extra}. The job must run in the private namespace that "
+            "scripts/tt_run.sh creates (scripts/ns_mask_dev.sh); refusing to let UMD enumerate other trays' chips."
+        )
+    if missing:
+        raise TrayGuardError(f"selected nodes are not visible in /dev/tenstorrent: {missing}")
+
+
 def verify_open_nodes(cfg: TrayConfig, opened: set[str]) -> None:
     outside_tray = sorted(n for n in opened if n not in cfg.allowed_nodes)
     outside_selection = sorted(n for n in opened if n in cfg.allowed_nodes and n not in cfg.selected_nodes)
@@ -192,6 +216,7 @@ class Deps:
     load_expected_env: Callable[[str | None], dict[str, str | None]] = field(default_factory=lambda: load_expected_env)
     read_bdf: Callable[[int], str | None] = field(default_factory=lambda: read_bdf_from_sysfs)
     list_open_nodes: Callable[[], set[str]] = field(default_factory=lambda: list_open_tt_nodes)
+    list_visible_nodes: Callable[[], set[str]] = field(default_factory=lambda: list_visible_dev_nodes)
     import_ttnn: Callable[[], Any] = field(default_factory=lambda: (lambda: importlib.import_module("ttnn")))
 
 
@@ -271,6 +296,7 @@ def open_tray_mesh(
     rows, cols = mesh_shape
     if rows * cols != len(cfg.chips):
         raise TrayGuardError(f"mesh shape {rows}x{cols} needs {rows * cols} chips but {len(cfg.chips)} are selected: {cfg.chips}")
+    verify_dev_view(cfg, deps.list_visible_nodes())
 
     ttnn = deps.import_ttnn()  # imported only after every check passed
     fabric_set, mesh = False, None

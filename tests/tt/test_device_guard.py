@@ -65,13 +65,16 @@ class FakeTtnn:
         self.calls.append(("close_mesh_device", mesh))
 
 
-def make_deps(env, ttnn=None, opened=None, bdf=None, importer=None):
+def make_deps(env, ttnn=None, opened=None, bdf=None, importer=None, visible=None):
     ttnn = ttnn or FakeTtnn()
     return dev.Deps(
         environ=env,
         load_expected_env=lambda chips: expected_for(make_env(chips=[int(c) for c in chips.split()]) if chips else make_env()),
         read_bdf=(lambda n: BDFS[n]) if bdf is None else bdf,
         list_open_nodes=lambda: set(opened if opened is not None else {f"/dev/tenstorrent/{n}" for n in NODES}),
+        list_visible_nodes=lambda: set(
+            visible if visible is not None else {f"/dev/tenstorrent/{c}" for c in env["TT_TRAY_CHIPS"].split()}
+        ),
         import_ttnn=importer or (lambda: ttnn),
     ), ttnn
 
@@ -202,6 +205,37 @@ def test_failed_open_cleans_up_fabric():
         dev.open_tray_mesh((2, 4), fabric_config="FABRIC_1D", deps=deps)
     assert ttnn.calls[-1] == ("set_fabric_config", "DISABLED")
     assert dev._ACTIVE is None
+
+
+# ---- the namespace mask (ADR-0005 option II) --------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "visible, match",
+    [
+        ({f"/dev/tenstorrent/{n}" for n in NODES} | {"/dev/tenstorrent/3"}, "may not use"),  # another tray's node is visible
+        ({f"/dev/tenstorrent/{n}" for n in range(0, 24)}, "may not use"),  # the unmasked host view
+        ({f"/dev/tenstorrent/{n}" for n in NODES[:-1]}, "not visible"),  # a selected chip is missing
+        (set(), "not visible"),
+    ],
+    ids=["extra-node", "unmasked-host", "missing-selected", "empty"],
+)
+def test_unmasked_or_incomplete_dev_view_refuses_before_import(visible, match):
+    deps, ttnn = make_deps(make_env(), visible=visible, importer=_never_import)
+    with pytest.raises(dev.TrayGuardError, match=match):
+        dev.open_tray_mesh((2, 4), deps=deps)
+    assert ttnn.calls == []
+
+
+def test_subset_selection_must_not_see_the_other_chips_of_the_tray_either():
+    deps, _ = make_deps(make_env(chips=[16]), visible={"/dev/tenstorrent/16", "/dev/tenstorrent/17"}, importer=_never_import)
+    with pytest.raises(dev.TrayGuardError, match="may not use"):
+        dev.open_tray_mesh((1, 1), deps=deps)
+
+
+def test_list_visible_dev_nodes_lists_names_only(tmp_path):
+    (tmp_path / "16").write_text("")
+    (tmp_path / "17").write_text("")
+    assert dev.list_visible_dev_nodes(str(tmp_path)) == {f"{tmp_path}/16", f"{tmp_path}/17"}
+    assert dev.list_visible_dev_nodes(str(tmp_path / "missing")) == set()
 
 
 # ---- fd listing -------------------------------------------------------------------------------------------------------

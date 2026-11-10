@@ -6,19 +6,23 @@ Evidence sources: `UPSTREAM_MAP.md`, `UPSTREAM_SEMANTICS.md`, `TTRL_NOTES.md`, `
 
 ## Clarifications of the brief (owner approval requested)
 
-### C-1 — Gradient clipping is per model in upstream, not one joint norm  — *Proposed*
+### C-1 — Gradient clipping is per model in upstream, not one joint norm  — *Accepted (owner, 2026-11-10: "그래")*
 BRIEF 3.7 lists "max_grad_norm over actor+critic as a whole". Upstream v5.5.2 clips **separately**:
 `clip_grad_norm_(actor.parameters(), max_grad_norm)` and `clip_grad_norm_(critic.parameters(), max_grad_norm)`
 (`rsl_rl/algorithms/ppo.py:309-310`), after the multi-GPU gradient mean (`:305-306`). The actor group includes the std
 parameter. Because the project goal is numerical equivalence with upstream (BRIEF §1.2), the port implements **two
 independent norms (actor, critic)** — a joint norm would change the update whenever one norm exceeds the threshold.
 Verified directly in the source by the maintainer of this file (2026-11-10).
-*Action requested:* confirm "follow upstream (two norms)".
+*Decision:* follow upstream (two norms: actor incl. std, critic).
 
-### C-2 — `RSL_RL_VERSION = v5.5.2` is provisional  — *Pending*
-Chosen as the latest upstream tag. It must be compared with the version the user's Isaac Lab pins (`pip show rsl-rl-lib`
-on the GPU host) before Phase 1 golden baselines are produced. Switching later only replaces `rsl_rl/` (BRIEF 3.1), but
-golden curves and `UPSTREAM_SEMANTICS.md` rows must then be re-checked.
+### C-2 — `RSL_RL_VERSION = v5.5.2`  — *Accepted for now (owner, 2026-11-10: "최신 버전으로 해줘 일단")*
+`v5.5.2` is the newest upstream **release tag** (checked with `git fetch upstream --tags` on 2026-11-10). Upstream `main` is 4 untagged
+commits ahead (`b61a24b` SAC + FlashSAC, `feb2267` PPO configuration checks #260, `a2176ae` algorithm statistics for the logger #265,
+`8945bdc` removal of unused `init_weights` #262; all committed 2026-11-10). They are not a release and `main` is still moving, so the
+pin stays on the tag; the PPO-related ones (#260/#265) are cheap to adopt later. Bump plan: when upstream tags a newer release, or at a
+phase boundary if the owner asks for `main`: replace `rsl_rl/` with that ref (BRIEF 3.1), update `version_pin.py`, re-check the
+`UPSTREAM_SEMANTICS.md` rows and re-run the parity/golden baselines. Still to compare with the version Isaac Lab pins
+(`pip show rsl-rl-lib` on the GPU host) before Phase 7.
 
 ## ADR-0001 — Training backend (A: hand-written TTNN fwd/bwd, B: tt-train `ttml`)  — *Proposed: A*
 **Evidence (source-level; nothing is measured on hardware yet — `TTNN_OP_SURVEY.md`).**
@@ -106,7 +110,7 @@ upstream gloo with `world_size=N`), not a single big batch. A periodic consisten
 **Consequences.** Differs deliberately from tt-rl's periodic parameter averaging (`TTRL_NOTES.md`), which is on the
 DO-NOT-USE list.
 
-## ADR-0005 — Isolation of the other trays' device nodes  — *Pending: owner decision (touches BRIEF 2-1 / 2-2)*
+## ADR-0005 — Isolation of the other trays' device nodes  — *Accepted: option II, delegated to the assistant by the owner on 2026-11-10 ("다른 트레이의 작업을 방해하지 않는 한으로 너가 해줘")*
 **Finding (`TTNN_OP_SURVEY.md` 11.3, source-level; not yet observed on hardware).** `TT_VISIBLE_DEVICES` (BDF tokens) makes UMD
 *initialise and use* only the listed chips. But UMD's enumeration `open()`s every `/dev/tenstorrent/N` on the host (O_RDWR, one
 `GET_DEVICE_INFO` ioctl, then `close()`), 1 to 3 times per enumeration call and from several callers, before it filters. Two
@@ -130,9 +134,24 @@ O_WRONLY/O_RDWR open fails with EACCES; opening `/dev/null` directly inside the 
   *Unverified:* that the real allowed nodes still open O_RDWR from inside the namespace, and that UMD/hugepage/sysfs access works
   there. Verification plan: the first device job opens only `--chips 16` and checks the fd list; if anything fails, fall back to I or III.
 - **III. OS-level isolation by an administrator** (ACL/udev permissions or a container exposing only 8 nodes). Strongest, needs root.
-**Until you decide, no device is opened.**
+**Decision (2026-11-10): option II.** The owner delegated the choice with one condition: never disturb the jobs other agents run on
+the other trays. Option I would send an open() (and, per the tt-kmd comment, a firmware message) to every other tray's chip on every run;
+II touches nothing but this job's own namespace. Implemented as an allow-list, which is stronger than the proposal above (UMD lists
+`/dev/tenstorrent` by file name only — `PCIDevice::get_all_device_ids`, `pci_device.cpp:1168` — so placeholder files work):
+`scripts/tt_run.sh` -> `unshare --user --map-root-user --mount` -> `scripts/ns_mask_dev.sh` mounts a private tmpfs, bind-mounts only the
+SELECTED chips (`--chips`) onto placeholders in it and moves it over `/dev/tenstorrent`. Other trays' nodes do not exist for the job, so
+nothing can open them; the nodes of tray 3 that this run did not select are hidden too. The job is uid 0 of its own user namespace
+(maps to our uid, no host privilege); PID/IPC/network/`/dev/shm`/`/tmp` are shared with the host, so tray-wide coordination (our flock,
+the kernel-side kmd locks, UMD's `/dev/shm` objects) is unchanged and other people's processes see nothing. `tt_run.sh` has no way to
+skip the mask and refuses to start the job when it cannot be built. `device.py` independently requires that `/dev/tenstorrent` shows
+exactly the selected chips before it imports ttnn (check (e)), and still reads `/proc/self/fd` after opening (2-2(b)/(c) unchanged).
+**Verified on this host (no device open):** 18 host tests with fake nodes (view, host untouched, char-device bind opens O_RDWR, refusal
+paths, exec keeps the PID); on the real tray: a job started with `--chips 16` sees exactly `/dev/tenstorrent/16` (a character device),
+holds no tenstorrent fd, sysfs BDF and view checks pass.
+**Still to verify on hardware (first device job, chip 16 only):** the real node opens O_RDWR from inside the namespace and UMD/KMD work
+there (hugepages/sysfs/ioctls); if not, stop and report (fall back to I/III only with the owner).
 
-## ADR-0006 — How `import ttnn` is provided  — *Pending: owner decision (BRIEF 2-7: ttnn/tt-metal build and versions)*
+## ADR-0006 — How `import ttnn` is provided  — *Accepted: option a, PyPI wheel (owner, 2026-11-10: "그래")*
 **Finding.** `/home/ttuser/experiments/tt-metal` was configured with `WITH_PYTHON_BINDINGS=OFF`: there is no `_ttnn.so`, so
 `import ttnn` cannot work from it (`ttml` is not built either). Someone else changed that tree while the survey ran (egg-info
 removed, CMake reconfigured with tests ON at 17:19), so it is also not a stable base. Pure-Python `ttnn` files are not enough.
@@ -147,6 +166,15 @@ removed, CMake reconfigured with tests ON at 17:19), so it is also not a stable 
   never in the shared tree).
 - **c. Reuse another tree's `_ttnn.so`** — rejected: ABI must match the `libtt_metal.so` it links; other people's trees.
 `scripts/ttnn_env.sh` currently only sets hygiene variables (private `TT_METAL_CACHE`/`TT_METAL_LOGS_PATH`, no bytecode in trees).
+
+**Done (2026-11-10), all inside `.venv`:** `pip install ttnn==0.81.1` (dry-run first: only pure-Python deps were new — click, graphviz, loguru,
+matplotlib, pandas, pyyaml, seaborn and their dependencies; torch 2.11.0+cpu and numpy 1.26.4 untouched). **sfpi:** the wheel does not ship the
+riscv toolchain and the JIT looks in `<ttnn>/runtime/sfpi`, then `/opt/tenstorrent/sfpi`. The host's `/opt/tenstorrent/sfpi` is 7.67.0 and
+the wheel needs **7.89.0** (`ttnn/tt_metal/sfpi-version`), so the official release `sfpi_7.89.0_x86_64_debian.txz` was downloaded from
+github.com/tenstorrent/sfpi, its sha256 (`de16ebb1...b610b954`, from the wheel's own version file) verified, and extracted to
+`.venv/lib/python3.10/site-packages/ttnn/runtime/sfpi` (436 MB, venv only; the tt-metal tree and `/opt` are untouched).
+`ttnn.__init__` sets its runtime root to the installed package directory automatically (no env var needed). Whether the wheel works with
+KMD 2.10.0 and this hardware is verified by the first device job.
 
 ## Host-computation allow-list (BRIEF 2-8)
 Silent torch/host fallbacks on the TT path are forbidden. Only the items below may run on the host. Each is counted by a
