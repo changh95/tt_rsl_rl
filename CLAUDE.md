@@ -11,7 +11,8 @@ v1 scope: PPO, MLPModel, GaussianDistribution (scalar/log std), EmpiricalNormali
 Confirmed design (do not re-litigate; BRIEF §3.0): 1-chip bring-up then mesh; plugin structure; fixed shapes + trace as the default design; tt-rl (MIT) is a reference implementation (cite source/license when copying code, never run its CLI).
 
 ## Resolved values (BRIEF §0, 2026-11-10)
-TRAY_ID=3, allowed nodes `/dev/tenstorrent/16`..`23` (8 nodes) — nothing else, ever. TT_METAL=`/home/ttuser/experiments/tt-metal` (v0.81.1, do not modify), PYTHON_ENV=`/home/ttuser/experiments/rsl_rl/.venv`, WORKDIR=`/home/ttuser/experiments/rsl_rl`, RSL_RL_VERSION=v5.5.2 (provisional). Unknown/pending: TT_VISIBLE_DEVICES ID space, TRAY_MESH_SHAPE, ISAAC_HOST. Device env vars are set ONLY in `scripts/tray_env.sh`.
+TRAY_ID=3, allowed nodes `/dev/tenstorrent/16`..`23` (8 nodes, BDFs `0000:c1:00.0`..`c8:00.0`) — nothing else, ever. `TT_VISIBLE_DEVICES` holds the BDFs (an integer there is a BDF-sorted index, NOT a /dev number). TT_METAL reference tree=`/home/ttuser/experiments/tt-metal` (v0.81.1, read-only, has no `_ttnn.so`; how ttnn is provided is ADR-0006, pending), PYTHON_ENV=`/home/ttuser/experiments/rsl_rl/.venv`, WORKDIR=`/home/ttuser/experiments/rsl_rl`, RSL_RL_VERSION=v5.5.2 (provisional). Pending owner decisions: ADR-0005 (other nodes are briefly open()ed by UMD enumeration), ADR-0006, DECISIONS C-1 (grad clip per model), C-2. Unknown: TRAY_MESH_SHAPE (expected 2x4), ISAAC_HOST. Device env vars are set ONLY in `scripts/tray_env.sh`; `import ttnn` plumbing lives in `scripts/ttnn_env.sh`.
+**No device is opened until ADR-0005 and ADR-0006 are decided by the owner and the owner has reviewed `/hooks` and restarted the session.**
 
 ## ABSOLUTE RULES — tray isolation and shared-server hygiene (BRIEF §2, copied verbatim)
 
@@ -48,8 +49,10 @@ Safety net (auxiliary only — the rules above stay binding even where the machi
 source .venv/bin/activate && pytest tests/tt -q
 
 # device jobs — ONLY through the wrapper (tray_env -> flock -> timeout, PID logged in .run/pids)
-scripts/tt_run.sh --timeout 600 -- python -m pytest -m tt tests/tt/<file>.py -q
+# --chips selects a subset of the tray (16 = 1x1 bring-up, 16,17 = 1x2, default = all 8); anything outside 16..23 is refused
+scripts/tt_run.sh --chips 16 --timeout 600 -- python -m pytest -m tt tests/tt/<file>.py -q
 scripts/tt_run.sh --timeout 600 -- python scripts/<script>.py
+# device code opens the mesh ONLY via:  from rsl_rl_tt.device import open_tray_mesh   (the single guarded entry point)
 
 # stop only jobs started by this repo (reads .run/pids)
 scripts/kill_my_jobs.sh

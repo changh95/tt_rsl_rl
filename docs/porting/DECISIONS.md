@@ -20,10 +20,29 @@ Chosen as the latest upstream tag. It must be compared with the version the user
 on the GPU host) before Phase 1 golden baselines are produced. Switching later only replaces `rsl_rl/` (BRIEF 3.1), but
 golden curves and `UPSTREAM_SEMANTICS.md` rows must then be re-checked.
 
-## ADR-0001 — Training backend (A: hand-written TTNN fwd/bwd, B: tt-train `ttml`)  — *Pending*
-To be written from `TTNN_OP_SURVEY.md` (op coverage, fp32, trace compatibility, `ttml` build state) and `TTRL_NOTES.md`
-(tt-rl's tape of per-op VJPs is a reusable oracle; tt-rl does not trace PPO and keeps Adam scalars on the host).
-Default per BRIEF 3.2 stays **A**.
+## ADR-0001 — Training backend (A: hand-written TTNN fwd/bwd, B: tt-train `ttml`)  — *Proposed: A*
+**Evidence (source-level; nothing is measured on hardware yet — `TTNN_OP_SURVEY.md`).**
+- **B (`ttml`) is not viable for v1.** Not built here (`BUILD_TT_TRAIN=OFF`, no `_ttml`); no ELU/tanh/softplus/sqrt/log autograd
+  ops, which an ELU-MLP + Gaussian policy needs; bf16-centric (fp32 only for optimizer master weights). Its AdamW(+fp32 master),
+  `clip_grad_norm` and DDP `synchronize_gradients` (all-reduce, then multiply by 1/N) are useful design references only.
+- **A needs only ops that exist in v0.81.1:** fp32 matmul/linear (HiFi4 + `fp32_dest_acc_en`, approx off), `elu` + `elu_bw`, `exp/log/
+  sqrt/rsqrt/square/reciprocal`, `where/clamp/minimum/maximum/lt/gt`, fp32 reductions (sum/mean/max, whole tensor), `ttnn.copy` /
+  `fill` in place, row gather via `ttnn.gather`/`tosa_gather` (fp32 table, UINT32 index; `ttnn.embedding` is bf16-only so it is
+  NOT used), `ttnn.all_reduce` (fp32 TILE, Sum) then ×1/N, and mesh trace capture/replay.
+- **Global grad norm** has no fp32 fused op (`moreh_clip_grad_norm` is bf16-only): compose it from `square` + `sum` + `sqrt` +
+  `clamp` + `multiply` in fp32 — one norm for the actor group (incl. the std parameter) and one for the critic (DECISIONS C-1).
+- **Adam** runs on device in fp32 (master weights + moments), per parameter, in place; `lr`, `1-β^t` bias corrections and the PPO
+  adaptive LR are **device tensors** updated by `copy_host_to_device_tensor` outside the trace, because a trace freezes Python
+  scalars (survey item 8; tt-rl keeps these scalars on the host and does not trace PPO at all, `TTRL_NOTES.md`).
+- **Noise** is sampled outside the trace (host generator in parity mode, BRIEF 3.5), because replayed traces repeat `ttnn.rand*`
+  noise.
+- **Backward:** hand-written per-op VJPs (tt-rl's tape is a reusable oracle for matmul transpose flags, broadcast reductions);
+  correctness is judged by gradient parity against upstream torch autograd (BRIEF 3.2), per parameter.
+**Main numerical risk.** fp32 matmul multiplies TF32-class operands (accumulation is fp32), so expect ~1e-3 relative error vs torch.
+This is measured first (noise-floor probe, survey Q10) and sets `TOLERANCES.md`. If parity needs more, the contingency is a split-fp32
+matmul (hi/lo operand decomposition, 2-3 matmuls) — decided only with the measurement in hand (BRIEF 2-9: tolerances are never
+loosened just because a test fails).
+**Decision.** Option A. ADR stays *Proposed* until the Phase 0 noise-floor measurements exist.
 
 ## ADR-0002 — Plugin injection point and runner subclass  — *Proposed*
 **Context.** Upstream resolves the algorithm from `cfg["algorithm"]["class_name"]` via `resolve_callable`
@@ -86,6 +105,48 @@ advantage normalization: the reference is upstream torch code run over N explici
 upstream gloo with `world_size=N`), not a single big batch. A periodic consistency check of parameters across chips is added.
 **Consequences.** Differs deliberately from tt-rl's periodic parameter averaging (`TTRL_NOTES.md`), which is on the
 DO-NOT-USE list.
+
+## ADR-0005 — Isolation of the other trays' device nodes  — *Pending: owner decision (touches BRIEF 2-1 / 2-2)*
+**Finding (`TTNN_OP_SURVEY.md` 11.3, source-level; not yet observed on hardware).** `TT_VISIBLE_DEVICES` (BDF tokens) makes UMD
+*initialise and use* only the listed chips. But UMD's enumeration `open()`s every `/dev/tenstorrent/N` on the host (O_RDWR, one
+`GET_DEVICE_INFO` ioctl, then `close()`), 1 to 3 times per enumeration call and from several callers, before it filters. Two
+consequences: (1) the `/proc/self/fd` check required by BRIEF 2-2(b) passes even then, because those probe fds are already closed —
+it proves what is *held*, not that nothing else was *ever opened*; (2) a source comment says tt-kmd messages the chip's firmware
+on every `open()` (kernel side, unverifiable here). So "no other tray's chip is ever opened" cannot be guaranteed by software
+inside the process; this was not visible when the brief was written.
+**Facts established on this host (read-only):** nodes 16..23 map to BDFs `0000:c1:00.0 .. 0000:c8:00.0` (consecutive buses, one tray);
+all `/dev/tenstorrent/*` are `crw-rw-rw- root:root`, so permissions protect nothing; unprivileged user+mount namespaces work
+(`unshare -Urm`, Ubuntu 22.04, `max_user_namespaces=2318138`, no `sudo`); `bwrap` is not installed.
+**Dry run with `/dev/null` only (no Tenstorrent node touched):** a bind-mounted char device in the namespace opens O_RDONLY but its
+O_WRONLY/O_RDWR open fails with EACCES; opening `/dev/null` directly inside the namespace works for O_RDWR.
+**Options**
+- **I. Accept** the transient probes: treat "never open other chips" as "never initialise, use, reset or touch them"; rely on
+  `TT_VISIBLE_DEVICES`, the sysfs BDF check and the fd check. Simplest; leaves the possible tt-kmd power-state message on all other
+  nodes at every run, on a host where other people's jobs are running.
+- **II. Mask in a private mount namespace (recommended, needs your approval):** `tt_run.sh` runs the job under `unshare -Urm`, and
+  before exec'ing it bind-mounts `/dev/null` over every `/dev/tenstorrent/*` entry that is not 16..23 (via the `mount(2)` syscall, no
+  `sudo`, invisible to every other process on the host). Per the survey, a node that cannot be opened read-write is silently dropped
+  from UMD's map, so enumeration then never reaches another tray's driver. The 8 allowed nodes are left at their original paths.
+  *Unverified:* that the real allowed nodes still open O_RDWR from inside the namespace, and that UMD/hugepage/sysfs access works
+  there. Verification plan: the first device job opens only `--chips 16` and checks the fd list; if anything fails, fall back to I or III.
+- **III. OS-level isolation by an administrator** (ACL/udev permissions or a container exposing only 8 nodes). Strongest, needs root.
+**Until you decide, no device is opened.**
+
+## ADR-0006 — How `import ttnn` is provided  — *Pending: owner decision (BRIEF 2-7: ttnn/tt-metal build and versions)*
+**Finding.** `/home/ttuser/experiments/tt-metal` was configured with `WITH_PYTHON_BINDINGS=OFF`: there is no `_ttnn.so`, so
+`import ttnn` cannot work from it (`ttml` is not built either). Someone else changed that tree while the survey ran (egg-info
+removed, CMake reconfigured with tests ON at 17:19), so it is also not a stable base. Pure-Python `ttnn` files are not enough.
+**Options**
+- **a. PyPI wheel `ttnn==0.81.1` into the dedicated venv (recommended).** Same version as the reference tree. Downloaded to a scratch
+  directory and **inspected only** (not installed, not imported): `ttnn-0.81.1-cp310-cp310-manylinux_2_34_x86_64.whl`, 103 MB, bundles
+  `_ttnn.cpython-310-*.so`, `libtt_metal.so`, `libtt-umd.so`, `_ttnncpp.so`, an OpenMPI, firmware/runtime sources; requirements are
+  the same pure-Python set as the tree (`numpy<2, loguru, networkx, graphviz, pyyaml, click, pandas, seaborn, ml_dtypes`). Open item:
+  the riscv `sfpi` toolchain is fetched by `ttnn/download_sfpi.py` (`sfpi-version` file) — whether first use needs network access is
+  unverified. Also unverified: compatibility with the installed kernel driver (2.10.0) — the same question applies to any route.
+- **b. Separate bindings build** of the same sources in a private clone/build dir (new build, long, heavy CPU load on a shared host;
+  never in the shared tree).
+- **c. Reuse another tree's `_ttnn.so`** — rejected: ABI must match the `libtt_metal.so` it links; other people's trees.
+`scripts/ttnn_env.sh` currently only sets hygiene variables (private `TT_METAL_CACHE`/`TT_METAL_LOGS_PATH`, no bytecode in trees).
 
 ## Host-computation allow-list (BRIEF 2-8)
 Silent torch/host fallbacks on the TT path are forbidden. Only the items below may run on the host. Each is counted by a

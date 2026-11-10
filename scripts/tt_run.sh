@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # tt_run.sh -- the ONLY way to run anything that may open Tenstorrent devices (BRIEF section 2-3).
 #
-#   scripts/tt_run.sh [--timeout SEC] [--grace SEC] [--wait SEC] [--tag NAME] -- CMD [ARGS...]
+#   scripts/tt_run.sh [--timeout SEC] [--grace SEC] [--wait SEC] [--tag NAME] [--chips 16[,17,...]] -- CMD [ARGS...]
+#
+#   --chips  which of the tray's chips (/dev node numbers 16..23) this job may use; default all 8. tray_env.sh rejects
+#            anything outside 16..23 and derives TT_VISIBLE_DEVICES (BDF tokens) from it. Use 16 for 1x1 bring-up.
 #
 # What it does, in order:
 #   1. source scripts/tray_env.sh (the single place that sets device-related env vars)
@@ -32,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --grace)   GRACE="$2"; shift 2 ;;
         --wait)    WAIT="$2"; shift 2 ;;
         --tag)     TAG="$2"; shift 2 ;;
+        --chips)   export TT_TRAY_CHIPS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         --)        shift; break ;;
         *)         break ;;
@@ -79,5 +83,9 @@ mv "$tmp" "$PIDS"
 
 # 4. run. `exec` keeps the PID recorded above and keeps SIGINT deliverable (a backgrounded child of a
 #    non-interactive bash would start with SIGINT ignored, which would break Python's KeyboardInterrupt cleanup).
+#    `--foreground`: signal ONLY the job, never a whole process group. Without it, when tt_run.sh is the first element of a pipeline
+#    in a job-control shell (`tt_run.sh ... | tee log`), timeout cannot make its own group and its group-wide SIGINT would also
+#    kill `tee`, losing the log tail exactly when a job times out. Consequence: descendants are not signalled automatically;
+#    scripts/kill_my_jobs.sh walks the recorded PID's process tree itself.
 echo "tt_run: tray=$TT_TRAY_ID timeout=${TIMEOUT}s grace=${GRACE}s tag=$TAG pid=$$ :: $*" >&2
-exec timeout --signal=INT --kill-after="${GRACE}s" "${TIMEOUT}s" "$@"
+exec timeout --foreground --signal=INT --kill-after="${GRACE}s" "${TIMEOUT}s" "$@"

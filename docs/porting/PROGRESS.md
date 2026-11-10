@@ -3,40 +3,43 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
-## 2026-11-10 — Phase 0 (in progress)
+## 2026-11-10 — Phase 0 (in progress; all host-side work done, STOPPED before any device open)
 **Done**
-- GitHub repo `changh95/tt_rsl_rl` created (public, non-fork, empty) and seeded from a full-history clone of upstream;
-  `main` = tag `v5.5.2` (pristine), upstream tags pushed, `upstream` push URL disabled, work branch `tt/phase-0`.
-- Section-0 values resolved with the owner: tray 3 = `/dev/tenstorrent/16..23` (8 nodes present), TT_METAL =
-  `~/experiments/tt-metal` v0.81.1 (read-only), PYTHON_ENV = `<repo>/.venv` (Python 3.10.12, torch 2.11.0+cpu, numpy 1.26.4),
-  `RSL_RL_VERSION = v5.5.2` (provisional).
-- `BRIEF.md`, `CLAUDE.md` (rules copied verbatim), README with phase table.
-- Safety net: `scripts/tt_run.sh`, `scripts/kill_my_jobs.sh`, `.claude/hooks/tray_guard.{sh,py}` (command-position
-  matching, fails closed). Host tests: `tests/tt/test_tray_guard.py` (218 cases incl. false-positive protection) and
-  `tests/tt/test_repo_invariants.py` (`rsl_rl/` identical to the tag; only `device.py` may open devices) — 221 passed.
-- Research docs: `UPSTREAM_MAP.md`, `UPSTREAM_SEMANTICS.md` (52 semantic rows), `TTRL_NOTES.md` (tt-rl commit `6fa5ead`),
-  `DECISIONS.md` (ADR-0002/0003/0004 proposed, host allow-list, clarifications C-1/C-2).
-- Commit `9c92dc4` pushed to `origin/tt/phase-0`.
+- Repo `changh95/tt_rsl_rl` (public, non-fork) seeded from a full-history clone of upstream; `main` = tag `v5.5.2` (pristine),
+  upstream tags pushed, `upstream` push URL disabled, work branch `tt/phase-0`.
+- Section-0 values resolved: tray 3 = `/dev/tenstorrent/16..23` = BDFs `0000:c1:00.0..c8:00.0`; PYTHON_ENV = `<repo>/.venv`
+  (Python 3.10.12, torch 2.11.0+cpu, numpy 1.26.4); `RSL_RL_VERSION = v5.5.2` (provisional).
+- Safety net, complete and tested on the host (265 tests passing, no device involved):
+  - `scripts/tray_env.sh` (single source of device env; BDF tokens; `--chips` subset; refuses chips outside 16..23 and empty
+    selections), `scripts/ttnn_env.sh` (software env only), `scripts/tt_run.sh` (flock, `timeout --foreground`, PID log),
+    `scripts/kill_my_jobs.sh` (recorded PIDs only, with their descendants);
+  - `rsl_rl_tt/device.py`: the single guarded entry point `open_tray_mesh()` (env == tray_env.sh evaluated in a clean sub-shell,
+    tray lock held, sysfs node->BDF check, mesh shape == #chips, then ttnn import + open, then `/proc/self/fd` check with
+    close-and-raise, close via context manager + atexit, fabric disabled after close);
+  - `.claude/hooks/tray_guard.{sh,py}` (command-position Bash guard, fails closed) + `.claude/settings.json` (hook registration and
+    `permissions.deny` on `.claude/**` and `scripts/tray_env.sh`; written last, so those files are now locked for the assistant);
+  - tests: `test_tray_guard.py` (218), `test_device_guard.py` (31), `test_repo_invariants.py` (`rsl_rl/` == tag; only device.py
+    may open/enumerate devices incl. `ttnn.get_num_devices`), `test_claude_settings.py`.
+- Verified by running with harmless commands (no ttnn): env seen by a job, tray-busy exit 75, timeout -> SIGINT -> clean Python
+  shutdown, `kill_my_jobs.sh` SIGINT-first, stale-PID pruning. Found and fixed a real bug: group-wide SIGINT from `timeout` killed
+  `tee`/`grep` in job-control pipelines (now `--foreground`).
+- Research docs: `UPSTREAM_MAP`, `UPSTREAM_SEMANTICS` (52 rows), `TTRL_NOTES`, `TTNN_OP_SURVEY` (19 on-device probes Q1-Q19),
+  `ENV`, `DECISIONS` (ADR-0001 proposed A, ADR-0002/0003/0004, **ADR-0005/0006 pending**, host allow-list, C-1/C-2).
 
-**Key findings so far**
-- BRIEF 3.7 says one grad norm over actor+critic; upstream clips actor and critic **separately** (`ppo.py:309-310`) — see
-  DECISIONS C-1 (owner confirmation requested).
-- Pure-config plugin injection is feasible: `cfg["algorithm"]["class_name"]="rsl_rl_tt.<mod>:TTPPO"`, runner device `cpu`;
-  no runner subclass and no upstream patch needed for the single-process mesh design.
-- Upstream multi-GPU semantics are mixed (grads mean, normalizer stats global, advantage normalization rank-local, KL mean,
-  LR from rank 0) — ADR-0004 reproduces them.
-- tt-rl does not trace PPO, keeps Adam scalars on the host, and uses periodic parameter averaging across chips
-  (DO-NOT-USE); its per-op VJP tape is a reusable gradient oracle.
+**Key findings that need the owner**
+1. **ADR-0005 (touches BRIEF 2-1/2-2):** UMD enumeration briefly open()s every `/dev/tenstorrent/*` node before applying
+   `TT_VISIBLE_DEVICES`; the fd check cannot see that. Options: accept / mask other nodes in a private user+mount namespace
+   (feasible here without sudo) / admin-level isolation.
+2. **ADR-0006:** the tt-metal tree has no `_ttnn.so` (bindings OFF); `import ttnn` is impossible there. Candidate: PyPI wheel
+   `ttnn==0.81.1` (same version; inspected, not installed).
+3. **C-1:** upstream clips actor and critic separately (`ppo.py:309-310`), BRIEF 3.7 says one joint norm.
+4. **C-2:** `v5.5.2` vs the Isaac Lab pin.
+5. fp32 matmul = TF32-class operands + fp32 accumulation (~1e-3 rel. error expected) -> first on-device measurement; sets tolerances.
 
-**Next (remaining Phase 0)**
-1. `TTNN_OP_SURVEY.md` (source-level op/CCL/trace/mesh survey; in progress) -> determines the `TT_VISIBLE_DEVICES` ID
-   space and how `import ttnn` works from the source tree without writing into it.
-2. `scripts/tray_env.sh` (single source of device env vars) and `rsl_rl_tt/device.py` (single guarded entry point:
-   env check, `/proc/self/fd` node check, close in `finally`+`atexit`) + their tests.
-3. `.claude/settings.json` (hook registration + `permissions.deny`) — written LAST, after the guard tests pass, because
-   the deny rules lock `.claude/**`. Then ask the owner for `/hooks` review and a session restart.
-4. After restart: smoke tests via `tt_run.sh` (1x1 matmul vs torch; tray-wide mesh + all-reduce with exactly 8 nodes),
-   noise-floor measurements -> `TOLERANCES.md`, ADR-0001, then STOP and report for approval of Phase 1.
+**Next (after the owner's decisions, `/hooks` review and a session restart)**
+1. Implement the chosen isolation (ADR-0005) in `tt_run.sh`; install the chosen ttnn (ADR-0006) into `.venv`.
+2. Smoke (a): `tt_run.sh --chips 16` -> 1x1 mesh via `open_tray_mesh` -> small matmul vs torch -> close; confirm the fd guard.
+3. Smoke (b): all 8 chips -> mesh (2x4 expected) -> `FABRIC_1D` -> `ttnn.all_reduce` -> exactly 8 nodes held, all allowed.
+4. Noise-floor probes (survey Q10 etc.) -> `TOLERANCES.md`; finalize ADR-0001; then STOP and report for Phase 1 approval.
 
-**Blocked / waiting on the owner**
-- Confirm C-1 (two grad norms, as upstream) and C-2 (provisional `v5.5.2` vs the Isaac Lab pin).
+**Blocked on the owner:** ADR-0005, ADR-0006, C-1, C-2 (details in `DECISIONS.md`).

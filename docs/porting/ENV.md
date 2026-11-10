@@ -16,7 +16,8 @@ Recorded 2026-11-10. Values marked *(pending)* are filled in once the correspond
 |------|-------|
 | tt-metal tree (`TT_METAL`) | `/home/ttuser/experiments/tt-metal`, tag `v0.81.1`, commit `d80d9482a418cf04ddcbeecf6adb67010d3091e6` (2026-10-22). Built (`build/lib`), no `python_env`. **Read-only for this project** (BRIEF 2-7). |
 | tt-umd | submodule `tt_metal/third_party/umd` @ `889651ea5525379cc6bf1807e56404661b48a76d` |
-| ttnn import path | *(pending: Phase 0 step 4, see TTNN_OP_SURVEY.md item 13)* |
+| ttnn import path | **not decided** (ADR-0006). The tt-metal tree has no `_ttnn.so` (`WITH_PYTHON_BINDINGS=OFF`), so it cannot be imported. Candidate: PyPI wheel `ttnn==0.81.1` (cp310, 103 MB, self-contained; downloaded to scratch and inspected only, NOT installed). |
+| Other trees on this host | `~/experiments/{pi05,qwen3-32b,tt-models}/tt-metal` and `~/experiments/tt-metal-newton` belong to other work; the reference tree was modified by someone else on 2026-11-10 17:08-17:19 (egg-info removed, CMake reconfigured with tests ON). Treat all of them as read-only and unstable. |
 | `PYTHON_ENV` | `/home/ttuser/experiments/rsl_rl/.venv` (dedicated; created 2026-11-10 with system `python3 -m venv`) |
 | Python | 3.10.12 |
 | torch | 2.11.0+cpu (CPU build; the tt-metal tree pins `torch==2.11.0` for x86_64; no CUDA on this host) |
@@ -42,5 +43,7 @@ Transitive: GitPython, onnx, onnxscript, tensordict, tensorboard (all from upstr
 |------|-------|
 | `TRAY_ID` | 3 |
 | Allowed nodes | `/dev/tenstorrent/16` .. `/dev/tenstorrent/23` — 8 nodes, all present (char devices, mode 666 root:root, so file permissions do **not** protect other trays; the guards in `device.py`/hooks do) |
-| `TT_VISIBLE_DEVICES` ID space | *(pending: determined from the tt-umd/tt-metal source, see TTNN_OP_SURVEY.md item 11)* |
-| Tray mesh shape | *(pending: determined in Phase 0 step 4 with the allowed chips only)* |
+| Node -> PCI BDF (sysfs symlink read, no open) | 16=`0000:c1:00.0` 17=`0000:c2:00.0` 18=`0000:c3:00.0` 19=`0000:c4:00.0` 20=`0000:c5:00.0` 21=`0000:c6:00.0` 22=`0000:c7:00.0` 23=`0000:c8:00.0` (consecutive PCI buses = one tray). Re-verified by `device.py` on every open. |
+| `TT_VISIBLE_DEVICES` ID space | An integer token is a **0-based index into the nodes sorted by PCI BDF**, NOT the `/dev/tenstorrent/N` number (UMD `pci_device.cpp:265-325`; tt-metal's own tests say "logical IDs (BDF-sorted indices)"). `TT_METAL_VISIBLE_DEVICES` is a dead variable. So `scripts/tray_env.sh` uses **full BDF tokens** (typos fail closed). |
+| What `TT_VISIBLE_DEVICES` does NOT guarantee | UMD enumeration briefly open()s/closes every `/dev/tenstorrent/*` node before filtering (ADR-0005, owner decision pending). |
+| Tray mesh shape | not confirmed on hardware. Source reading: metal's auto-discovery over 8 visible chips infers **2x4** (a `1x8` request is placed in ring order); fabric bring-up on a tray subset is the main unknown (survey Q3). To be confirmed in the smoke test. |
