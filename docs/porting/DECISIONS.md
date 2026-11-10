@@ -1,7 +1,8 @@
 # Decisions (ADRs) and the host-computation allow-list
 
-Status values: **Accepted** (owner-confirmed or fixed by the brief), **Proposed** (Phase 0 recommendation, waiting for owner
-approval at the Phase 0 stop), **Pending** (needs a result that is not available yet).
+Status values: **Accepted** (owner-confirmed or fixed by the brief), **Proposed** (recommendation, waiting for owner
+approval), **Pending** (needs a result that is not available yet). At the end of Phase 0 (2026-11-10) the owner approved all open ADRs
+(0001, 0002, 0003 as the working plan, 0004 with amendment A-1) and Phase 1.
 Evidence sources: `UPSTREAM_MAP.md`, `UPSTREAM_SEMANTICS.md`, `TTRL_NOTES.md`, `TTNN_OP_SURVEY.md`, `ENV.md`.
 
 ## Clarifications of the brief (owner approval requested)
@@ -24,7 +25,7 @@ phase boundary if the owner asks for `main`: replace `rsl_rl/` with that ref (BR
 `UPSTREAM_SEMANTICS.md` rows and re-run the parity/golden baselines. Still to compare with the version Isaac Lab pins
 (`pip show rsl-rl-lib` on the GPU host) before Phase 7.
 
-## ADR-0001 — Training backend (A: hand-written TTNN fwd/bwd, B: tt-train `ttml`)  — *Proposed: A (measurements done, see below; awaiting owner approval)*
+## ADR-0001 — Training backend (A: hand-written TTNN fwd/bwd, B: tt-train `ttml`)  — *Accepted: A (owner, 2026-11-10: "전부 승인", after the Phase 0 measurements below)*
 **Evidence (source-level survey: `TTNN_OP_SURVEY.md`; hardware measurements: the "MEASURED" block below).**
 - **B (`ttml`) is not viable for v1.** Not built here (`BUILD_TT_TRAIN=OFF`, no `_ttml`); no ELU/tanh/softplus/sqrt/log autograd
   ops, which an ELU-MLP + Gaussian policy needs; bf16-centric (fp32 only for optimizer master weights). Its AdamW(+fp32 master),
@@ -62,7 +63,7 @@ phase boundary if the owner asks for `main`: replace `rsl_rl/` with that ref (BR
   clipping tolerates; this is a property to document, not to tune away.
 **Decision.** Option A. Evidence now exists; recommended **Accepted** (owner approval requested at the Phase 0 stop).
 
-## ADR-0002 — Plugin injection point and runner subclass  — *Proposed*
+## ADR-0002 — Plugin injection point and runner subclass  — *Accepted (owner, 2026-11-10)*
 **Context.** Upstream resolves the algorithm from `cfg["algorithm"]["class_name"]` via `resolve_callable`
 (`utils.py:167-176`) and calls the static `construct_algorithm(obs, env, cfg, device)` (`on_policy_runner.py:39-40`).
 The runner touches only `train_mode/eval_mode/broadcast_parameters/act/process_env_step/compute_returns/update/
@@ -90,13 +91,13 @@ optimizer` (`on_policy_runner.py:66`).
 **Consequences.** Upstream stays byte-identical to the tag (tested). Open items: Q1 (which `runner.alg.*` attributes Isaac
 Lab accesses), Q2 (extra cfg keys), Q3 (dtypes of `dones`/`time_outs`).
 
-## ADR-0003 — Environment location and bridge  — *Pending (ISAAC_HOST unknown)*
+## ADR-0003 — Environment location and bridge  — *Accepted as the working plan (owner, 2026-11-10); the concrete bridge is decided in Phase 7 once ISAAC_HOST is known*
 The host has no NVIDIA GPU tooling (`ENV.md`), so Isaac Sim is assumed to run on a separate GPU host. Default plan
 (BRIEF 3.8 / Phase 7): `RemoteVecEnv` (an rsl_rl `VecEnv`) on the TT host talking to a small server wrapping the Isaac Lab
 env on the GPU host, ZeroMQ + raw float32 buffers; same-host would connect directly. Alternatives (gRPC, shared memory,
 Arrow Flight) and the measured round-trip/bandwidth are compared in Phase 7. Nothing is built before Phase 7.
 
-## ADR-0004 — Multi-chip statistics synchronisation  — *Proposed (amendment A-1 below is new: gradient sum = gather + sum, not `all_reduce`)*
+## ADR-0004 — Multi-chip statistics synchronisation  — *Accepted incl. amendment A-1: gradient sum = gather + sum, not `all_reduce` (owner, 2026-11-10)*
 **Amendment A-1 (hardware measurement, 2026-11-10, 2x4 mesh on FABRIC_1D, `tests/tt/test_noise_floor_mesh.py`).** The stock fp32
 `ttnn.all_reduce` is NOT fp32-accurate: rel_fro **5.5e-4** vs a float64 sum of the 8 shards (torch fp32 sum: 5.6e-8) at 8K..1M values per
 chip, in every variant (flat, or per mesh axis 1 then 0: 5.7e-4). It is bit-identical across chips and takes 0.23-0.40 ms. The alternative
