@@ -1,3 +1,34 @@
+# tt_rsl_rl — rsl_rl training on Tenstorrent Blackhole (TTNN)
+
+This repository ports the **training side of [rsl_rl](https://github.com/leggedrobotics/rsl_rl)** (rollout policy
+inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package (`rsl_rl_tt/`) that is injected into the
+**unmodified** upstream `OnPolicyRunner` through its configuration. Environments (simulators) stay where they are.
+
+- **Based on:** [leggedrobotics/rsl_rl](https://github.com/leggedrobotics/rsl_rl) (BSD-3-Clause; upstream `LICENSE` retained).
+  Full upstream history is preserved; remote `upstream` points to the original repository.
+- **Baseline tag:** `v5.5.2` — everything under `rsl_rl/` is exactly this tag (checked by a test); the TT implementation
+  lives in `rsl_rl_tt/`. *(The tag is provisional until it is confirmed against the Isaac Lab version in use.)*
+- **Status / log:** [`docs/porting/PROGRESS.md`](docs/porting/PROGRESS.md) · work order:
+  [`docs/porting/BRIEF.md`](docs/porting/BRIEF.md) · decisions: [`docs/porting/DECISIONS.md`](docs/porting/DECISIONS.md)
+- **Docs:** [`docs/porting/`](docs/porting/) (environment, upstream map & semantics, tolerances, perf, TTNN issues)
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 0 | Environment, safety net, research, ADRs | in progress |
+| 1 | Reference + parity harness (host only) | pending |
+| 2 | 1-chip (1x1 mesh) forward | pending |
+| 3 | 1-chip backward, optimizer, PPO update | pending |
+| 4 | 1-chip end-to-end training + checkpoint compatibility | pending |
+| 5 | 1-chip performance (trace, pre-allocation) | pending |
+| 6 | Tray multi-chip data parallel (8 chips) | pending |
+| 7 | Isaac Lab integration | pending |
+
+> This is a work in progress on shared hardware; it only ever touches one dedicated 8-chip tray (see `CLAUDE.md`).
+
+---
+
+# Original rsl_rl README (upstream, unchanged)
+
 # RSL-RL
 
 **RSL-RL** is a GPU-accelerated, lightweight learning library for robotics research. Its compact design allows

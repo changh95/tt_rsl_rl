@@ -14,3 +14,26 @@ docs/_build/
 
 # vs code
 .vscode
+
+# --- tt_rsl_rl additions ---
+# local runtime state (PID log, locks) and the dedicated venv
+.run/
+.venv/
+# large artifacts must never be committed (checkpoints, raw logs, exported models, TB runs)
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+logs/
+runs/
+outputs/
+checkpoints/
+wandb/
+*.log
+# tt-metal / ttnn caches
+.tt_cache/
+tt_cache/
+generated/
+# small golden curves are intentionally tracked
+!docs/porting/golden/*.csv
