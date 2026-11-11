@@ -229,6 +229,11 @@ class TrayMesh:
     def __init__(self, ttnn: Any, mesh_device: Any, cfg: TrayConfig, fabric_set: bool, mesh_shape: tuple[int, int] | None = None):
         self._ttnn, self.mesh_device, self.cfg, self._fabric_set, self._closed = ttnn, mesh_device, cfg, fabric_set, False
         self.mesh_shape = mesh_shape
+        self._close_hooks: list[Callable[[], None]] = []
+
+    def add_close_hook(self, hook: Callable[[], None]) -> None:
+        """Run `hook()` right BEFORE the mesh is closed (e.g. release captured traces, which must not outlive the device)."""
+        self._close_hooks.append(hook)
 
     def close(self) -> None:
         global _ACTIVE
@@ -236,6 +241,12 @@ class TrayMesh:
             return
         self._closed = True
         error: BaseException | None = None
+        for hook in reversed(self._close_hooks):
+            try:
+                hook()
+            except BaseException as exc:  # still close the mesh
+                print(f"rsl_rl_tt.device: close hook failed: {exc!r}", file=sys.stderr)
+        self._close_hooks.clear()
         try:
             self._ttnn.close_mesh_device(self.mesh_device)
         except BaseException as exc:  # still reset fabric and bookkeeping below

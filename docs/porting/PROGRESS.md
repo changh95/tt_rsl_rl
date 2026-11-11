@@ -3,6 +3,20 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-11 — Phase 5 IN PROGRESS (device work paused after a job timeout, BRIEF 2-6)
+**Done so far (branch `tt/phase-5`)**
+- Baselines (null env, algorithm cost only, `scripts/bench_matrix.py`): 4096 envs x 24 steps, hidden [512,256,128]: upstream CPU 3.2 s per iteration (update 3.0 s); TT untraced 2.34 s
+  (update 2.2 s, of which the shuffle gather 1.25 s = 57 %).
+- Shuffle: exact fp32 row gather through 3 x bf16 pieces + `ttnn.embedding` (probe: bit exact, 5.9 ms for 24576 rows vs 237 ms for `tosa_gather`); in `TTRolloutStorage.shuffle`.
+  TT iteration 2.34 s -> 1.05 s (update 0.92 s). Remaining per-mini-batch cost is per-op dispatch (adam 17 ms, backward 10 ms, clip 7 ms, loss 4 ms, forward 3.5 ms).
+- Trace probe: replay of ~120 ops 0.67 ms vs 10.2 ms eager (15x); persistent inputs, in-place outputs/parameters and allocations between replays behave (`scripts/probe_trace.py`).
+- Refactor to PERSISTENT device state updated in place (weights, normalizer statistics, Gaussian derived rows, Adam moments and scalars, learning rate, loss accumulators), a single
+  `_minibatch_step` used eagerly and as a captured trace, traced `act` step, `trace` option in `tt_cfg`. Eager path: 130 device tests passed after the refactor.
+**Incident (rules 2-6)**: the first traced test run hit `TT_FATAL ... not yet in program cache` during capture, the exception left the capture open and the job ran into its timeout (exit 124).
+Root cause and fixes (host side): `docs/porting/incidents/2026-11-11_trace_capture_left_open.md`. No device job has been started since; the hardware state is unverified.
+**Next (when device work resumes)**: plain open/close smoke of chip 16, then `tests/tt/test_tt_trace.py` (traced == eager bit for bit), the Phase 2-4 suites on the traced path, the benchmark matrix
+(num_envs 4096/16384/65536 x hidden [512,256,128]/[1024,1024,512]), `PERF.md`.
+
 ## 2026-11-11 — Phase 4 DONE: 1-chip end-to-end training and checkpoint compatibility (tag `phase-4-done`)
 **Done**
 - TT training of all three envs x 3 seeds (same config/seeds/iterations as the golden runs) with the unmodified `OnPolicyRunner` + `TTPPO` on one chip: `docs/porting/tt_runs/` (CSVs, `summary.json`,

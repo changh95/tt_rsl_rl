@@ -48,8 +48,8 @@ class TTEmpiricalNormalization:
         mean = pad_vector(m._mean.reshape(-1), self.dim_p, 0.0)
         var = pad_vector(m._var.reshape(-1), self.dim_p, 1.0)
         self.count = int(m.count)
-        self._mean = ctx.upload(mean, op="H-6", batch_sharded=False)
-        self._var = ctx.upload(var, op="H-6", batch_sharded=False)
+        self._mean = ctx.upload_into(getattr(self, "_mean", None), mean, op="H-6")
+        self._var = ctx.upload_into(getattr(self, "_var", None), var, op="H-6")
         self._refresh_derived()
 
     def sync_to_torch(self) -> None:
@@ -62,9 +62,10 @@ class TTEmpiricalNormalization:
         m.count.fill_(self.count)
 
     def _refresh_derived(self) -> None:
-        ttnn = self.ctx.ttnn
-        self._std = ttnn.sqrt(self._var)
-        self._std_eps = ttnn.add(self._std, self.eps, **_acc(ttnn))  # (std + eps)
+        ctx = self.ctx
+        ttnn = ctx.ttnn
+        self._std = ctx.put(getattr(self, "_std", None), ttnn.sqrt(self._var))
+        self._std_eps = ctx.put(getattr(self, "_std_eps", None), ttnn.add(self._std, self.eps, **_acc(ttnn)))  # (std + eps)
 
     # -- compute ----------------------------------------------------------------------------------------------------------
     def forward(self, x: Any) -> Any:
@@ -89,8 +90,8 @@ class TTEmpiricalNormalization:
         new_mean = ttnn.add(self._mean, ttnn.multiply(delta_mean, rate), **_acc(ttnn))
         # var += rate * (var_x - var + delta_mean * (mean_x - new_mean))
         inner = ttnn.add(ttnn.subtract(var_x, self._var, **_acc(ttnn)), ttnn.multiply(delta_mean, ttnn.subtract(mean_x, new_mean, **_acc(ttnn))), **_acc(ttnn))
-        self._var = ttnn.add(self._var, ttnn.multiply(inner, rate), **_acc(ttnn))
-        self._mean = new_mean
+        self._var = ctx.put(self._var, ttnn.add(self._var, ttnn.multiply(inner, rate), **_acc(ttnn)))  # in place: the act trace reads these buffers
+        self._mean = ctx.put(self._mean, new_mean)
         self._refresh_derived()
 
     # -- host views (for tests / logging) ---------------------------------------------------------------------------------
@@ -115,8 +116,8 @@ class TTLinear:
 
     def sync_from_torch(self) -> None:
         w, b = linear_to_host(self.mirror.weight, self.mirror.bias, self.in_p, self.out_p)
-        self.w = self.ctx.upload(w, op="H-6", batch_sharded=False)
-        self.b = self.ctx.upload(b, op="H-6", batch_sharded=False)
+        self.w = self.ctx.upload_into(getattr(self, "w", None), w, op="H-6")
+        self.b = self.ctx.upload_into(getattr(self, "b", None), b, op="H-6")
 
     def sync_to_torch(self) -> None:
         w = self.ctx.download(self.w, op="H-6", batch_sharded=False)
@@ -208,8 +209,10 @@ class TTMLP:
         return [t for layer in self.layers for t in (layer.w, layer.b)]
 
     def set_parameters(self, values: list) -> None:
+        """Write new parameter values into the persistent weight/bias tensors in place."""
+        ctx = self.ctx
         for k, layer in enumerate(self.layers):
-            layer.w, layer.b = values[2 * k], values[2 * k + 1]
+            layer.w, layer.b = ctx.put(layer.w, values[2 * k]), ctx.put(layer.b, values[2 * k + 1])
 
     def sync_from_torch(self) -> None:
         for layer in self.layers:
@@ -260,7 +263,7 @@ class TTGaussianDistribution:
 
     def sync_from_torch(self) -> None:
         fill = 1.0 if self.std_type == "scalar" else 0.0  # padded columns: std = 1 (log std = 0), never trained, masked out of the sums
-        self.param = self.ctx.upload(pad_vector(self._param().detach(), self.dim_p, fill), op="H-6", batch_sharded=False)
+        self.param = self.ctx.upload_into(getattr(self, "param", None), pad_vector(self._param().detach(), self.dim_p, fill), op="H-6")
         self.refresh()
 
     def sync_to_torch(self) -> None:
@@ -268,34 +271,36 @@ class TTGaussianDistribution:
         self._param().data.copy_(host)
 
     def refresh(self) -> None:
-        """Recompute std, var and the log-prob constants from the parameter (call after every parameter change)."""
+        """Recompute std, var and the log-prob / backward rows from the parameter (call after every parameter change). The derived tensors are
+        PERSISTENT: they are written in place so that a captured trace keeps reading the current values."""
         ctx = self.ctx
         ttnn = ctx.ttnn
+        put = lambda name, value: setattr(self, name, ctx.put(getattr(self, name, None), value))
         if self.std_type == "scalar":
-            self.std = ttnn.clamp(self.param, min=self.std_range[0], max=self.std_range[1])
-            self.log_std = ttnn.log(self.std)
+            put("std", ttnn.clamp(self.param, min=self.std_range[0], max=self.std_range[1]))
+            put("log_std", ttnn.log(self.std))
         else:
-            self.log_std = ttnn.clamp(self.param, min=self.log_std_range[0], max=self.log_std_range[1])
-            self.std = ttnn.exp(self.log_std)
-        self.var = ttnn.square(self.std)
-        self.two_var = ttnn.multiply(self.var, 2.0)
-        self.log_prob_const = ttnn.add(self.log_std, HALF_LOG_2PI, **_acc(ttnn))  # log(std) + 0.5 log(2 pi), per action column
+            put("log_std", ttnn.clamp(self.param, min=self.log_std_range[0], max=self.log_std_range[1]))
+            put("std", ttnn.exp(self.log_std))
+        put("var", ttnn.square(self.std))
+        put("two_var", ttnn.multiply(self.var, 2.0))
+        put("log_prob_const", ttnn.add(self.log_std, HALF_LOG_2PI, **_acc(ttnn)))  # log(std) + 0.5 log(2 pi), per action column
         # entropy per sample = sum_real (0.5 + 0.5 log(2 pi) + log std): identical for every row
         ent = ttnn.add(self.log_std, 0.5 + HALF_LOG_2PI, **_acc(ttnn))
-        self.entropy_dev = ttnn.sum(ttnn.multiply(ent, self.mask), dim=-1, keepdim=True, compute_kernel_config=ctx.compute_cfg)
+        put("entropy_dev", ttnn.sum(ttnn.multiply(ent, self.mask), dim=-1, keepdim=True, compute_kernel_config=ctx.compute_cfg))
         # rows used by the backward pass (all masked, so padded action columns never receive a gradient)
-        self.inv_std = ttnn.multiply(ttnn.reciprocal(self.std), self.mask)
-        self.inv_var = ttnn.multiply(ttnn.reciprocal(self.var), self.mask)
-        self.inv_std3 = ttnn.multiply(self.inv_var, self.inv_std)
+        put("inv_std", ttnn.multiply(ttnn.reciprocal(self.std), self.mask))
+        put("inv_var", ttnn.multiply(ttnn.reciprocal(self.var), self.mask))
+        put("inv_std3", ttnn.multiply(self.inv_var, self.inv_std))
         # d(param) = d(std) * dstd/dparam * [param inside the clamp range] (torch clamp backward is inclusive)
         if self.std_type == "scalar":
             lo, hi = self.std_range
             inside = ttnn.multiply(ttnn.ge(self.param, lo), ttnn.le(self.param, hi))
-            self.param_gate = ttnn.multiply(inside, self.mask)
+            put("param_gate", ttnn.multiply(inside, self.mask))
         else:
             lo, hi = self.log_std_range
             inside = ttnn.multiply(ttnn.ge(self.param, lo), ttnn.le(self.param, hi))
-            self.param_gate = ttnn.multiply(ttnn.multiply(inside, self.std), self.mask)  # dstd/dlog_std = std
+            put("param_gate", ttnn.multiply(ttnn.multiply(inside, self.std), self.mask))  # dstd/dlog_std = std
 
     # -- compute ----------------------------------------------------------------------------------------------------------
     def sample(self, mean: Any, noise: Any) -> Any:
@@ -337,12 +342,13 @@ class TTMLPModel:
         self.output_dim_p = pad_up(self.output_dim)
 
     # -- host staging (H-3 concat + H-1 upload) ---------------------------------------------------------------------------
-    def obs_to_device(self, obs: Any) -> Any:
+    def obs_to_device(self, obs: Any, into: Any = None) -> Any:
+        """H-3 concat + H-1 upload; with `into` the data is written in place into that persistent device tensor (a traced step reads it)."""
         ctx = self.ctx
         ctx.check_batch(obs[self.obs_groups[0]].shape[0], "number of environments / samples")
         buf = stage_obs(obs, self.obs_groups, self.obs_dim_p)
         ctx.host_ops.count("H-3", buf.numel() * 4)
-        return ctx.upload(buf, op="H-1", batch_sharded=True)
+        return ctx.upload_into(into, buf, op="H-1", batch_sharded=True)
 
     # -- compute ----------------------------------------------------------------------------------------------------------
     def latent(self, obs_dev: Any) -> Any:

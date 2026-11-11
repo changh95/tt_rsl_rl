@@ -118,11 +118,23 @@ class TTRolloutStorage:
         return ttnn.concat(parts, dim=1)
 
     def shuffle(self, table: Any, permutation: Any) -> Any:
-        """Row gather with the (host-drawn) permutation, a UINT32 [1, batch] device tensor: bit-exact `tosa_gather` (Phase 3 probe)."""
+        """Exact fp32 row gather with the (host-drawn) permutation, a UINT32 ROW_MAJOR [1, batch] device tensor (`ctx.upload_index`).
+
+        `ttnn.tosa_gather`/`gather` move fp32 at ~50 ns per element (TTNN_ISSUES T-12) and `ttnn.embedding` accepts bf16 tables only, so every fp32
+        value is split EXACTLY into three bf16 values (h1 = bf16(x), r1 = x - h1, h2 = bf16(r1), r2 = r1 - h2, h3 = bf16(r2); the subtractions are
+        exact in fp32), the 3 x width bf16 columns are gathered with `embedding` (a page copy, ~1 ms per 100k rows) and added back: bit-exact for
+        every finite value with |x| >= 1e-30 (below that the tiny remainders hit the fp32 flush-to-zero threshold: absolute error <= 2e-38) and 40-50x faster than the fp32 gather (Phase 5 probe, TTNN_ISSUES T-12)."""
         ttnn = self.ctx.ttnn
         n, w = self.batch_size, self.width
-        out = ttnn.tosa_gather(ttnn.reshape(table, (1, n, w)), permutation)
-        return ttnn.reshape(out, (n, w))
+        h1 = ttnn.typecast(table, ttnn.bfloat16)
+        r1 = ttnn.subtract(table, ttnn.typecast(h1, ttnn.float32))
+        h2 = ttnn.typecast(r1, ttnn.bfloat16)
+        r2 = ttnn.subtract(r1, ttnn.typecast(h2, ttnn.float32))
+        h3 = ttnn.typecast(r2, ttnn.bfloat16)
+        pieces = ttnn.to_layout(ttnn.concat([h1, h2, h3], dim=1), ttnn.ROW_MAJOR_LAYOUT)
+        gathered = ttnn.to_layout(ttnn.reshape(ttnn.embedding(permutation, pieces, layout=ttnn.ROW_MAJOR_LAYOUT), (n, 3 * w)), ttnn.TILE_LAYOUT)
+        parts = [ttnn.typecast(gathered[:, k * w : (k + 1) * w], ttnn.float32) for k in range(3)]
+        return ttnn.add(ttnn.add(parts[0], parts[1]), parts[2])
 
     def split(self, rows: Any) -> dict:
         """Column views of a (mini-)batch of table rows."""

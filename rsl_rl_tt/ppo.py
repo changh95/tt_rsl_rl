@@ -28,7 +28,7 @@ from rsl_rl_tt.losses import PPOLosses
 from rsl_rl_tt.modules import TTMLPModel
 from rsl_rl_tt.optim import TTAdam, TTAdaptiveLR, clip_grad_norm
 from rsl_rl_tt.storage import TTRolloutStorage
-from rsl_rl_tt.tt_common import TTContext, linear_from_host, pack_step_scalars, pad_matrix, pad_vector, unit_row
+from rsl_rl_tt.tt_common import SectionTimer, TTContext, linear_from_host, pack_step_scalars, pad_matrix, pad_vector, unit_row
 
 
 class TTPPO(PPO):
@@ -48,11 +48,16 @@ class TTPPO(PPO):
         super().__init__(actor, critic, storage, **kwargs)
         tt_cfg = dict(tt_cfg or {})
         mesh_shape = tuple(tt_cfg.pop("mesh_shape", (1, 1)))
+        self.trace_enabled = bool(tt_cfg.pop("trace", False))  # capture/replay the act step and the mini-batch step (Phase 5); results are bit-identical to eager
         self._mesh_kwargs = {k: tt_cfg.pop(k) for k in ("fabric_config", "trace_region_size", "l1_small_size") if k in tt_cfg}
         if tt_cfg:
             raise ValueError(f"unknown tt_cfg keys: {sorted(tt_cfg)}")
+        if self.trace_enabled:
+            self._mesh_kwargs.setdefault("trace_region_size", 128 * 1024 * 1024)
         self.tray = acquire_tray_mesh(mesh_shape, **self._mesh_kwargs)
         self.ctx = TTContext.create(self.tray.mesh_device)
+        if self.trace_enabled:
+            self.tray.add_close_hook(self.release_traces)  # captured traces must be released before the device is closed
         self._validate_batch_alignment(storage)
         self.tt_actor = TTMLPModel(self.ctx, self._raw_actor)
         self.tt_critic = TTMLPModel(self.ctx, self._raw_critic)
@@ -69,6 +74,9 @@ class TTPPO(PPO):
         self.adam: TTAdam | None = None
         self._col0 = self.ctx.upload(unit_row(0, 32), op="H-6", batch_sharded=False)  # places the critic's single output in column 0
         self._pending: dict | None = None
+        self._traces: dict = {}  # name -> trace id (act, update.step.<i>)
+        self._buf: dict = {}  # persistent device buffers that traces read and write (inputs, outputs, accumulators)
+        self.timer = SectionTimer(self.ctx, enabled=False)  # `alg.timer.enabled = True` profiles the sections below (adds device syncs)
         self._weights_stale = False  # True while the device holds newer parameters than the torch mirrors
         self._optimizer_stale = False  # the same for the Adam moments
         self._refresh_std_mirror()
@@ -142,19 +150,17 @@ class TTPPO(PPO):
         return [slots[id(p)] for p in self.optimizer.param_groups[0]["params"] if id(p) in slots]
 
     def _optimizer_state_from_torch(self) -> None:
+        """Torch optimizer state -> the device Adam moments, written IN PLACE (a traced step keeps reading the same tensors)."""
         ctx = self.ctx
         state = self.optimizer.state
         slots = self._param_slots()
-        if not any(p in state and "exp_avg" in state[p] for p, *_ in slots):
-            self.adam = None  # fresh optimizer: Adam restarts from zero moments
-            return
-        params = self._params()
-        self.adam = TTAdam(ctx, params)
-        m, v = list(self.adam.m), list(self.adam.v)
+        if self.adam is None:
+            self.adam = TTAdam(ctx, self._params())
+        m, v = [ctx.ttnn.zeros_like(t) for t in self.adam.m], [ctx.ttnn.zeros_like(t) for t in self.adam.v]
         step = 0
         for p, idx, kind, owner in slots:
             if p not in state or "exp_avg" not in state[p]:
-                continue
+                continue  # a fresh torch optimizer: Adam restarts from zero moments (m, v stay zero, step 0)
             step = max(step, int(state[p]["step"]))
             for store, key in ((m, "exp_avg"), (v, "exp_avg_sq")):
                 t = state[p][key]
@@ -201,40 +207,117 @@ class TTPPO(PPO):
         self.tt_critic.set_training(False)
 
     # -- rollout ------------------------------------------------------------------------------------------------------------
+    def _capture(self, name: str, fn) -> None:
+        """Record `fn()` (device ops only, persistent tensors, every program already in the program cache) as a trace; the ops are recorded, not executed.
+
+        Whatever happens inside, the capture is ALWAYS ended (an exception that left it open made every later read fail with "Reads are not supported
+        during trace capture" and hung the process until the job timeout: docs/porting/incidents/2026-11-11_trace_capture_left_open.md)."""
+        ttnn = self.ctx.ttnn
+        trace_id = ttnn.begin_trace_capture(self.ctx.mesh, cq_id=0)
+        try:
+            fn()
+        except BaseException:
+            try:
+                ttnn.end_trace_capture(self.ctx.mesh, trace_id, cq_id=0)
+                ttnn.release_trace(self.ctx.mesh, trace_id)
+            except BaseException as exc:
+                print(f"rsl_rl_tt.ppo: could not end the failed trace capture cleanly: {exc!r}", file=__import__("sys").stderr)
+            raise
+        ttnn.end_trace_capture(self.ctx.mesh, trace_id, cq_id=0)
+        self._traces[name] = trace_id
+
+    def _replay(self, name: str) -> None:
+        self.ctx.ttnn.execute_trace(self.ctx.mesh, self._traces[name], cq_id=0, blocking=False)
+
+    def release_traces(self) -> None:
+        for trace_id in self._traces.values():
+            self.ctx.ttnn.release_trace(self.ctx.mesh, trace_id)
+        self._traces.clear()
+
+    def _act_graph(self, actor_in, critic_in, noise, persist: bool) -> dict:
+        """The device ops of one act step (forward passes, sample, log-prob, value). With persist=True the results are written in place into
+        persistent buffers (what a trace needs); otherwise they are fresh tensors."""
+        ctx = self.ctx
+        actor, critic = self.tt_actor, self.tt_critic
+        dist = actor.distribution
+        mean = actor.forward(actor_in)
+        action = dist.sample(mean, noise)
+        logp = dist.log_prob(action, mean)
+        value = critic.forward(critic_in)[:, 0:1]
+        out = dict(action=action, mean=mean, logp=logp, value=value)
+        if persist:
+            out = {k: ctx.put(self._buf.get("act." + k), v) for k, v in out.items()}
+            for k, v in out.items():
+                self._buf["act." + k] = v
+        return out
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions (forward passes on the device); everything but the actions stays on the device until process_env_step()."""
         ctx = self.ctx
         actor, critic = self.tt_actor, self.tt_critic
         rows = obs.batch_size[0]
         dist = actor.distribution
-        actor_in = actor.obs_to_device(obs)
-        critic_in = actor_in if self.storage.share_obs else critic.obs_to_device(obs)
-        mean = actor.forward(actor_in)
+        share = self.storage.share_obs
+        traced = self.trace_enabled
         # parity mode (BRIEF 3.5): the noise is drawn on the host from the global generator, the stream upstream's Normal.sample() uses
         # (randn of shape [rows, A]); padded action columns get zero noise.
-        noise = ctx.upload(pad_matrix(torch.randn(rows, actor.output_dim), rows, dist.dim_p), op="H-4", batch_sharded=True)
-        action = dist.sample(mean, noise)
-        logp = dist.log_prob(action, mean)
-        value = critic.forward(critic_in)[:, 0:1]
-        self._pending = dict(actor_obs=actor_in, critic_obs=critic_in, action=action, mean=mean, value=value, logp=logp)
-        return ctx.download(action, op="H-2")[:, : actor.output_dim].contiguous()  # the one per-step sync point (H-2)
+        noise_host = pad_matrix(torch.randn(rows, actor.output_dim), rows, dist.dim_p)
+        with self.timer.section("act.upload_obs"):
+            if traced:  # persistent input buffers, written in place (copy_host_to_device_tensor)
+                actor_in = actor.obs_to_device(obs, into=self._buf.get("act.actor_in"))
+                self._buf["act.actor_in"] = actor_in
+                if share:
+                    critic_in = actor_in
+                else:
+                    critic_in = critic.obs_to_device(obs, into=self._buf.get("act.critic_in"))
+                    self._buf["act.critic_in"] = critic_in
+                noise = ctx.upload_into(self._buf.get("act.noise"), noise_host, op="H-4", batch_sharded=True)
+                self._buf["act.noise"] = noise
+            else:
+                actor_in = actor.obs_to_device(obs)
+                critic_in = actor_in if share else critic.obs_to_device(obs)
+                noise = ctx.upload(noise_host, op="H-4", batch_sharded=True)
+        with self.timer.section("act.compute"):
+            if traced and "act" in self._traces:
+                self._replay("act")
+                out = {k: self._buf["act." + k] for k in ("action", "mean", "logp", "value")}
+            else:
+                out = self._act_graph(actor_in, critic_in, noise, persist=traced)
+                if traced:
+                    # warm-up: the first persist=True pass ADOPTS the outputs as persistent buffers; only the second one runs the in-place `ttnn.copy`
+                    # programs, and a program that is not in the program cache cannot be loaded during capture ("Warm up before capturing a trace")
+                    out = self._act_graph(actor_in, critic_in, noise, persist=True)
+                    self._capture("act", lambda: self._act_graph(actor_in, critic_in, noise, persist=True))
+        ttnn = ctx.ttnn
+        if traced:  # the trace's inputs and outputs are overwritten by the next step: keep this step's copies in the storage
+            a_obs = ttnn.clone(actor_in)
+            self._pending = dict(
+                actor_obs=a_obs, critic_obs=a_obs if share else ttnn.clone(critic_in),
+                action=ttnn.clone(out["action"]), mean=ttnn.clone(out["mean"]), value=ttnn.clone(out["value"]), logp=ttnn.clone(out["logp"]),
+            )
+        else:
+            self._pending = dict(actor_obs=actor_in, critic_obs=critic_in, action=out["action"], mean=out["mean"], value=out["value"], logp=out["logp"])
+        with self.timer.section("act.download_actions"):
+            return ctx.download(out["action"], op="H-2")[:, : actor.output_dim].contiguous()  # the one per-step sync point (H-2)
 
     def process_env_step(self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
         """Record one environment step on the device: upload (reward, done, time_out) in ONE tensor, bootstrap time-outs with V(s_t)."""
         ttnn = self.ctx.ttnn
         pending, self._pending = self._pending, None
         assert pending is not None, "process_env_step() without a preceding act()"
-        packed = self.ctx.upload(pack_step_scalars(rewards, dones, extras.get("time_outs")), op="H-1", batch_sharded=True)
-        reward, done, time_out = packed[:, 0:1], packed[:, 1:2], packed[:, 2:3]
-        # upstream: rewards += gamma * values * time_outs  (the pre-step value V(s_t), see UPSTREAM_SEMANTICS)
-        reward = ttnn.add(reward, ttnn.multiply(ttnn.multiply(pending["value"], time_out), self.gamma))
-        self.storage.add_transition(reward=reward, done=done, **pending)
+        with self.timer.section("process_env_step"):
+            packed = self.ctx.upload(pack_step_scalars(rewards, dones, extras.get("time_outs")), op="H-1", batch_sharded=True)
+            reward, done, time_out = packed[:, 0:1], packed[:, 1:2], packed[:, 2:3]
+            # upstream: rewards += gamma * values * time_outs  (the pre-step value V(s_t), see UPSTREAM_SEMANTICS)
+            reward = ttnn.add(reward, ttnn.multiply(ttnn.multiply(pending["value"], time_out), self.gamma))
+            self.storage.add_transition(reward=reward, done=done, **pending)
 
     def compute_returns(self, obs: TensorDict) -> None:
         """GAE on the device (storage.compute_returns); the last value comes from the device critic."""
         critic = self.tt_critic
-        last_values = critic.forward(critic.obs_to_device(obs))[:, 0:1]
-        self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantages=not self.normalize_advantage_per_mini_batch)
+        with self.timer.section("compute_returns"):
+            last_values = critic.forward(critic.obs_to_device(obs))[:, 0:1]
+            self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantages=not self.normalize_advantage_per_mini_batch)
 
     # -- update -------------------------------------------------------------------------------------------------------------
     def _params(self) -> list:
@@ -247,13 +330,53 @@ class TTPPO(PPO):
         a.mlp.set_parameters(new[:na])
         k = na
         if a.distribution.learn_std:
-            a.distribution.param = new[k]
+            a.distribution.param = self.ctx.put(a.distribution.param, new[k])
             a.distribution.refresh()
             k += 1
         c.mlp.set_parameters(new[k:])
 
+    def _acc(self, name: str):
+        """Persistent [1, 1] loss accumulators (in-place adds, so a traced mini-batch step keeps writing the same tensors)."""
+        if name not in self._buf:
+            self._buf[name] = self.ctx.upload_scalar(0.0, op="H-8")
+        return self._buf[name]
+
+    def _minibatch_step(self, i: int, rows: int) -> None:
+        """One mini-batch optimisation step on the persistent state: forward, KL / learning rate, losses, backward, per-model clipping, Adam.
+
+        Reads rows i*rows..(i+1)*rows of the persistent shuffled table, writes parameters, Adam moments, the learning rate and the loss accumulators IN
+        PLACE: the same function is executed eagerly and recorded as a trace. `adam.prepare_step()` (host side) must have run."""
+        ctx = self.ctx
+        ttnn = ctx.ttnn
+        st, actor, critic = self.storage, self.tt_actor, self.tt_critic
+        dist = actor.distribution
+        with self.timer.section("update.minibatch.slice"):
+            batch = st.split(self._buf["update.table"][i * rows : (i + 1) * rows, :])
+            adv = st.normalize(batch["advantages"], rows) if self.normalize_advantage_per_mini_batch and rows > 1 else batch["advantages"]
+        with self.timer.section("update.minibatch.forward"):
+            mean, cache_a = actor.forward_train(batch["actor_obs"])
+            value_out, cache_c = critic.forward_train(batch["critic_obs"])
+            entropy = dist.entropy_dev
+        with self.timer.section("update.minibatch.kl_lr"):
+            lr = self.lr_sched.update(self.losses.kl_mean(dist, batch["old_mean"], self._buf["update.old_var"], self._buf["update.old_log_std"], mean))
+        with self.timer.section("update.minibatch.loss"):
+            la = self.losses.actor(dist, mean, batch["actions"], batch["old_logp"], adv, rows)
+            lc = self.losses.critic(value_out[:, 0:1], batch["old_values"], batch["returns"], rows)
+        for name, value in (("value", lc["value_loss"]), ("surrogate", la["surrogate_loss"]), ("entropy", entropy)):
+            acc = self._acc("update.acc." + name)  # accumulate BEFORE the optimizer step: `entropy` is a persistent tensor that the step rewrites in place
+            ctx.put(acc, ttnn.add(acc, value))
+        with self.timer.section("update.minibatch.backward"):
+            grads_a = [t for pair in actor.mlp.backward(cache_a, la["d_mean"]) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
+            grads_c = [t for pair in critic.mlp.backward(cache_c, ttnn.multiply(lc["d_value"], self._col0)) for t in pair]
+        with self.timer.section("update.minibatch.clip"):
+            # upstream clips the actor group (incl. std) and the critic group SEPARATELY (DECISIONS C-1)
+            grads_a, _ = clip_grad_norm(ctx, grads_a, self.max_grad_norm)
+            grads_c, _ = clip_grad_norm(ctx, grads_c, self.max_grad_norm)
+        with self.timer.section("update.minibatch.adam"):
+            self._set_params(self.adam.step(self._params(), grads_a + grads_c, lr))
+
     def update(self) -> dict[str, float]:
-        """PPO optimisation epochs over the stored rollout (upstream `PPO.update`), entirely on the device."""
+        """PPO optimisation epochs over the stored rollout (upstream `PPO.update`), entirely on the device; with `trace` the mini-batch step is replayed."""
         ctx = self.ctx
         ttnn = ctx.ttnn
         st, actor, critic = self.storage, self.tt_actor, self.tt_critic
@@ -263,42 +386,42 @@ class TTPPO(PPO):
         if not 1 <= mb <= n:
             raise ValueError("num_mini_batches must be between 1 and the rollout batch size.")
         rows = n // mb
-        old_var, old_log_std = dist.var, dist.log_std  # the rollout's std (parameters do not change before the first optimizer step)
+        if self.adam is None:
+            self.adam = TTAdam(ctx, self._params())
+        # the rollout's std (parameters do not change before the first optimizer step), snapshotted into persistent buffers
+        for key, value in (("update.old_var", dist.var), ("update.old_log_std", dist.log_std)):
+            self._buf[key] = ctx.put(self._buf.get(key), value)
         actor_obs_all, critic_obs_all = st.all_actor_obs(), st.all_critic_obs()
+        with self.timer.section("update.pack_table"):
+            packed = st.packed_table()
         # one permutation per update, reused by every epoch (upstream mini_batch_generator); drawn on the host (parity mode, H-4)
-        table = st.shuffle(st.packed_table(), ctx.upload_index(torch.randperm(n), op="H-4"))
+        with self.timer.section("update.shuffle_gather"):
+            shuffled = st.shuffle(packed, ctx.upload_index(torch.randperm(n), op="H-4"))
+            self._buf["update.table"] = ctx.put(self._buf.get("update.table"), shuffled)
+        for name in ("value", "surrogate", "entropy"):
+            acc = self._acc("update.acc." + name)
+            ctx.put(acc, ttnn.multiply(acc, 0.0))
 
-        value_sum = surrogate_sum = entropy_sum = None
         for _epoch in range(self.num_learning_epochs):
             for i in range(mb):
-                batch = st.split(table[i * rows : (i + 1) * rows, :])
-                adv = st.normalize(batch["advantages"], rows) if self.normalize_advantage_per_mini_batch and rows > 1 else batch["advantages"]
-                mean, cache_a = actor.forward_train(batch["actor_obs"])
-                value_out, cache_c = critic.forward_train(batch["critic_obs"])
-                entropy = dist.entropy_dev
-                lr = self.lr_sched.update(self.losses.kl_mean(dist, batch["old_mean"], old_var, old_log_std, mean))
-                la = self.losses.actor(dist, mean, batch["actions"], batch["old_logp"], adv, rows)
-                lc = self.losses.critic(value_out[:, 0:1], batch["old_values"], batch["returns"], rows)
-                grads_a = [t for pair in actor.mlp.backward(cache_a, la["d_mean"]) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
-                grads_c = [t for pair in critic.mlp.backward(cache_c, ttnn.multiply(lc["d_value"], self._col0)) for t in pair]
-                # upstream clips the actor group (incl. std) and the critic group SEPARATELY (DECISIONS C-1)
-                grads_a, _ = clip_grad_norm(ctx, grads_a, self.max_grad_norm)
-                grads_c, _ = clip_grad_norm(ctx, grads_c, self.max_grad_norm)
-                params = self._params()
-                if self.adam is None:
-                    self.adam = TTAdam(ctx, params)
-                self._set_params(self.adam.step(params, grads_a + grads_c, lr))
-                value_sum = lc["value_loss"] if value_sum is None else ttnn.add(value_sum, lc["value_loss"])
-                surrogate_sum = la["surrogate_loss"] if surrogate_sum is None else ttnn.add(surrogate_sum, la["surrogate_loss"])
-                entropy_sum = entropy if entropy_sum is None else ttnn.add(entropy_sum, entropy)
+                self.adam.prepare_step()
+                key = f"update.step.{i}"
+                if self.trace_enabled and key in self._traces:
+                    with self.timer.section("update.minibatch.replay"):
+                        self._replay(key)
+                else:
+                    self._minibatch_step(i, rows)  # eager (always when tracing is off; the first occurrence of each step when it is on)
+                    if self.trace_enabled:
+                        self._capture(key, lambda i=i: self._minibatch_step(i, rows))
 
         # the normalizers learn from the whole rollout AFTER the epochs (upstream order)
-        actor.update_normalization(actor_obs_all, n)
-        critic.update_normalization(critic_obs_all, n)
+        with self.timer.section("update.normalizers"):
+            actor.update_normalization(actor_obs_all, n)
+            critic.update_normalization(critic_obs_all, n)
 
         num_updates = self.num_learning_epochs * mb
         host = lambda t: float(ctx.download(t, op="H-5", batch_sharded=False)[0, 0])
-        loss_dict = {"value": host(value_sum) / num_updates, "surrogate": host(surrogate_sum) / num_updates, "entropy": host(entropy_sum) / num_updates}
+        loss_dict = {k: host(self._acc("update.acc." + k)) / num_updates for k in ("value", "surrogate", "entropy")}
         self.learning_rate = host(self.lr_sched.lr)
         for group in self.optimizer.param_groups:  # keep the (unused) torch optimizer's lr in line for logging / checkpoints
             group["lr"] = self.learning_rate

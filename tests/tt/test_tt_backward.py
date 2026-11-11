@@ -275,6 +275,7 @@ def test_adam_matches_torch_over_many_steps_with_changing_lr(tt_ctx, shapes):
         for group in opt.param_groups:
             group["lr"] = lr
         opt.step()
+        tt.prepare_step()
         params = tt.step(params, [ctx.upload(gr, op="H-6", batch_sharded=False) for gr in grads], ctx.upload_scalar(lr, op="H-8"))
         for k, (p_tt, p_ref) in enumerate(zip(params, tparams)):
             rep = rec(f"adam shapes={len(shapes)} step={step} param{k}", compare(ctx.download(p_tt, op="H-6", batch_sharded=False), p_ref.detach(), TOLERANCES["adam_step"]))

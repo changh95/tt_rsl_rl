@@ -459,7 +459,32 @@ def test_update_host_traffic_is_exactly_the_allow_listed_scalars(tt_mesh, tmp_pa
     n_norm = sum(m.normalizer is not None for m in (alg.tt_actor, alg.tt_critic))
     calls = dict(alg.ctx.host_ops.calls)
     first_update_constants = 4  # the four unit rows used to assemble the packed table (H-6, built once, on the first update)
-    assert calls == {"H-4": 1, "H-5": 3 + 1 + 1, "H-8": 2 * steps + n_norm + 0, "H-6": first_update_constants}, calls
+    # H-8: two Adam bias-correction scalars per optimizer step, plus (first update only) Adam's two initial scalars and the three loss accumulators,
+    # plus one rate scalar per normalizer
+    assert calls == {"H-4": 1, "H-5": 3 + 1 + 1, "H-8": 2 * steps + 2 + 3 + n_norm, "H-6": first_update_constants}, calls
 
 
 STEPS_PER_ITER = 8
+
+
+def test_shuffle_is_bit_exact_for_extreme_values(tt_ctx):
+    """The bf16-split embedding gather must move ANY finite fp32 value unchanged: zeros, huge, tiny (down to 1e-30), mixed signs, repeated rows."""
+    from rsl_rl_tt.storage import TTRolloutStorage
+
+    steps, envs = 4, 64
+    st = TTRolloutStorage(tt_ctx, envs, steps, 32, 32, 32, True)
+    n, w = st.batch_size, st.width
+    g = torch.Generator().manual_seed(3)
+    exps = torch.randint(-30, 38, (n, w), generator=g).float()
+    table = torch.randn(n, w, generator=g) * torch.pow(10.0, exps)
+    table[::7] = 0.0
+    table[3, :] = torch.tensor([3.3e38, -3.3e38, 1e-30, -1e-30, 1.0, -1.0, 0.0] * (w // 7) + [0.0] * (w % 7))
+    perm = torch.randperm(n, generator=g)
+    dev = tt_ctx.upload(table, op="H-1", batch_sharded=True)
+    got = dl(tt_ctx, st.shuffle(dev, tt_ctx.upload_index(perm, op="H-4")))
+    want = table[perm]
+    normal = want.abs() >= 1e-30
+    bad = ((got != want) & normal).sum().item()
+    assert bad == 0, f"{bad} of {int(normal.sum())} values with |x| >= 1e-30 changed by the shuffle (max abs diff {(got - want).abs().max():.3e})"
+    # below that the tiny bf16 remainders (2^-16 of the value) reach the fp32 flush-to-zero threshold: the absolute error stays below ~2e-38
+    assert (got - want).abs().max() <= 2e-38

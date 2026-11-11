@@ -107,6 +107,35 @@ class TTContext:
             host = host[: host.shape[0] // self.n_chips]
         return host.to(torch.float32)
 
+    # -- persistent buffers (trace-compatible state) ----------------------------------------------------------------------------
+    def put(self, current: Any, new: Any) -> Any:
+        """Device -> device: write `new` into the persistent tensor `current` IN PLACE (so its address, which traces capture, never changes).
+        `current is None` adopts `new` as the persistent tensor."""
+        if current is None:
+            return new
+        self.ttnn.copy(new, current)
+        return current
+
+    def upload_into(self, current: Any, host: torch.Tensor, *, op: str, batch_sharded: bool = False) -> Any:
+        """Host -> device into the persistent tensor `current` in place (`copy_host_to_device_tensor`); a fresh upload when there is none yet."""
+        if current is None:
+            return self.upload(host, op=op, batch_sharded=batch_sharded)
+        ttnn = self.ttnn
+        self.host_ops.count(op, host.numel() * 4)
+        mapper = ttnn.ShardTensorToMesh(self.mesh, dim=0) if batch_sharded else ttnn.ReplicateTensorToMesh(self.mesh)
+        ttnn.copy_host_to_device_tensor(ttnn.from_torch(host.contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper), current)
+        return current
+
+    def upload_scalar_into(self, current: Any, value: float, *, op: str) -> Any:
+        """A replicated [1, 1] scalar written into the persistent tensor `current` (per-iteration scalars of a traced step)."""
+        if current is None:
+            return self.upload_scalar(value, op=op)
+        ttnn = self.ttnn
+        self.host_ops.count(op, 4)
+        host = ttnn.from_torch(torch.full((1, 1), float(value)), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
+        ttnn.copy_host_to_device_tensor(host, current)
+        return current
+
     def upload_scalar(self, value: float, *, op: str) -> Any:
         """A replicated [1, 1] float32 device tensor (per-iteration scalars travel as device tensors so a trace cannot freeze them)."""
         ttnn = self.ttnn
@@ -114,11 +143,11 @@ class TTContext:
         return ttnn.from_torch(torch.full((1, 1), float(value)), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
 
     def upload_index(self, host_idx: torch.Tensor, *, op: str) -> Any:
-        """A UINT32 [1, N] index row (N a multiple of 32) for `tosa_gather`; the permutation itself is drawn on the host (allow-list H-4)."""
+        """A UINT32 ROW_MAJOR [1, N] index row for `ttnn.embedding` (the row gather of the shuffle); the permutation itself is drawn on the host (allow-list H-4)."""
         ttnn = self.ttnn
         assert host_idx.dim() == 1 and host_idx.numel() % TILE == 0, host_idx.shape
         self.host_ops.count(op, host_idx.numel() * 4)
-        return ttnn.from_torch(host_idx.to(torch.int64).reshape(1, -1), dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=self.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
+        return ttnn.from_torch(host_idx.to(torch.int64).reshape(1, -1), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
 
     def zeros(self, rows: int, cols: int, *, batch_sharded: bool, op: str = "H-6") -> Any:
         return self.upload(torch.zeros(rows, cols), op=op, batch_sharded=batch_sharded)
@@ -186,3 +215,42 @@ def pack_step_scalars(reward: torch.Tensor, done: torch.Tensor, time_out: torch.
     if time_out is not None:
         buf[:, 2] = time_out.to(torch.float32).reshape(n)
     return buf
+
+
+class SectionTimer:
+    """Optional wall-clock profile of named sections (host time with a device synchronisation at each boundary). Off by default: `section()` is a no-op."""
+
+    def __init__(self, ctx: "TTContext | None" = None, enabled: bool = False) -> None:
+        self.ctx, self.enabled = ctx, enabled
+        self.totals: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+
+    def section(self, name: str):
+        timer = self
+
+        class _Section:
+            def __enter__(self_inner):
+                if timer.enabled:
+                    timer.ctx.ttnn.synchronize_device(timer.ctx.mesh)
+                    import time
+
+                    self_inner.t0 = time.perf_counter()
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                if timer.enabled:
+                    import time
+
+                    timer.ctx.ttnn.synchronize_device(timer.ctx.mesh)
+                    dt = time.perf_counter() - self_inner.t0
+                    timer.totals[name] = timer.totals.get(name, 0.0) + dt
+                    timer.counts[name] = timer.counts.get(name, 0) + 1
+
+        return _Section()
+
+    def reset(self) -> None:
+        self.totals.clear()
+        self.counts.clear()
+
+    def report(self) -> dict[str, dict[str, float]]:
+        return {k: {"total_ms": v * 1e3, "calls": self.counts[k], "ms_per_call": v * 1e3 / self.counts[k]} for k, v in sorted(self.totals.items(), key=lambda kv: -kv[1])}

@@ -24,27 +24,38 @@ class TTAdam:
         ttnn = ctx.ttnn
         self.m = [ttnn.zeros_like(p) for p in params]
         self.v = [ttnn.zeros_like(p) for p in params]
+        # the two bias-correction scalars are PERSISTENT device tensors written by `prepare_step()` before every (replayed) step
+        self.inv_bc1 = ctx.upload_scalar(1.0, op="H-8")
+        self.inv_sqrt_bc2 = ctx.upload_scalar(1.0, op="H-8")
 
     def load_state(self, m: list, v: list, t: int) -> None:
         """Replace the moments (device tensors, same order and shapes as the parameters) and the step counter (checkpoint resume)."""
         assert len(m) == len(self.m) and len(v) == len(self.v)
-        self.m, self.v, self.t = list(m), list(v), int(t)
+        for k in range(len(m)):
+            self.m[k] = self.ctx.put(self.m[k], m[k])
+            self.v[k] = self.ctx.put(self.v[k], v[k])
+        self.t = int(t)
+
+    def prepare_step(self) -> None:
+        """Advance the host step counter and write the step's two bias-correction scalars into their persistent device tensors (H-8)."""
+        self.t += 1
+        self.ctx.upload_scalar_into(self.inv_bc1, 1.0 / (1.0 - self.beta1**self.t), op="H-8")
+        self.ctx.upload_scalar_into(self.inv_sqrt_bc2, 1.0 / (1.0 - self.beta2**self.t) ** 0.5, op="H-8")
 
     def step(self, params: list, grads: list, lr: Any) -> list:
-        """One Adam step for all parameters. `lr` is a [1, 1] device tensor (the adaptive learning rate)."""
+        """One Adam step for all parameters (`prepare_step()` must have run). `lr` is a [1, 1] device tensor. Returns the NEW parameter values;
+        the moments are updated in place."""
         ctx = self.ctx
         ttnn = ctx.ttnn
-        self.t += 1
-        inv_bc1 = ctx.upload_scalar(1.0 / (1.0 - self.beta1**self.t), op="H-8")
-        inv_sqrt_bc2 = ctx.upload_scalar(1.0 / (1.0 - self.beta2**self.t) ** 0.5, op="H-8")
-        neg_step_size = ttnn.neg(ttnn.multiply(lr, inv_bc1))  # -lr / bias_correction1
+        neg_step_size = ttnn.neg(ttnn.multiply(lr, self.inv_bc1))  # -lr / bias_correction1
         new_params = []
         for k, (p, g) in enumerate(zip(params, grads)):
             m = ttnn.add(self.m[k], ttnn.multiply(ttnn.subtract(g, self.m[k]), 1.0 - self.beta1))  # exp_avg.lerp_(grad, 1 - beta1)
             v = ttnn.add(ttnn.multiply(self.v[k], self.beta2), ttnn.multiply(ttnn.square(g), 1.0 - self.beta2))  # exp_avg_sq.mul_(beta2).addcmul_(g, g, 1 - beta2)
-            denom = ttnn.add(ttnn.multiply(ttnn.sqrt(v), inv_sqrt_bc2), self.eps)  # sqrt(v) / sqrt(bc2) + eps
+            denom = ttnn.add(ttnn.multiply(ttnn.sqrt(v), self.inv_sqrt_bc2), self.eps)  # sqrt(v) / sqrt(bc2) + eps
             new_params.append(ttnn.add(p, ttnn.multiply(ttnn.divide(m, denom), neg_step_size)))  # p.addcdiv_(m, denom, value=-step_size)
-            self.m[k], self.v[k] = m, v
+            self.m[k] = ctx.put(self.m[k], m)
+            self.v[k] = ctx.put(self.v[k], v)
         return new_params
 
 
@@ -78,10 +89,10 @@ class TTAdaptiveLR:
         self.ctx = ctx
         self.desired_kl = desired_kl
         self.adaptive = desired_kl is not None and schedule == "adaptive"
-        self.lr = ctx.upload_scalar(learning_rate, op="H-8")
+        self.lr = ctx.upload_scalar(learning_rate, op="H-8")  # persistent: updated in place by `update()` / `set()`
 
     def set(self, learning_rate: float) -> None:
-        self.lr = self.ctx.upload_scalar(learning_rate, op="H-8")
+        self.lr = self.ctx.upload_scalar_into(self.lr, learning_rate, op="H-8")
 
     def update(self, kl_mean: Any) -> Any:
         if not self.adaptive:
@@ -92,5 +103,5 @@ class TTAdaptiveLR:
         lr_up = ttnn.minimum(ttnn.multiply(lr, self.FACTOR), self.LR_MAX)
         too_big = ttnn.gt(kl_mean, 2.0 * self.desired_kl)
         small = ttnn.multiply(ttnn.lt(kl_mean, self.desired_kl / 2.0), ttnn.gt(kl_mean, 0.0))
-        self.lr = ttnn.where(too_big, lr_down, ttnn.where(small, lr_up, lr))
+        self.lr = self.ctx.put(self.lr, ttnn.where(too_big, lr_down, ttnn.where(small, lr_up, lr)))
         return self.lr

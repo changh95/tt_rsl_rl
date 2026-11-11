@@ -1,0 +1,24 @@
+{
+  "N=98304 M=24576 C=256": {
+    "split_ms": 4.0,
+    "to_row_major_ms": 0.74,
+    "embedding_ms": 5.11,
+    "embedding_ms_second_call": 0.24,
+    "combine_ms_warm": 1.12,
+    "whole_gather_pipeline_ms_warm": 5.93,
+    "bit_exact": true,
+    "mismatched": 0,
+    "max_abs_err": 0.0
+  },
+  "N=393216 M=98304 C=256": {
+    "split_ms": 15.85,
+    "to_row_major_ms": 2.79,
+    "embedding_ms": 6.62,
+    "embedding_ms_second_call": 0.8,
+    "combine_ms_warm": 4.11,
+    "whole_gather_pipeline_ms_warm": 23.24,
+    "bit_exact": true,
+    "mismatched": 0,
+    "max_abs_err": 0.0
+  }
+}
