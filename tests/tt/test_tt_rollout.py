@@ -84,7 +84,9 @@ def test_runner_builds_ttppo_and_rollout_matches_the_upstream_models_step_by_ste
     # only allow-listed transfers happened, with exactly the expected counts: per step the obs uploads (actor [+ critic]), one noise upload,
     # one action download, ONE packed (reward, done, time_out) upload; compute_returns uploads the critic's obs once; no H-5 (std is cached)
     calls = dict(ctx.host_ops.calls)
-    assert calls == {"H-1": STEPS * (n_obs_uploads + 1) + 1, "H-3": STEPS * n_obs_uploads + 1, "H-4": STEPS, "H-2": STEPS, "H-6": 3 * STEPS + 2 + 1 + 4}, calls
+    assert calls == {"H-1": STEPS * (n_obs_uploads + 1) + 1, "H-3": STEPS * n_obs_uploads + 1, "H-4": STEPS, "H-2": STEPS, "H-6": 3 * STEPS + 2 + 1}, calls
+    # (Phase 5: the four unit rows of `packed_table` used to be uploaded here, on its first call, and are now built when the storage is constructed,
+    # before any trace can be captured (TTNN_ISSUES T-15): the same four H-6 transfers, but outside this counting window.)
 
 
 @pytest.mark.parametrize("name", ENV_NAMES)

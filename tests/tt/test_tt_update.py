@@ -458,10 +458,10 @@ def test_update_host_traffic_is_exactly_the_allow_listed_scalars(tt_mesh, tmp_pa
     steps = alg.num_learning_epochs * alg.num_mini_batches
     n_norm = sum(m.normalizer is not None for m in (alg.tt_actor, alg.tt_critic))
     calls = dict(alg.ctx.host_ops.calls)
-    first_update_constants = 4  # the four unit rows used to assemble the packed table (H-6, built once, on the first update)
-    # H-8: two Adam bias-correction scalars per optimizer step, plus (first update only) Adam's two initial scalars and the three loss accumulators,
-    # plus one rate scalar per normalizer
-    assert calls == {"H-4": 1, "H-5": 3 + 1 + 1, "H-8": 2 * steps + 2 + 3 + n_norm, "H-6": first_update_constants}, calls
+    # H-8: two Adam bias-correction scalars per optimizer step plus one rate scalar per normalizer. (Phase 5: the constants that the first update used to
+    # create lazily - the four unit rows of the packed table (H-6), Adam's two initial scalars and the three loss accumulators (H-8) - are now built when
+    # the algorithm is constructed, before any trace can be captured (TTNN_ISSUES T-15): the same transfers, outside this counting window.)
+    assert calls == {"H-4": 1, "H-5": 3 + 1 + 1, "H-8": 2 * steps + n_norm}, calls
 
 
 STEPS_PER_ITER = 8

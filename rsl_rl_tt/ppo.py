@@ -31,6 +31,9 @@ from rsl_rl_tt.storage import TTRolloutStorage
 from rsl_rl_tt.tt_common import SectionTimer, TTContext, linear_from_host, pack_step_scalars, pad_matrix, pad_vector, unit_row
 
 
+_CAPTURED_TRACES: dict[int, int] = {}  # id(TrayMesh) -> number of live captured traces on that mesh (guard against the T-15 overwrite hazard)
+
+
 class TTPPO(PPO):
     """PPO on the tray mesh (a single chip until Phase 6)."""
 
@@ -55,6 +58,13 @@ class TTPPO(PPO):
         if self.trace_enabled:
             self._mesh_kwargs.setdefault("trace_region_size", 128 * 1024 * 1024)
         self.tray = acquire_tray_mesh(mesh_shape, **self._mesh_kwargs)
+        if _CAPTURED_TRACES.get(id(self.tray), 0):
+            # T-15: the intermediates of a captured trace are freed after the capture, and every replay rewrites them. Device state that this algorithm
+            # allocates now could sit on those addresses and be silently overwritten by the other algorithm's replays.
+            raise RuntimeError(
+                "a captured trace is alive on this mesh: construct every TTPPO BEFORE the first trace is captured, or call release_traces() on the "
+                "algorithm that owns them (TTNN_ISSUES T-15)"
+            )
         self.ctx = TTContext.create(self.tray.mesh_device)
         if self.trace_enabled:
             self.tray.add_close_hook(self.release_traces)  # captured traces must be released before the device is closed
@@ -65,17 +75,25 @@ class TTPPO(PPO):
             raise ValueError("the actor needs a distribution_cfg (GaussianDistribution)")
         share = self.tt_actor.obs_groups == self.tt_critic.obs_groups
         self.storage = TTRolloutStorage(  # replaces the host RolloutStorage that upstream's construct_algorithm built
-            self.ctx, storage.num_envs, storage.num_transitions_per_env, self.tt_actor.obs_dim_p, self.tt_critic.obs_dim_p, self.tt_actor.distribution.dim_p, share
+            self.ctx, storage.num_envs, storage.num_transitions_per_env, self.tt_actor.obs_dim_p, self.tt_critic.obs_dim_p, self.tt_actor.distribution.dim_p, share,
+            persistent=self.trace_enabled,
         )
         self.losses = PPOLosses(
             self.ctx, clip_param=self.clip_param, value_loss_coef=self.value_loss_coef, entropy_coef=self.entropy_coef, use_clipped_value_loss=self.use_clipped_value_loss
         )
         self.lr_sched = TTAdaptiveLR(self.ctx, self.learning_rate, self.desired_kl, self.schedule)
-        self.adam: TTAdam | None = None
         self._col0 = self.ctx.upload(unit_row(0, 32), op="H-6", batch_sharded=False)  # places the critic's single output in column 0
         self._pending: dict | None = None
         self._traces: dict = {}  # name -> trace id (act, update.step.<i>)
         self._buf: dict = {}  # persistent device buffers that traces read and write (inputs, outputs, accumulators)
+        # PERSISTENT-STATE RULE of the traced path (TTNN_ISSUES T-15): a trace's intermediates are freed when its capture ends, so anything that keeps a
+        # value across replays must be allocated BEFORE the first capture. Here: Adam moments, loss accumulators, the rollout storage slots (and the
+        # constants of storage / losses / distribution created above). Buffers that are rewritten before every use (update.table, act inputs) are exempt.
+        self.adam: TTAdam | None = TTAdam(self.ctx, self._params())
+        for name in ("value", "surrogate", "entropy"):
+            self._acc("update.acc." + name)
+        if self.trace_enabled:
+            self.storage.preallocate()
         self.timer = SectionTimer(self.ctx, enabled=False)  # `alg.timer.enabled = True` profiles the sections below (adds device syncs)
         self._weights_stale = False  # True while the device holds newer parameters than the torch mirrors
         self._optimizer_stale = False  # the same for the Adam moments
@@ -225,6 +243,7 @@ class TTPPO(PPO):
             raise
         ttnn.end_trace_capture(self.ctx.mesh, trace_id, cq_id=0)
         self._traces[name] = trace_id
+        _CAPTURED_TRACES[id(self.tray)] = _CAPTURED_TRACES.get(id(self.tray), 0) + 1
 
     def _replay(self, name: str) -> None:
         self.ctx.ttnn.execute_trace(self.ctx.mesh, self._traces[name], cq_id=0, blocking=False)
@@ -232,6 +251,7 @@ class TTPPO(PPO):
     def release_traces(self) -> None:
         for trace_id in self._traces.values():
             self.ctx.ttnn.release_trace(self.ctx.mesh, trace_id)
+        _CAPTURED_TRACES[id(self.tray)] = _CAPTURED_TRACES.get(id(self.tray), 0) - len(self._traces)
         self._traces.clear()
 
     def _act_graph(self, actor_in, critic_in, noise, persist: bool) -> dict:
@@ -259,6 +279,7 @@ class TTPPO(PPO):
         dist = actor.distribution
         share = self.storage.share_obs
         traced = self.trace_enabled
+        assert not traced or self.storage.persistent, "a traced act step needs the persistent (preallocated) rollout storage"
         # parity mode (BRIEF 3.5): the noise is drawn on the host from the global generator, the stream upstream's Normal.sample() uses
         # (randn of shape [rows, A]); padded action columns get zero noise.
         noise_host = pad_matrix(torch.randn(rows, actor.output_dim), rows, dist.dim_p)
@@ -288,15 +309,9 @@ class TTPPO(PPO):
                     # programs, and a program that is not in the program cache cannot be loaded during capture ("Warm up before capturing a trace")
                     out = self._act_graph(actor_in, critic_in, noise, persist=True)
                     self._capture("act", lambda: self._act_graph(actor_in, critic_in, noise, persist=True))
-        ttnn = ctx.ttnn
-        if traced:  # the trace's inputs and outputs are overwritten by the next step: keep this step's copies in the storage
-            a_obs = ttnn.clone(actor_in)
-            self._pending = dict(
-                actor_obs=a_obs, critic_obs=a_obs if share else ttnn.clone(critic_in),
-                action=ttnn.clone(out["action"]), mean=ttnn.clone(out["mean"]), value=ttnn.clone(out["value"]), logp=ttnn.clone(out["logp"]),
-            )
-        else:
-            self._pending = dict(actor_obs=actor_in, critic_obs=critic_in, action=out["action"], mean=out["mean"], value=out["value"], logp=out["logp"])
+        # Traced: these are the trace's persistent buffers, overwritten by the next replay; `process_env_step` -> `add_transition` copies them into this
+        # step's preallocated storage slot before that happens (no tensor is allocated here: see the persistent-state rule in __init__).
+        self._pending = dict(actor_obs=actor_in, critic_obs=critic_in, action=out["action"], mean=out["mean"], value=out["value"], logp=out["logp"])
         with self.timer.section("act.download_actions"):
             return ctx.download(out["action"], op="H-2")[:, : actor.output_dim].contiguous()  # the one per-step sync point (H-2)
 
@@ -391,7 +406,6 @@ class TTPPO(PPO):
         # the rollout's std (parameters do not change before the first optimizer step), snapshotted into persistent buffers
         for key, value in (("update.old_var", dist.var), ("update.old_log_std", dist.log_std)):
             self._buf[key] = ctx.put(self._buf.get(key), value)
-        actor_obs_all, critic_obs_all = st.all_actor_obs(), st.all_critic_obs()
         with self.timer.section("update.pack_table"):
             packed = st.packed_table()
         # one permutation per update, reused by every epoch (upstream mini_batch_generator); drawn on the host (parity mode, H-4)
@@ -416,8 +430,9 @@ class TTPPO(PPO):
 
         # the normalizers learn from the whole rollout AFTER the epochs (upstream order)
         with self.timer.section("update.normalizers"):
-            actor.update_normalization(actor_obs_all, n)
-            critic.update_normalization(critic_obs_all, n)
+            # built HERE, not before the epochs: a tensor allocated before a replay and read after it can be overwritten by that replay (T-15)
+            actor.update_normalization(st.all_actor_obs(), n)
+            critic.update_normalization(st.all_critic_obs(), n)
 
         num_updates = self.num_learning_epochs * mb
         host = lambda t: float(ctx.download(t, op="H-5", batch_sharded=False)[0, 0])

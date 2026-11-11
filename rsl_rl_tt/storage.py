@@ -23,12 +23,24 @@ SCALAR_BLOCK = 32
 
 
 class TTRolloutStorage:
-    def __init__(self, ctx: TTContext, num_envs: int, num_transitions_per_env: int, actor_dim_p: int, critic_dim_p: int, act_dim_p: int, share_obs: bool) -> None:
+    """Device rollout storage.
+
+    `persistent=False` (eager path): a step is stored by reference (nothing is copied).
+    `persistent=True` (traced path): every step has PREALLOCATED device buffers (`preallocate()`, before the first trace is captured) and
+    `add_transition` copies into them in place. A trace's intermediate tensors are freed when its capture ends, so any tensor that is allocated
+    AFTER a capture and must keep its value across replays can land on those addresses and is overwritten by the next replay (found in Phase 5:
+    docs/porting/TTNN_ISSUES.md T-15). The persistent-state rule of the traced path: everything that survives a replay is allocated first."""
+
+    def __init__(
+        self, ctx: TTContext, num_envs: int, num_transitions_per_env: int, actor_dim_p: int, critic_dim_p: int, act_dim_p: int, share_obs: bool, persistent: bool = False
+    ) -> None:
         self.ctx = ctx
         self.num_envs, self.num_transitions_per_env = num_envs, num_transitions_per_env
         self.actor_dim_p, self.critic_dim_p, self.act_dim_p, self.share_obs = actor_dim_p, critic_dim_p, act_dim_p, share_obs
+        self.persistent = persistent
         self.step = 0
         self._steps: list[dict] = []
+        self._slots: list[dict] | None = None
         self.returns = self.advantages = None
         # column layout of the packed table
         self.col_actor = 0
@@ -37,7 +49,18 @@ class TTRolloutStorage:
         self.col_mean = self.col_action + act_dim_p
         self.col_scalars = self.col_mean + act_dim_p
         self.width = self.col_scalars + SCALAR_BLOCK
-        self._unit_cols = None
+        # constant selector rows of `packed_table` (persistent device state: created here, before any trace is captured)
+        self._unit_cols = {name: ctx.upload(unit_row(col, SCALAR_BLOCK), op="H-6", batch_sharded=False) for name, col in SCALAR_COLS.items()}
+
+    def preallocate(self) -> None:
+        """Allocate the per-step buffers of the whole rollout (zeros). Must run before the first trace capture (see the class docstring)."""
+        zeros = lambda cols: self.ctx.zeros(self.num_envs, cols, batch_sharded=True)
+        slots = []
+        for _ in range(self.num_transitions_per_env):
+            slot = dict(actor_obs=zeros(self.actor_dim_p), action=zeros(self.act_dim_p), mean=zeros(self.act_dim_p), value=zeros(1), logp=zeros(1), reward=zeros(1), done=zeros(1))
+            slot["critic_obs"] = slot["actor_obs"] if self.share_obs else zeros(self.critic_dim_p)
+            slots.append(slot)
+        self._slots = slots
 
     @property
     def batch_size(self) -> int:
@@ -47,7 +70,15 @@ class TTRolloutStorage:
     def add_transition(self, *, actor_obs: Any, critic_obs: Any, action: Any, mean: Any, value: Any, logp: Any, reward: Any, done: Any) -> None:
         if self.step >= self.num_transitions_per_env:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
-        self._steps.append(dict(actor_obs=actor_obs, critic_obs=critic_obs, action=action, mean=mean, value=value, logp=logp, reward=reward, done=done))
+        fields = dict(actor_obs=actor_obs, critic_obs=critic_obs, action=action, mean=mean, value=value, logp=logp, reward=reward, done=done)
+        if self.persistent:
+            assert self._slots is not None, "preallocate() must run before the first transition of a persistent storage"
+            slot = self._slots[self.step]
+            for key, tensor in fields.items():
+                if not (key == "critic_obs" and self.share_obs):  # shared observations: the critic slot IS the actor slot
+                    self.ctx.put(slot[key], tensor)
+            fields = slot
+        self._steps.append(fields)
         self.step += 1
 
     def clear(self) -> None:
@@ -97,11 +128,9 @@ class TTRolloutStorage:
     def all_critic_obs(self) -> Any:
         return self.all_actor_obs() if self.share_obs else self._cat("critic_obs")
 
-    def _unit(self, k: int) -> Any:
-        """[1, 32] row with a 1 in column k (selects a scalar column when blocks are assembled)."""
-        if self._unit_cols is None:
-            self._unit_cols = {name: self.ctx.upload(unit_row(col, SCALAR_BLOCK), op="H-6", batch_sharded=False) for name, col in SCALAR_COLS.items()}
-        return self._unit_cols[k]
+    def _unit(self, name: str) -> Any:
+        """[1, 32] row with a 1 in the column of scalar `name` (selects a scalar column when blocks are assembled)."""
+        return self._unit_cols[name]
 
     def packed_table(self) -> Any:
         """[batch, width] fp32 table of the whole rollout in upstream's flatten order (advantages/returns must be computed)."""
