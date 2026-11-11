@@ -8,7 +8,9 @@
     MUJOCO_GL=egl python examples/g1_walk/play.py --checkpoint random .run/examples/g1_walk/model_100.pt .run/examples/g1_walk/model_1499.pt --video g1.mp4 --gif g1.gif
 
 The robot follows 0.4 m/s, 0.8 m/s, then 0.5 m/s while turning left and right (5 s each). The label of a panel names the iteration of the checkpoint (`model_100.pt` is the state after
-101 iterations); the counter shows how often the robot fell (it then starts again, like in training). `MUJOCO_GL=egl` renders headless; the video needs imageio-ffmpeg.
+101 iterations); the counter shows how often the robot fell (it then starts again, like in training). Under every panel the REWARD of that robot is plotted live (the return of its current
+episode, one scale for all panels, red ticks = falls) and under all panels the LEARNING CURVE of the training run (mean episode return and speed against the iteration, with the iteration of every
+panel marked); the curve is read from the `metrics.csv` that `train.py` writes next to the checkpoints. `MUJOCO_GL=egl` renders headless; the video needs imageio-ffmpeg.
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ def main() -> None:
     ap.add_argument("--checkpoint", nargs="+", required=True, help="`random` and/or model_<it>.pt files (upstream format)")
     ap.add_argument("--video", default=None, help="MP4 of the checkpoints side by side")
     ap.add_argument("--gif", default=None, help="a small GIF of the same")
+    ap.add_argument("--metrics", default=None, help="metrics.csv of the training run, for the reward / learning-curve strips of the video (default: the metrics.csv next to the checkpoints)")
+    ap.add_argument("--no-curves", action="store_true", help="a video of the robots only: no return strips, no learning curve")
     ap.add_argument("--no-eval", action="store_true", help="skip the measurement")
     ap.add_argument("--eval-envs", type=int, default=64, help="robots of the measurement (each holds one command for 12 s)")
     args = ap.parse_args()
@@ -42,7 +46,11 @@ def main() -> None:
                 print(f"  command vx {cmd[0]:.1f} m/s, yaw rate {cmd[2]:+.1f} rad/s -> vx {m['mean_vx']:.2f} m/s, yaw rate {m['mean_yaw_rate']:+.2f} rad/s, "
                       f"{100 * m['fell_fraction']:.0f} % of the finished episodes were falls")
     if args.video or args.gif:
-        render_comparison(args.checkpoint, video=args.video, gif=args.gif)
+        metrics = args.metrics
+        if metrics is None and not args.no_curves:
+            beside = [Path(ck).parent / "metrics.csv" for ck in args.checkpoint if ck != "random"]
+            metrics = next((str(m) for m in beside if m.exists()), None)
+        render_comparison(args.checkpoint, video=args.video, gif=args.gif, metrics=None if args.no_curves else metrics)
 
 
 if __name__ == "__main__":
