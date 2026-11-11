@@ -39,16 +39,18 @@ SEED = 0
 REFERENCE = "mc_step_reference.npz"  # .npz, not .pt: checkpoints (*.pt) are git-ignored on purpose (BRIEF 2-10); this is a small test fixture
 REFERENCE_HETERO = "mc_step_reference_hetero.npz"  # the same with a heteroscedastic actor (Phase 8.1)
 REFERENCE_RND = "mc_step_reference_rnd.npz"  # the same with RND (Phase 8.2): the predictor's embedding is compared as well
+REFERENCE_SYM = "mc_step_reference_sym.npz"  # the same with the symmetry extension (Phase 8.3): data augmentation (4 copies) + mirror loss
 RND_CFG = {"predictor_hidden_dims": [48, 48], "target_hidden_dims": [48, 48], "num_outputs": 24, "activation": "elu", "state_normalization": True, "reward_normalization": True, "weight": 1.0, "learning_rate": 1e-3}
 RND_GROUPS = {"actor": ["policy"], "critic": ["policy", "privileged"], "rnd_state": ["privileged"]}  # the RND state is a set of groups of its own: the storage keeps a block for it
 KEYS = ("actor_before", "critic_before", "actor_after", "critic_after")
 RND_KEYS = ("rnd_before", "rnd_after")
 
 
-def make_runner(mesh_shape: list[int], hetero: bool = False, rnd: bool = False):
+def make_runner(mesh_shape: list[int], hetero: bool = False, rnd: bool = False, symmetry: bool = False):
     """The TTPPO runner of the test (eager, no rollout is ever run on it); `hetero`: a heteroscedastic Gaussian actor (state-dependent std); `rnd`: Random Network Distillation."""
     base = REF_SPECS[ENV]
-    spec = RefSpec(num_envs=256, num_steps=8, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1, **({"rnd_cfg": dict(RND_CFG)} if rnd else {})},
+    spec = RefSpec(num_envs=256, num_steps=8, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1, **({"rnd_cfg": dict(RND_CFG)} if rnd else {}),
+                              **({"symmetry_cfg": {"data_augmentation_func": "rsl_rl_tt.testing.symmetry:tracking12_dihedral_mirror", "use_data_augmentation": True, "use_mirror_loss": True, "mirror_loss_coeff": 0.5}} if symmetry else {})},
                    **({"distribution": "HeteroscedasticGaussianDistribution"} if hetero else {}), **({"obs_groups": RND_GROUPS} if rnd else {}))
     runner, _, _ = build_reference_runner(ENV, SEED, None, spec, tt=True, tt_cfg={"mesh_shape": list(mesh_shape)})
     return runner
@@ -94,6 +96,18 @@ def make_pool(alg: Any, seed: int = 1) -> tuple[torch.Tensor, TensorDict]:
         table[:, st.col_std : st.col_std + st.act_dim_p] = pad_matrix(std, rows, st.act_dim_p, fill=1.0)  # a stored std is 1 in the padded columns
     if st.rnd_own:
         table[:, st.col_rnd : st.col_rnd + st.rnd_dim_p] = stage_obs(obs, alg.rnd_tt.groups, st.rnd_dim_p)
+    if alg.sym_tt is not None:  # the mirrored copies of the observations and actions: computed on the host with the user's function (the device maps are tested against it elsewhere)
+        aug_obs, aug_act = alg.symmetry.data_augmentation_func(env=None, obs=obs, actions=action)
+        for name, (a, b) in st.extra_cols.items():
+            kind, k = name.rsplit("_", 1)
+            k = int(k)
+            sel = slice(k * rows, (k + 1) * rows)
+            if kind == "sym_actor":
+                table[:, a:b] = stage_obs(aug_obs[sel], alg.tt_actor.obs_groups, st.actor_dim_p)
+            elif kind == "sym_critic":
+                table[:, a:b] = stage_obs(aug_obs[sel], alg.tt_critic.obs_groups, st.critic_dim_p)
+            else:
+                table[:, a:b] = pad_matrix(aug_act[sel], rows, st.act_dim_p)
     for name, col in (("value", old_value), ("returns", returns), ("advantages", adv), ("old_logp", old_logp)):
         table[:, st.col_scalars + {"value": 0, "returns": 1, "advantages": 2, "old_logp": 3}[name]] = col
     return table, obs

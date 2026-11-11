@@ -1,0 +1,108 @@
+{
+  "backend": "TTPPO on one Blackhole chip (tray 3, node 16), fp32 policy, math fidelity HiFi4, traced, unmodified OnPolicyRunner",
+  "envs": {
+    "cartpole": {
+      "seeds": {
+        "0": {
+          "iterations": 100,
+          "wall_s": 21.0,
+          "final_reward": 500.0
+        },
+        "1": {
+          "iterations": 100,
+          "wall_s": 16.0,
+          "final_reward": 500.0
+        },
+        "2": {
+          "iterations": 100,
+          "wall_s": 16.2,
+          "final_reward": 500.0
+        }
+      },
+      "num_envs": 1024,
+      "num_steps_per_env": 24,
+      "criterion": {
+        "tt_final_rewards": [
+          500.0,
+          500.0,
+          500.0
+        ],
+        "tt_mean": 500.0,
+        "reference_mean": 500.0,
+        "reference_std": 0.0,
+        "threshold": 475.0,
+        "all_finite": true,
+        "passes": true
+      }
+    },
+    "pendulum": {
+      "seeds": {
+        "0": {
+          "iterations": 200,
+          "wall_s": 51.7,
+          "final_reward": -150.70322376346587
+        },
+        "1": {
+          "iterations": 200,
+          "wall_s": 43.6,
+          "final_reward": -150.06211445400118
+        },
+        "2": {
+          "iterations": 200,
+          "wall_s": 42.5,
+          "final_reward": -152.6822150360346
+        }
+      },
+      "num_envs": 1024,
+      "num_steps_per_env": 32,
+      "criterion": {
+        "tt_final_rewards": [
+          -150.70322376346587,
+          -150.06211445400118,
+          -152.6822150360346
+        ],
+        "tt_mean": -151.14918441783388,
+        "reference_mean": -152.40818103686968,
+        "reference_std": 1.3184154872646436,
+        "threshold": -160.02859008871317,
+        "all_finite": true,
+        "passes": true
+      }
+    },
+    "tracking12": {
+      "seeds": {
+        "0": {
+          "iterations": 300,
+          "wall_s": 109.7,
+          "final_reward": 184.32138424682617
+        },
+        "1": {
+          "iterations": 300,
+          "wall_s": 96.9,
+          "final_reward": 186.08871154022216
+        },
+        "2": {
+          "iterations": 300,
+          "wall_s": 98.8,
+          "final_reward": 182.89365351867676
+        }
+      },
+      "num_envs": 2048,
+      "num_steps_per_env": 24,
+      "criterion": {
+        "tt_final_rewards": [
+          184.32138424682617,
+          186.08871154022216,
+          182.89365351867676
+        ],
+        "tt_mean": 184.43458310190837,
+        "reference_mean": 183.70533433278402,
+        "reference_std": 1.4897377245599495,
+        "threshold": 174.52006761614481,
+        "all_finite": true,
+        "passes": true
+      }
+    }
+  },
+  "total_wall_s": 497.9
+}

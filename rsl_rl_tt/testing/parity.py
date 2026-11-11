@@ -57,6 +57,7 @@ TOLERANCES: dict[str, Tol] = {
     # Phase 8.2 (RND; measured 2026-11-11, tests/tt/test_tt_rnd.py, ~3x the measured maxima 2.6e-3 / 5.4e-3 / 5.7e-3)
     "rnd_intrinsic_reward": Tol("RND intrinsic reward: length of the difference of two MLP embeddings (untrained predictor), scaled", rel_fro=8e-3, doc_tokens=("**8e-3**",)),
     "rnd_predictor_loss": Tol("RND predictor loss (MSE of the two embeddings) of one mini-batch / the mean over an update", rel_fro=1.6e-2, doc_tokens=("**1.6e-2**",)),
+    "update_symmetry_loss": Tol("PPO.update mirror loss (MSE between the actor's mean on mirrored observations and the mirrored mean on the originals; mean over the update's mini-batches)", rel_fro=5e-2, doc_tokens=("**5e-2**",)),
     "rnd_reward_stats": Tol("RND reward normalizer: running mean / var / std of the discounted reward sum after a few steps", rel_fro=1.8e-2, doc_tokens=("**1.8e-2**",)),
 }
 

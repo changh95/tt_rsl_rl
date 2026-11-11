@@ -32,15 +32,17 @@ from rsl_rl_tt.testing.envs import ENV_NAMES  # noqa: E402
 FINAL_WINDOW = 10  # "final reward" = mean of Train/mean_reward over the last 10 iterations
 
 
-def _run_one(env_name: str, seed: int, runs_dir: str, iterations: int | None, threads: int, distribution: str = "GaussianDistribution", std_type: str = "scalar", rnd: bool = False) -> dict:
+def _run_one(env_name: str, seed: int, runs_dir: str, iterations: int | None, threads: int, distribution: str = "GaussianDistribution", std_type: str = "scalar", rnd: bool = False, symmetry: bool = False) -> dict:
     # imported here so that each worker process builds torch state itself
     import dataclasses
 
-    from rsl_rl_tt.testing.reference import REF_SPECS, train_reference, with_rnd
+    from rsl_rl_tt.testing.reference import REF_SPECS, train_reference, with_rnd, with_symmetry
 
     spec = dataclasses.replace(REF_SPECS[env_name], distribution=distribution, std_type=std_type)
     if rnd:
         spec = with_rnd(env_name, spec)
+    if symmetry:
+        spec = with_symmetry(env_name, spec)
 
     log_dir = os.path.join(runs_dir, env_name, f"seed{seed}")
     if os.path.isdir(log_dir):
@@ -91,6 +93,7 @@ def main() -> None:
     ap.add_argument("--distribution", default="GaussianDistribution", help='action distribution of the actor, e.g. "HeteroscedasticGaussianDistribution" (Phase 8.1)')
     ap.add_argument("--std-type", default="scalar", choices=("scalar", "log"))
     ap.add_argument("--rnd", action="store_true", help="Random Network Distillation (Phase 8.2: reference.with_rnd)")
+    ap.add_argument("--symmetry", action="store_true", help="symmetry augmentation + mirror loss (Phase 8.3: reference.with_symmetry)")
     ap.add_argument("--out", default=str(REPO / "docs" / "porting" / "golden"))
     ap.add_argument("--runs-dir", default=str(REPO / ".run" / "golden_runs"))
     args = ap.parse_args()
@@ -101,7 +104,7 @@ def main() -> None:
     infos: dict[tuple[str, int], dict] = {}
     t0 = time.time()
     with cf.ProcessPoolExecutor(max_workers=args.parallel, mp_context=__import__("multiprocessing").get_context("spawn")) as pool:
-        futs = {pool.submit(_run_one, e, s, args.runs_dir, args.iterations, args.threads, args.distribution, args.std_type, args.rnd): (e, s) for e, s in jobs}
+        futs = {pool.submit(_run_one, e, s, args.runs_dir, args.iterations, args.threads, args.distribution, args.std_type, args.rnd, args.symmetry): (e, s) for e, s in jobs}
         for fut in cf.as_completed(futs):
             key = futs[fut]
             infos[key] = fut.result()
@@ -114,6 +117,7 @@ def main() -> None:
         "distribution": args.distribution,
         "std_type": args.std_type,
         "rnd": args.rnd,
+        "symmetry": args.symmetry,
         "torch": torch.__version__,
         "python": platform.python_version(),
         "machine": {"cpu_count": os.cpu_count(), "threads_per_run": args.threads, "parallel_runs": args.parallel, "platform": platform.platform()},

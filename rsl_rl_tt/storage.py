@@ -34,13 +34,16 @@ class TTRolloutStorage:
 
     def __init__(
         self, ctx: TTContext, num_envs: int, num_transitions_per_env: int, actor_dim_p: int, critic_dim_p: int, act_dim_p: int, share_obs: bool, persistent: bool = False,
-        store_std: bool = False, rnd_dim_p: int = 0, rnd_source: str | None = None,
+        store_std: bool = False, rnd_dim_p: int = 0, rnd_source: str | None = None, extra_cols: list | None = None,
     ) -> None:
         """`store_std`: also keep the per-sample std of the action distribution (a state-dependent std: upstream's `distribution_params = (mean, std)`); the packed
         table then has one more column block. The layout is unchanged otherwise.
 
         `rnd_source`: where the observations of the RND state come from (None = no RND). "actor" / "critic": the RND state IS that observation (same groups in the same
-        order: nothing extra is stored); "own": a separate block of `rnd_dim_p` columns per step (the state of RND is a different set of observation groups)."""
+        order: nothing extra is stored); "own": a separate block of `rnd_dim_p` columns per step (the state of RND is a different set of observation groups).
+
+        `extra_cols`: [(name, width)] more column blocks of the packed table, filled by the caller at the end of the rollout (`packed_table(extra=...)`): the mirrored copies of the
+        symmetry extension, which are computed once per update and must be shuffled together with the rows they belong to."""
         self.ctx = ctx
         self.store_std = store_std
         assert rnd_source in (None, "actor", "critic", "own"), rnd_source
@@ -62,7 +65,12 @@ class TTRolloutStorage:
         self.col_mean = self.col_action + act_dim_p
         self.col_std = self.col_mean + act_dim_p
         self.col_rnd = self.col_std + (act_dim_p if store_std else 0)
-        self.col_scalars = self.col_rnd + self.rnd_dim_p
+        self.extra_cols: dict[str, tuple[int, int]] = {}
+        col = self.col_rnd + self.rnd_dim_p
+        for name, width in extra_cols or []:
+            self.extra_cols[name] = (col, col + width)
+            col += width
+        self.col_scalars = col
         self.width = self.col_scalars + SCALAR_BLOCK
         # constant selector rows of `packed_table` (persistent device state: created here, before any trace is captured)
         self._unit_cols = {name: ctx.upload(unit_row(col, SCALAR_BLOCK), op="H-6", batch_sharded=False) for name, col in SCALAR_COLS.items()}
@@ -176,8 +184,8 @@ class TTRolloutStorage:
         """[1, 32] row with a 1 in the column of scalar `name` (selects a scalar column when blocks are assembled)."""
         return self._unit_cols[name]
 
-    def packed_table(self) -> Any:
-        """[batch, width] fp32 table of the whole rollout in upstream's flatten order (advantages/returns must be computed)."""
+    def packed_table(self, extra: list | None = None) -> Any:
+        """[batch, width] fp32 table of the whole rollout in upstream's flatten order (advantages/returns must be computed); `extra`: the tensors of the `extra_cols` blocks, in order."""
         ttnn = self.ctx.ttnn
         assert self.returns is not None, "compute_returns() must run before update()"
         scalars = None
@@ -187,7 +195,7 @@ class TTRolloutStorage:
         parts = [self.all_actor_obs()]
         if not self.share_obs:
             parts.append(self._cat("critic_obs"))
-        parts += [self._cat("action"), self._cat("mean")] + ([self._cat("std")] if self.store_std else []) + ([self._cat("rnd_obs")] if self.rnd_own else []) + [scalars]
+        parts += [self._cat("action"), self._cat("mean")] + ([self._cat("std")] if self.store_std else []) + ([self._cat("rnd_obs")] if self.rnd_own else []) + list(extra or []) + [scalars]
         return ttnn.concat(parts, dim=1)
 
     def shuffle(self, table: Any, permutation: Any) -> Any:
@@ -219,6 +227,7 @@ class TTRolloutStorage:
             "actions": view(self.col_action, self.col_action + self.act_dim_p),
             "old_mean": view(self.col_mean, self.col_mean + self.act_dim_p),
             **({"old_std": view(self.col_std, self.col_std + self.act_dim_p)} if self.store_std else {}),
+            **{name: view(a, b) for name, (a, b) in self.extra_cols.items()},
             **({"rnd_obs": {"actor": view(self.col_actor, self.col_actor + self.actor_dim_p), "critic": view(self.col_actor, self.col_actor + self.actor_dim_p) if self.share_obs else view(self.col_critic, self.col_critic + self.critic_dim_p),
                             "own": view(self.col_rnd, self.col_rnd + self.rnd_dim_p) if self.rnd_own else None}[self.rnd_source]} if self.rnd_source else {}),
             "old_values": view(s + SCALAR_COLS["value"], s + SCALAR_COLS["value"] + 1),
