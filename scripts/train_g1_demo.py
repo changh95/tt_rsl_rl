@@ -50,6 +50,7 @@ def main() -> None:
     ap.add_argument("--env-threads", type=int, default=60, help="threads of the multithreaded MuJoCo rollout")
     ap.add_argument("--threads", type=int, default=8, help="torch threads of the host-side work")
     ap.add_argument("--save-interval", type=int, default=100)
+    ap.add_argument("--profile", action="store_true", help="TT: time the sections of the TT path (device synchronisation at every section boundary: a few % slower); 3 warm-up iterations first")
     ap.add_argument("--out", required=True, help="directory of metrics.csv and summary.json")
     ap.add_argument("--runs-dir", default=None, help="checkpoint directory (default .run/g1/<name of --out>, not committed)")
     args = ap.parse_args()
@@ -70,6 +71,11 @@ def main() -> None:
     runner = OnPolicyRunner(env, cfg, log_dir=str(runs), device="cpu")
     print(f"{args.backend}: {args.envs} environments x {args.steps} steps = {args.envs * args.steps} samples per iteration, {args.iterations} iterations", flush=True)
 
+    if args.profile and hasattr(runner.alg, "timer"):
+        runner.learn(num_learning_iterations=3, init_at_random_ep_len=True)  # warm-up: JIT, program cache, trace capture
+        runner.alg.timer.enabled = True
+        runner.alg.timer.reset()
+        env.step_seconds = 0.0
     t0 = time.perf_counter()
     try:
         runner.learn(num_learning_iterations=args.iterations, init_at_random_ep_len=True)
@@ -90,6 +96,8 @@ def main() -> None:
         "cpu_simulation_s": round(env.step_seconds, 1), "algorithm_s": round(wall - env.step_seconds, 1),
         "final": {c: round(mean(c), 3) for c in final_cols if c in rows_[-1]}, "env_threads": env.num_threads,
     }
+    if args.profile and hasattr(runner.alg, "timer"):
+        summary["sections_ms_per_iteration"] = {k: round(v["total_ms"] / args.iterations, 1) for k, v in runner.alg.timer.report().items()}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2), flush=True)
     env.close()

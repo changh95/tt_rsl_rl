@@ -3,6 +3,14 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-11 — Demo 2 follow-up (branch `tt/demo-g1-gait`, not merged): `examples/g1_walk/`, initial / middle / final video, eight-chip scaling profile
+**Done**: (1) `examples/` (`README.md`, `g1_walk/{train.py, play.py, README.md}`): the G1 demo as a short example on top of the public rsl_rl API (`MujocoG1VecEnv` + `g1_train_cfg` + `tt_agent_cfg` + the upstream `OnPolicyRunner`); `train.py` smoke-tested on one chip
+(3 iterations, 256 robots), `play.py` on its checkpoint. The evaluation / rendering code moved from `scripts/render_g1_demo.py` into the library module `rsl_rl_tt/demos/g1_render.py` (the scripts are thin wrappers); `tests/tt/test_g1_render.py` (8 host tests: labels, checkpoint
+load path == upstream inference policy exactly, measurement, tiny EGL render, video / GIF writers, `--help` of the four scripts). (2) New comparison video / GIF `docs/porting/demo_g1/g1.{mp4,gif}`: untrained / iteration 101 / iteration 1500 (before: 201 instead of 101; iteration 101
+keeps its balance but does not move (0.00-0.01 m/s, 0 falls), 201 already follows the commands, so 101 is the stage that still looks different); `eval.json` now has the four checkpoints (256 robots x 600 steps each). (3) `gait.mp4`: slow-motion two-view close-up of the final gait with foot contacts
+(`scripts/render_g1_gait.py`). (4) Profile of one iteration, one chip vs eight (`train_g1_demo.py --profile`, `profile_1chip/`, `profile_8chips/`): CPU simulation 830 / 845 ms, PPO update replay 308 / 112 ms (2.75x with 8x the chips), acting 56 / 42, step processing 28 / 34, iteration 1290 / 1123 ms (1.15x);
+upper bound with free chips 1.55x (Amdahl); explanation in `docs/porting/demo_g1/README.md` ("Why eight chips are not eight times faster"). **Next**: nothing pending; merge to `main` only if the owner asks (not a phase).
+
 ## 2026-11-12 — Demo 2 (not a phase; merged from branch `tt/demo-g1`): Unitree G1 walking on command, CPU simulation + training on ALL EIGHT chips
 **Done**: `rsl_rl_tt/demos/mujoco_g1.py` (G1 MJX model of MuJoCo Menagerie, pinned commit, fetched by `scripts/fetch_g1_model.sh`: velocity-command task, 12 leg joints, privileged critic observations, phase-based gait rewards;
 4096 robots stepped by MuJoCo's multithreaded `rollout`), `g1_cfg.py`, `scripts/train_g1_demo.py` / `render_g1_demo.py` / `plot_g1_curves.py`, 9 host tests (`tests/tt/test_mujoco_g1.py`: conventions, determinism, geometry, rollout == `mj_step` EXACTLY
