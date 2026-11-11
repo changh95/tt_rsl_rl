@@ -6,7 +6,7 @@ parity test, traced == eager bit for bit, 1x2 / 2x4 mesh equivalence in function
 
 | # | Feature (upstream `rsl_rl` v5.5.2) | What it needs beyond v1 | Effort | Status |
 |---|---|---|---|---|
-| 8.1 | `HeteroscedasticGaussianDistribution` (state-dependent std from the MLP) | per-row std in log-prob / entropy / KL, an output layer with two heads, the rollout storing the std, gradient through the std head | small-medium | in progress |
+| 8.1 | `HeteroscedasticGaussianDistribution` (state-dependent std from the MLP) | per-row std in log-prob / entropy / KL, an output layer with two heads, the rollout storing the std, gradient through the std head | small-medium | **done** (branch `tt/phase-8-1-heteroscedastic`, results in `PROGRESS.md`) |
 | 8.2 | RND (`rsl_rl/extensions/rnd.py`) | a second pair of MLPs (predictor + frozen target) with its own Adam, an intrinsic reward added before GAE, its own normalizers | medium | not started |
 | 8.3 | Symmetry augmentation / mirror loss | user callbacks (`data_augmentation_func`) that act on observations and actions: either a host callback (a new allow-list entry) or a fixed mirror matrix on the device | medium | not started |
 | 8.4 | Distillation (`algorithms/distillation.py`, teacher / student, behaviour cloning) | a second algorithm class, a loss without a critic, the teacher's forward on the device | medium | not started |
