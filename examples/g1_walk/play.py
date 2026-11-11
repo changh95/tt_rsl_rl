@@ -9,8 +9,9 @@
 
 The robot follows 0.4 m/s, 0.8 m/s, then 0.5 m/s while turning left and right (5 s each). The label of a panel names the iteration of the checkpoint (`model_100.pt` is the state after
 101 iterations); the counter shows how often the robot fell (it then starts again, like in training). Under every panel the REWARD of that robot is plotted live (the return of its current
-episode, one scale for all panels, red ticks = falls) and under all panels the LEARNING CURVE of the training run (mean episode return and speed against the iteration, with the iteration of every
-panel marked); the curve is read from the `metrics.csv` that `train.py` writes next to the checkpoints. `MUJOCO_GL=egl` renders headless; the video needs imageio-ffmpeg.
+episode, one scale for all panels, red ticks = falls) and under all panels three plots against the training iteration, with the iteration of every panel marked: the VELOCITY TRACKING ERROR of the
+saved checkpoints, the critic's VALUE LOSS and the REWARD TERMS (rewards above zero, penalties below). The loss and the reward terms are read from the `metrics.csv` that `train.py` writes next to the
+checkpoints; the tracking error is measured on every `model_<it>.pt` there (about 5 s each, once: `tracking_error.json` next to them). `MUJOCO_GL=egl` renders headless; the video needs imageio-ffmpeg.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from rsl_rl_tt.demos.g1_render import label_of, load_policy, measure, render_comparison  # noqa: E402
+from rsl_rl_tt.demos.g1_render import label_of, load_policy, measure, render_comparison, tracking_curve  # noqa: E402
 
 
 def main() -> None:
@@ -31,8 +32,8 @@ def main() -> None:
     ap.add_argument("--checkpoint", nargs="+", required=True, help="`random` and/or model_<it>.pt files (upstream format)")
     ap.add_argument("--video", default=None, help="MP4 of the checkpoints side by side")
     ap.add_argument("--gif", default=None, help="a small GIF of the same")
-    ap.add_argument("--metrics", default=None, help="metrics.csv of the training run, for the reward / learning-curve strips of the video (default: the metrics.csv next to the checkpoints)")
-    ap.add_argument("--no-curves", action="store_true", help="a video of the robots only: no return strips, no learning curve")
+    ap.add_argument("--metrics", default=None, help="metrics.csv of the training run, for the strips under the video (default: the metrics.csv next to the checkpoints)")
+    ap.add_argument("--no-curves", action="store_true", help="a video of the robots only: no return strips, no training plots")
     ap.add_argument("--no-eval", action="store_true", help="skip the measurement")
     ap.add_argument("--eval-envs", type=int, default=64, help="robots of the measurement (each holds one command for 12 s)")
     args = ap.parse_args()
@@ -50,7 +51,13 @@ def main() -> None:
         if metrics is None and not args.no_curves:
             beside = [Path(ck).parent / "metrics.csv" for ck in args.checkpoint if ck != "random"]
             metrics = next((str(m) for m in beside if m.exists()), None)
-        render_comparison(args.checkpoint, video=args.video, gif=args.gif, metrics=None if args.no_curves else metrics)
+        tracking = None
+        if metrics is not None and not args.no_curves:
+            tracking = Path(metrics).parent / "tracking_error.json"
+            if not tracking.exists():  # once per run: every saved checkpoint, the commands of the video, 128 robots each
+                print(f"measuring the tracking error of the checkpoints in {tracking.parent} ...")
+                tracking.write_text(json.dumps(tracking_curve(str(tracking.parent)), indent=1))
+        render_comparison(args.checkpoint, video=args.video, gif=args.gif, metrics=None if args.no_curves else metrics, tracking=None if args.no_curves else (str(tracking) if tracking else None))
 
 
 if __name__ == "__main__":

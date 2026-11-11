@@ -1,0 +1,175 @@
+{
+ "schedule": [
+  {
+   "vx": 0.4,
+   "vy": 0.0,
+   "yaw_rate": 0.0,
+   "seconds": 5.0
+  },
+  {
+   "vx": 0.8,
+   "vy": 0.0,
+   "yaw_rate": 0.0,
+   "seconds": 5.0
+  },
+  {
+   "vx": 0.5,
+   "vy": 0.0,
+   "yaw_rate": 0.4,
+   "seconds": 5.0
+  },
+  {
+   "vx": 0.5,
+   "vy": 0.0,
+   "yaw_rate": -0.4,
+   "seconds": 5.0
+  }
+ ],
+ "policy": "deterministic",
+ "points": [
+  {
+   "iteration": 1,
+   "checkpoint": "random",
+   "lin_vel_error": 0.4834934331492224,
+   "yaw_rate_error": 0.24097060736916842,
+   "fell_per_robot_minute": 39.5859375,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 101,
+   "checkpoint": "model_100.pt",
+   "lin_vel_error": 0.5428156181085619,
+   "yaw_rate_error": 0.19724429910442015,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 201,
+   "checkpoint": "model_200.pt",
+   "lin_vel_error": 0.12814688043612402,
+   "yaw_rate_error": 0.1377424586927875,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 301,
+   "checkpoint": "model_300.pt",
+   "lin_vel_error": 0.10987226605982282,
+   "yaw_rate_error": 0.09968427231418163,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 401,
+   "checkpoint": "model_400.pt",
+   "lin_vel_error": 0.1037447402781361,
+   "yaw_rate_error": 0.08949640026381044,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 501,
+   "checkpoint": "model_500.pt",
+   "lin_vel_error": 0.10348619676534784,
+   "yaw_rate_error": 0.08252337931679754,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 601,
+   "checkpoint": "model_600.pt",
+   "lin_vel_error": 0.10306626512242541,
+   "yaw_rate_error": 0.08248129801752073,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 701,
+   "checkpoint": "model_700.pt",
+   "lin_vel_error": 0.10091590736583238,
+   "yaw_rate_error": 0.07908374370164517,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 801,
+   "checkpoint": "model_800.pt",
+   "lin_vel_error": 0.10016640907002933,
+   "yaw_rate_error": 0.07855061866638748,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 901,
+   "checkpoint": "model_900.pt",
+   "lin_vel_error": 0.098314970684762,
+   "yaw_rate_error": 0.08056079255052324,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 1001,
+   "checkpoint": "model_1000.pt",
+   "lin_vel_error": 0.08997085207413268,
+   "yaw_rate_error": 0.07326679212016324,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 1101,
+   "checkpoint": "model_1100.pt",
+   "lin_vel_error": 0.08299045537620361,
+   "yaw_rate_error": 0.06571991683659957,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 1201,
+   "checkpoint": "model_1200.pt",
+   "lin_vel_error": 0.08059162922338717,
+   "yaw_rate_error": 0.0638010519842572,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 1301,
+   "checkpoint": "model_1300.pt",
+   "lin_vel_error": 0.0789059521750061,
+   "yaw_rate_error": 0.061129304711982975,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 1401,
+   "checkpoint": "model_1400.pt",
+   "lin_vel_error": 0.07689282242088713,
+   "yaw_rate_error": 0.061280244336552984,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  },
+  {
+   "iteration": 1500,
+   "checkpoint": "model_1499.pt",
+   "lin_vel_error": 0.07493077692153698,
+   "yaw_rate_error": 0.05645536831935408,
+   "fell_per_robot_minute": 0.0,
+   "robots": 128,
+   "seconds": 20.0
+  }
+ ]
+}

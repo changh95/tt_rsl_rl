@@ -83,6 +83,49 @@ def measure(policy, command: tuple[float, float, float], steps: int = 600, envs:
         env.close()
 
 
+def tracking_error(policy, schedule=SCHEDULE, envs: int = 128, seed: int = 7) -> dict:
+    """Velocity tracking error of `envs` robots that all follow the command `schedule` of the video (a robot that fell starts again, like in training), deterministic policy.
+
+    Per control step and robot: the length of (command - body-frame velocity) in the horizontal plane (m/s) and |command - yaw rate| (rad/s); the mean over all robots and steps. The step on which an
+    episode ends is left out (the state it returns is the one after the reset). `fell_per_robot_minute`: falls per minute of robot time."""
+    env = MujocoG1VecEnv(envs, seed=seed, num_threads=16)
+    lin, yaw, falls, count = 0.0, 0.0, 0, 0
+    try:
+        with torch.inference_mode():
+            for cmd, seconds in schedule:
+                env.set_command(cmd)
+                obs = env.get_observations()
+                for _ in range(int(seconds / env.dt)):
+                    obs, _, dones, extras = env.step(policy(obs))
+                    s = env._state
+                    v_body = np.einsum("nji,nj->ni", quat_to_rotation(s[:, 4:8]), s[:, 1 + env.nq : 1 + env.nq + 3])
+                    ok = ~dones.numpy().astype(bool)
+                    lin += float(np.linalg.norm(np.asarray(cmd[:2]) - v_body[ok, :2], axis=1).sum())
+                    yaw += float(np.abs(cmd[2] - s[ok, 1 + env.nq + 5]).sum())
+                    count += int(ok.sum())
+                    if "log" in extras:
+                        falls += round(extras["log"]["Episode_Termination/fell"] * int(dones.sum()))
+        seconds_total = sum(sec for _, sec in schedule)
+        return {"lin_vel_error": lin / count, "yaw_rate_error": yaw / count, "fell_per_robot_minute": falls / (envs * seconds_total / 60.0), "robots": envs, "seconds": seconds_total}
+    finally:
+        env.close()
+
+
+def tracking_curve(directory: str, hidden: tuple[int, ...] = (512, 256, 128), robots: int = 128, seed: int = 7, log=print) -> dict:
+    """`tracking_error` of the untrained network (`random`, iteration 1) and of every `model_<it>.pt` of `directory` except `model_0.pt` (one update only: it would share the iteration 1).
+    Returns {"schedule", "policy", "points": [{"iteration", "checkpoint", "lin_vel_error", "yaw_rate_error", ...}]} (the json of `scripts/eval_g1_tracking.py`)."""
+    import time
+
+    found = sorted((p for p in Path(directory).glob("model_*.pt") if iteration_of(p.name) > 1), key=lambda p: iteration_of(p.name))
+    points = []
+    for ck in ["random"] + [str(p) for p in found]:
+        t0 = time.perf_counter()
+        r = tracking_error(load_policy(ck, hidden), envs=robots, seed=seed)
+        points.append({"iteration": iteration_of(ck), "checkpoint": Path(ck).name if ck != "random" else "random", **r})
+        log(f"iteration {points[-1]['iteration']:5d}: linear {r['lin_vel_error']:.3f} m/s, yaw rate {r['yaw_rate_error']:.3f} rad/s, {r['fell_per_robot_minute']:.2f} falls per robot-minute ({time.perf_counter() - t0:.0f} s)")
+    return {"schedule": [{"vx": c[0], "vy": c[1], "yaw_rate": c[2], "seconds": sec} for c, sec in SCHEDULE], "policy": "deterministic", "points": points}
+
+
 def render_panel(policy, schedule, skip: int, size: tuple[int, int], seed: int, label: str) -> list[np.ndarray]:
     """Frames of ONE robot following the command schedule (after a fall it starts again, like in training); `size` is (height, width); a frame every `skip` control steps."""
     return render_panel_traced(policy, schedule, skip, size, seed, label)[0]
@@ -175,9 +218,40 @@ def draw_return_strip(trace: dict, cum: np.ndarray, step: int, size: tuple[int, 
     return np.asarray(img)
 
 
-def curve_strip(metrics: str, checkpoints: list[str], size: tuple[int, int], labels: list[str]) -> np.ndarray:
-    """The training curve under the panels: mean episode return (left) and achieved vs commanded forward speed (right) against the iteration (log axis), with the iteration of every panel marked."""
+# Reward terms of the demo task, grouped for the plot: (group, sign, terms, colour). The terms and their weights are the ones of `MujocoG1VecEnv.WEIGHTS` (the plot checks that every term is in a group).
+REWARD_GROUPS = [
+    ("velocity tracking", +1, ["track_lin_vel", "track_ang_vel"], (64, 166, 140)),
+    ("gait shaping", +1, ["feet_phase", "contact_schedule", "feet_air_time"], (90, 140, 217)),
+    ("alive bonus", +1, ["alive"], (150, 178, 204)),
+    ("posture / balance penalties", -1, ["lin_vel_z", "ang_vel_xy", "orientation", "base_height", "hip_deviation"], (217, 166, 77)),
+    ("effort / smoothness penalties", -1, ["action_rate", "torques", "dof_acc"], (166, 128, 204)),
+    ("foot slip penalty", -1, ["feet_slip"], (217, 128, 102)),
+    ("fall penalty (the episode ends)", -1, ["termination"], (191, 64, 77)),
+]
+
+
+def reward_rates(metrics: str, window: int = 9, dt: float = 0.02) -> tuple[list[int], dict[str, list[float]]]:
+    """Reward of every term per second of episode time, per training iteration: the weighted per-episode sum of the finished episodes divided by their mean length x dt, smoothed over `window`
+    iterations (trailing mean). Iterations without a finished episode are left out. `dt` = the control step of the task (5 substeps of 4 ms). Returns (x = iteration + 1, {term: rates})."""
     import csv
+
+    terms = list(MujocoG1VecEnv.WEIGHTS)
+    rows = [r for r in csv.DictReader(open(metrics)) if all(r.get(k, "") != "" for k in ["Metrics/episode_length"] + [f"Episode_Reward/{t}" for t in terms])]
+    xs = [int(float(r["iteration"])) + 1 for r in rows]
+    out = {}
+    for t in terms:
+        raw = [float(r[f"Episode_Reward/{t}"]) / (float(r["Metrics/episode_length"]) * dt) for r in rows]
+        out[t] = [sum(raw[max(0, i - window + 1) : i + 1]) / len(raw[max(0, i - window + 1) : i + 1]) for i in range(len(raw))]
+    return xs, out
+
+
+def curve_strip(metrics: str, checkpoints: list[str], size: tuple[int, int], labels: list[str], tracking: str) -> np.ndarray:
+    """The strip under the panels, against the training iteration (log axis), with the iteration of every panel marked:
+    (1) velocity tracking error of the saved checkpoints (`tracking`: json of `scripts/eval_g1_tracking.py`), (2) the critic's value loss (the only estimation loss this model has; there is no separate encoder),
+    (3) the reward terms of the actor-critic per second, stacked: rewards above zero, penalties below, the net reward as a line, with the terms and their weights listed on the right."""
+    import csv
+    import json
+    import textwrap
 
     import matplotlib
 
@@ -185,36 +259,93 @@ def curve_strip(metrics: str, checkpoints: list[str], size: tuple[int, int], lab
     import matplotlib.pyplot as plt
 
     h, w = size
-    rows = [{k: (float(v) if v != "" else None) for k, v in r.items()} for r in csv.DictReader(open(metrics))]
-    series = lambda key: [(r["iteration"] + 1, r[key]) for r in rows if r.get(key) is not None]
+    bg, fg, dim, grid = [c / 255 for c in BACKGROUND], (0.82, 0.84, 0.88), (0.6, 0.63, 0.7), (0.3, 0.33, 0.4)
+    weights = MujocoG1VecEnv.WEIGHTS
+    grouped = [t for _, _, ts, _ in REWARD_GROUPS for t in ts]
+    assert sorted(grouped) == sorted(weights), "every reward term of the task must be in exactly one group"
+    stage_colors = [[c / 255 for c in COLORS[k % len(COLORS)]] for k in range(len(checkpoints))]
+    stage_its = [iteration_of(ck) for ck in checkpoints]
 
-    def smooth(points: list, window: int = 9) -> list:
-        """Trailing mean over `window` points: the speed of the finished episodes of one iteration is noisy, the trend is what the plot is for."""
-        return [(x, sum(v for _, v in points[max(0, i - window + 1) : i + 1]) / len(points[max(0, i - window + 1) : i + 1])) for i, (x, _) in enumerate(points)]
-    bg, fg, grid = [c / 255 for c in BACKGROUND], (0.82, 0.84, 0.88), (0.3, 0.33, 0.4)
-    fig, axes = plt.subplots(1, 2, figsize=(w / 100, h / 100), dpi=100, facecolor=bg)
-    fig.subplots_adjust(left=0.05, right=0.99, top=0.76, bottom=0.2, wspace=0.12)
-    panels = [("training curve: mean episode return of all robots", "Train/mean_reward"), ("forward speed: achieved (solid) vs commanded (dashed), m/s", "Metrics/forward_speed")]
-    for ax, (title, key) in zip(axes, panels):
+    fig = plt.figure(figsize=(w / 100, h / 100), dpi=100, facecolor=bg)
+    top, bottom = 58, 34  # pixels above / below the axes
+    cols = [(44, 270), (366, 270), (688, 430)]  # (left, width) in pixels of the three plots
+    axes = [fig.add_axes([x / w, bottom / h, wd / w, (h - top - bottom) / h]) for x, wd in cols]
+
+    def heading(i: int, title: str, *subtitle: str) -> None:
+        fig.text(cols[i][0] / w, 1 - 11 / h, title, color=fg, fontsize=8.5, fontweight="bold", va="center")
+        for k, line in enumerate(subtitle):
+            fig.text(cols[i][0] / w, 1 - (24 + 9 * k) / h, line, color=dim, fontsize=6.3, va="center")
+
+    def style(ax, ylabel: str) -> None:
         ax.set_facecolor(bg)
-        ax.plot(*zip(*(series(key) if key == "Train/mean_reward" else smooth(series(key)))), color=fg, linewidth=1.4)
-        if key == "Metrics/forward_speed":
-            ax.plot(*zip(*smooth(series("Metrics/command_vx"))), color=fg, linewidth=1.0, linestyle="--", alpha=0.7)
         ax.set_xscale("log")
-        ax.set_title(title + (" (mean of 9 iterations)" if key != "Train/mean_reward" else ""), color=fg, fontsize=8, loc="left", pad=11)
+        ax.set_xlim(0.8, 2000)
         ax.tick_params(colors=fg, labelsize=7, length=2)
         ax.set_xlabel("training iteration (log scale)", color=fg, fontsize=7, labelpad=1)
+        ax.set_ylabel(ylabel, color=fg, fontsize=7, labelpad=2)
         ax.grid(alpha=0.35, color=grid, linewidth=0.5)
         for s in ax.spines.values():
             s.set_color(grid)
-        xs_all = dict(series(key))
-        for k, (ck, color, label) in enumerate(zip(checkpoints, COLORS, labels)):
-            it = iteration_of(ck)
-            ax.axvline(it, color=[c / 255 for c in color], linewidth=1.0, alpha=0.9)
-            y = xs_all.get(it)
-            if y is not None:
-                ax.plot([it], [y], "o", color=[c / 255 for c in color], markersize=5)
-            ax.annotate(f"iteration {it}", xy=(it, 1.0), xycoords=("data", "axes fraction"), color=[c / 255 for c in color], fontsize=7, ha="right" if it > 1000 else "center", va="bottom", xytext=(0, 1), textcoords="offset points")
+
+    def stages(ax, curve: dict | None = None, label: bool = True) -> None:
+        """A line at the iteration of every panel (its colour) and, when `curve` = {iteration: value}, a dot on the curve."""
+        for it, color in zip(stage_its, stage_colors):
+            ax.axvline(it, color=color, linewidth=1.0, alpha=0.9, zorder=5)
+            if curve is not None and it in curve:
+                ax.plot([it], [curve[it]], "o", color=color, markersize=5, zorder=6)
+            if label:
+                ax.annotate(f"iter {it}", xy=(it, 1.0), xycoords=("data", "axes fraction"), color=color, fontsize=6.5, ha="right" if it > 1000 else "center", va="bottom", xytext=(0, 1), textcoords="offset points")
+
+    # (1) velocity tracking error
+    points = json.loads(Path(tracking).read_text())["points"]
+    ax = axes[0]
+    style(ax, "error")
+    for key, color, name in (("lin_vel_error", (0.95, 0.95, 0.97), "linear velocity (m/s)"), ("yaw_rate_error", (0.55, 0.8, 0.95), "yaw rate (rad/s)")):
+        xs, ys = [p["iteration"] for p in points], [p[key] for p in points]
+        ax.plot(xs, ys, "-o", color=color, linewidth=1.3, markersize=2.6, label=name)
+    ax.set_ylim(0, max(p["lin_vel_error"] for p in points) * 1.1)
+    ax.legend(loc="center right", fontsize=6.5, facecolor=bg, edgecolor=grid, labelcolor=fg, framealpha=0.9, borderpad=0.4)
+    stages(ax, {p["iteration"]: p["lin_vel_error"] for p in points})
+    heading(0, "velocity tracking error", "length of (command - actual velocity) / |yaw rate error|:", "128 robots, the commands of the video, 20 s")
+
+    # (2) the critic's value loss
+    rows = [{k: (float(v) if v != "" else None) for k, v in r.items()} for r in csv.DictReader(open(metrics))]
+    pts = [(r["iteration"] + 1, r["Loss/value"]) for r in rows if r.get("Loss/value") is not None]
+    smooth = [(x, sum(v for _, v in pts[max(0, i - 8) : i + 1]) / len(pts[max(0, i - 8) : i + 1])) for i, (x, _) in enumerate(pts)]
+    ax = axes[1]
+    style(ax, "mean squared error")
+    ax.plot(*zip(*pts), color=fg, linewidth=0.5, alpha=0.35)
+    ax.plot(*zip(*smooth), color=fg, linewidth=1.4)
+    ax.set_yscale("log")
+    stages(ax, dict(smooth))
+    heading(1, "value loss (the critic's estimate)", "PPO value loss of the critic, log scale (bold: mean of 9", "iterations). The model has no other estimation / encoder loss")
+
+    # (3) the reward terms
+    xs, rate = reward_rates(metrics)
+    ax = axes[2]
+    style(ax, "reward per second of episode time")
+    for sign in (+1, -1):
+        groups = [g for g in REWARD_GROUPS if g[1] == sign]
+        ax.stackplot(xs, *[[sum(rate[t][i] for t in ts) for i in range(len(xs))] for _, _, ts, _ in groups], colors=[[c / 255 for c in col] for _, _, _, col in groups], alpha=0.9, linewidth=0)
+    net = [sum(rate[t][i] for t in rate) for i in range(len(xs))]
+    ax.plot(xs, net, color="white", linewidth=1.3, zorder=4)
+    ax.axhline(0, color=(0.7, 0.72, 0.78), linewidth=0.6)
+    stages(ax, dict(zip(xs, net)))
+    heading(2, "reward the actor-critic maximises", "per second of episode time (mean of 9 iterations): rewards above zero,", "penalties below zero, the net reward is the white line")
+
+    # the terms and their weights
+    x0, y = 1136, 1 - 11 / h
+    fig.text(x0 / w, y, "reward terms (weight, per second)", color=fg, fontsize=7.5, fontweight="bold", va="center")
+    y -= 16 / h
+    for name, sign, terms, col in REWARD_GROUPS:
+        fig.patches.append(plt.Rectangle((x0 / w, y - 4 / h), 8 / w, 8 / h, transform=fig.transFigure, facecolor=[c / 255 for c in col], edgecolor="none"))
+        fig.text((x0 + 13) / w, y, ("+ " if sign > 0 else "- ") + name, color=fg, fontsize=6.8, va="center")
+        y -= 11 / h
+        for line in textwrap.wrap(", ".join(f"{t} {weights[t]:g}" for t in terms), 62, break_long_words=False, break_on_hyphens=False):
+            fig.text((x0 + 13) / w, y, line, color=dim, fontsize=6, va="center")
+            y -= 9 / h
+        y -= 3 / h
+    fig.text(x0 / w, y - 2 / h, "no contact / collision term: a fall (pelvis below 0.45 m or tilted\nmore than 60 degrees) ends the episode and costs the fall penalty", color=dim, fontsize=6, va="top", linespacing=1.3)
     fig.canvas.draw()
     img = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
     plt.close(fig)
@@ -245,10 +376,11 @@ def write_gif(frames: list[np.ndarray], path: str, real_time_fps: float, width: 
 
 
 def render_comparison(checkpoints: list[str], *, hidden: tuple[int, ...] = (512, 256, 128), fps: int = 25, size: tuple[int, int] = (352, 480), seed: int = 7,
-                      video: str | None = None, gif: str | None = None, schedule=SCHEDULE, metrics: str | None = None) -> int:
+                      video: str | None = None, gif: str | None = None, schedule=SCHEDULE, metrics: str | None = None, tracking: str | None = None) -> int:
     """The checkpoints side by side, every robot following the same scripted commands; returns the number of frames.
 
-    `metrics`: the `metrics.csv` of the training run; adds the live return of every robot under its panel and the training curve under all panels (see the module docstring)."""
+    `metrics`: the `metrics.csv` of the training run and `tracking`: the json of `scripts/eval_g1_tracking.py`; add the live return of every robot under its panel and, under all panels, the velocity
+    tracking error, the value loss and the reward terms against the training iteration (`curve_strip`)."""
     probe = MujocoG1VecEnv(1, seed=0, num_threads=1)
     skip = max(1, round(1.0 / (fps * probe.dt)))
     real_time_fps = 1.0 / (skip * probe.dt)
@@ -257,17 +389,19 @@ def render_comparison(checkpoints: list[str], *, hidden: tuple[int, ...] = (512,
     panels = [r[0] for r in results]
     n = min(len(p) for p in panels)
     h, w = size
+    if (metrics is None) != (tracking is None):
+        raise ValueError("`metrics` (metrics.csv of the run) and `tracking` (json of scripts/eval_g1_tracking.py) go together")
     if metrics is None:
         frames = [np.concatenate([p[i] for p in panels], axis=1) for i in range(n)]
     else:
         from PIL import Image, ImageDraw
 
-        live_h, curve_h = 16 * round(h * 0.23 / 16), 16 * round(h * 0.5 / 16)
+        live_h, curve_h = 16 * round(h * 0.23 / 16), 16 * round(h * 0.9 / 16)
         traces = [r[1] for r in results]
         cums = [episode_returns(tr) for tr in traces]
         span = (min(0.0, min(float(c.min()) for c in cums)), max(1.0, max(float(c.max()) for c in cums)))  # one scale for all panels
         labels = [label_of(ck) for ck in checkpoints]
-        curves = curve_strip(metrics, checkpoints, (curve_h, w * len(panels)), labels)
+        curves = curve_strip(metrics, checkpoints, (curve_h, w * len(panels)), labels, tracking)
         frames = []
         for i in range(n):
             top = []
@@ -280,5 +414,5 @@ def render_comparison(checkpoints: list[str], *, hidden: tuple[int, ...] = (512,
     if video:
         write_video(frames, video, real_time_fps)
     if gif:
-        write_gif(frames, gif, real_time_fps, **({"width": 720, "every": 5, "colors": 48} if metrics else {}))
+        write_gif(frames, gif, real_time_fps, **({"width": 720, "every": 6, "colors": 40} if metrics else {}))
     return n

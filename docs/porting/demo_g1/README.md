@@ -2,13 +2,26 @@
 
 ![untrained / iteration 101 / iteration 1500](g1.gif)
 
-**Video (20 s, real time, 1440x608 H.264): [`g1.mp4`](g1.mp4)** — three stages of the run side by side following the same commands (0.4 m/s, 0.8 m/s, then 0.5 m/s while turning left, then right). Left: untrained
+**Video (20 s, real time, 1440x752 H.264): [`g1.mp4`](g1.mp4)** — three stages of the run side by side following the same commands (0.4 m/s, 0.8 m/s, then 0.5 m/s while turning left, then right). Left: untrained
 (falls forward after ~80 steps = 1.6 s, again and again; the counter shows the falls). Middle: after 101 iterations — it keeps its balance but does not move yet. Right: after 1500 iterations.
 (Iteration 201 already follows the commands, 0.76 m/s for 0.8, and from iteration ~250 on the gait hardly changes, so the middle stage is taken where something different can still be seen; the table has all four.)
-The video also shows the **reward** and the **learning curve**: under every panel the return of that robot's current episode, plotted live (one scale for all three; a red tick = a fall, after which the
-episode and its return start again), and at the bottom the training curve of the run (mean episode return of all robots, and achieved against commanded speed, against the iteration on a log axis) with the iteration of
-every panel marked in the colour of its panel. The numbers fit together: at the end of the 20 s the final robot has collected 84.1, the training curve is at 83 for iteration 1500; the middle robot 54, the curve at 45 for
-iteration 101; the untrained one never gets beyond ~5 before it falls again (curve: 0.4). The slow-motion close-up of the final gait with the foot contacts, [`gait.mp4`](gait.mp4) (two views, half speed), shows the alternating steps. This demo is also available as a short
+The video also shows the **reward** and, under all panels, **what the training optimises** (three plots against the training iteration on a log axis, the iteration of every panel marked in the colour of its panel):
+
+* **Under every panel**: the return of that robot's current episode, plotted live (one scale for all three; a red tick = a fall, after which the episode and its return start again). At the end of the 20 s the final robot has
+  collected 84.1 (the mean episode return of the run at iteration 1500: 83), the middle robot 54 (curve 45 at iteration 101), the untrained one never gets beyond ~5 before it falls again (curve: 0.4).
+* **Velocity tracking error** (left plot): the length of (commanded - actual) horizontal velocity, and the yaw-rate error, averaged over 128 robots following the commands of the video for 20 s with the deterministic policy,
+  measured on every saved checkpoint (`tracking_error.json`, `scripts/eval_g1_tracking.py`; 16 points, one per 100 iterations, so the curve is not dense where the learning happens, in the first 200 iterations).
+  Untrained: 0.48 m/s / 0.24 rad/s and 40 falls per robot-minute; iteration 101: 0.54 m/s (it stands still, so the error is the command); iteration 201: 0.13 / 0.14; iteration 1500: **0.075 m/s / 0.056 rad/s**.
+* **Value loss** (middle plot, `Loss/value` of every iteration, log scale): the loss of the critic's estimate of the return (it sees the observations of the actor plus 8 privileged quantities). **This model has no
+  separate estimator / encoder and so no estimation loss besides this one**: the actor and the critic are plain MLPs (47 -> 512 -> 256 -> 128 -> 12, and 55 -> ... -> 1). The loss rises to 0.34 in the first iterations,
+  while the robots start to fall and the returns change quickly, and falls to 4e-4 (mean of the last 50 iterations).
+* **Reward terms** (right plot): the 16 terms of the reward the actor-critic maximises (`rsl_rl_tt/demos/mujoco_g1.py`, weights in the legend of the plot), each as reward per second of episode time (the weighted sum of the
+  finished episodes divided by their length), stacked: rewards above zero, penalties below, the net reward as the white line. In the first ~15 iterations the fall penalty (-1.5 per second at its worst, iteration 13) and the posture
+  penalties (-0.6) cancel what the robots earn and the net reward is slightly negative (-0.11 at worst); the tracking and gait terms take over from iteration ~16. At iteration 1500 the net reward is **+4.15 per second** (= 83 per 20 s episode): velocity tracking
+  +2.15, gait shaping +1.95, alive +0.2; the penalties have shrunk to -0.07 (posture), -0.06 (effort / smoothness), -0.01 (foot slip), and no robot falls. **There is no contact / collision penalty in this task**: it is flat ground
+  without obstacles and the only contact event that is punished is a fall (pelvis below 0.45 m or tilted more than 60 degrees), which ends the episode with the fall penalty.
+
+The slow-motion close-up of the final gait with the foot contacts, [`gait.mp4`](gait.mp4) (two views, half speed), shows the alternating steps. This demo is also available as a short
 example: [`examples/g1_walk/`](../../../examples/g1_walk/README.md) (`train.py`, `play.py`).
 
 The robot is the Unitree G1 (MJX variant of the model in [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/main/unitree_g1), BSD-3-Clause, (c) Unitree Robotics; fetched, not committed:
@@ -94,7 +107,8 @@ scripts/tt_run.sh --timeout 14400 --tag g1 -- python scripts/train_g1_demo.py --
 scripts/tt_run.sh --chips 16 --timeout 1500 --tag g1_1 -- python scripts/train_g1_demo.py --mesh 1x1 --envs 4096 --iterations 60 --out docs/porting/demo_g1/timing_1chip
 python scripts/train_g1_demo.py --backend cpu --envs 4096 --iterations 8 --threads 32 --out docs/porting/demo_g1/timing_cpu
 # evaluation, video and GIF, curves
-MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_100.pt .run/g1/tt_8chips/model_1499.pt --no-eval --metrics docs/porting/demo_g1/tt_8chips/metrics.csv --video docs/porting/demo_g1/g1.mp4 --gif docs/porting/demo_g1/g1.gif
+MUJOCO_GL=egl python scripts/eval_g1_tracking.py --dir .run/g1/tt_8chips --out docs/porting/demo_g1/tracking_error.json     # velocity tracking error of every saved checkpoint (host only, ~1.5 min)
+MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_100.pt .run/g1/tt_8chips/model_1499.pt --no-eval --metrics docs/porting/demo_g1/tt_8chips/metrics.csv --tracking docs/porting/demo_g1/tracking_error.json --video docs/porting/demo_g1/g1.mp4 --gif docs/porting/demo_g1/g1.gif
 MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_100.pt .run/g1/tt_8chips/model_200.pt .run/g1/tt_8chips/model_1499.pt --eval-out docs/porting/demo_g1/eval.json
 MUJOCO_GL=egl python scripts/render_g1_gait.py --checkpoint .run/g1/tt_8chips/model_1499.pt --command 0.8 --out docs/porting/demo_g1/gait.mp4
 # the profiles (40 iterations after 3 warm-up iterations)
