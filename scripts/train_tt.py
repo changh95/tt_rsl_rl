@@ -26,7 +26,7 @@ sys.path.insert(0, str(REPO))
 
 from rsl_rl_tt.testing.envs import ENV_NAMES  # noqa: E402
 from rsl_rl_tt.testing.golden import GOLDEN_DIR, final_reward, load_curve, tt_vs_golden  # noqa: E402
-from rsl_rl_tt.testing.reference import REF_SPECS, train_reference, with_rnd, with_symmetry  # noqa: E402
+from rsl_rl_tt.testing.reference import DISTILL_ITERATIONS, REF_SPECS, train_distillation, train_reference, with_rnd, with_symmetry  # noqa: E402
 
 
 TT_LABEL = "1 chip"
@@ -67,6 +67,8 @@ def main() -> None:
     ap.add_argument("--std-type", default="scalar", choices=("scalar", "log"))
     ap.add_argument("--rnd", action="store_true", help="Random Network Distillation (Phase 8.2: reference.with_rnd; the golden curves must have been made with the same flag)")
     ap.add_argument("--symmetry", action="store_true", help="symmetry augmentation + mirror loss (Phase 8.3: reference.with_symmetry; the golden curves must have been made with the same flag)")
+    ap.add_argument("--distill", action="store_true", help="distillation (Phase 8.4: `rsl_rl_tt.distillation:TTDistillation`; the golden curves must have been made with the same flag and teachers)")
+    ap.add_argument("--teachers", default=str(REPO / ".run" / "teachers"), help="directory of the teacher checkpoints <env>.pt (made by `scripts/train_reference.py --distill`)")
     ap.add_argument("--golden", default=str(GOLDEN_DIR), help="directory of the upstream reference curves to compare with (must have been produced with the same --distribution / --std-type)")
     ap.add_argument("--out", default=str(REPO / "docs" / "porting" / "tt_runs"))
     ap.add_argument("--runs-dir", default=str(REPO / ".run" / "tt_runs"))
@@ -96,7 +98,11 @@ def main() -> None:
                 spec = with_rnd(env_name, spec)
             if args.symmetry:
                 spec = with_symmetry(env_name, spec)
-            info = train_reference(env_name, seed, log_dir, iterations=args.iterations, spec=spec, num_threads=args.threads, tt=True, tt_cfg=tt_cfg)
+            if args.distill:
+                info = train_distillation(env_name, seed, log_dir, os.path.join(args.teachers, f"{env_name}.pt"), iterations=args.iterations or DISTILL_ITERATIONS[env_name], spec=spec,
+                                          num_threads=args.threads, tt=True, tt_cfg=tt_cfg)
+            else:
+                info = train_reference(env_name, seed, log_dir, iterations=args.iterations, spec=spec, num_threads=args.threads, tt=True, tt_cfg=tt_cfg)
             shutil.copyfile(os.path.join(log_dir, "metrics.csv"), out / env_name / f"seed{seed}.csv")
             rows = load_curve(env_name, seed, out)
             per_seed[str(seed)] = {"iterations": info["iterations"], "wall_s": round(info["wall_s"], 1), "final_reward": final_reward(rows)}
