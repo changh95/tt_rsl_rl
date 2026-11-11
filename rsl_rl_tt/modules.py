@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from rsl_rl_tt.tt_common import TTContext, linear_from_host, linear_to_host, mask_row, pad_up, pad_vector, stage_obs
+from rsl_rl_tt.tt_common import TTContext, linear_from_host, linear_to_host, mask_row, pad_heads, pad_up, pad_vector, stage_obs, unpad_heads
 
 HALF_LOG_2PI = 0.5 * math.log(2.0 * math.pi)
 ACTIVATIONS = ("elu", "relu", "tanh", "identity")  # v1 scope: what was measured in Phase 0 (BRIEF 1: everything else needs approval)
@@ -114,23 +114,41 @@ class TTEmpiricalNormalization:
 
 
 class TTLinear:
-    """y = x @ W + b on padded tensors; W is stored as [in_p, out_p]."""
+    """y = x @ W + b on padded tensors; W is stored as [in_p, out_p].
 
-    def __init__(self, ctx: TTContext, mirror: Any) -> None:
-        self.ctx, self.mirror = ctx, mirror
+    `heads` > 1 (the output layer of a heteroscedastic actor: mean | std): the out_features are `heads` blocks of equal size and every block is padded on its own
+    (out_p = heads * pad_up(out_features / heads)), so the blocks are tile-aligned column slices of the output."""
+
+    def __init__(self, ctx: TTContext, mirror: Any, heads: int = 1) -> None:
+        self.ctx, self.mirror, self.heads = ctx, mirror, heads
         self.in_features, self.out_features = mirror.in_features, mirror.out_features
-        self.in_p, self.out_p = pad_up(self.in_features), pad_up(self.out_features)
+        assert self.out_features % heads == 0, "the output blocks of a multi-head layer have the same size"
+        self.in_p, self.out_p = pad_up(self.in_features), heads * pad_up(self.out_features // heads)
         self.sync_from_torch()
 
+    # torch layout <-> padded device layout of this layer (also used for the Adam moments of a checkpoint)
+    def weight_to_host(self, w: Any) -> Any:
+        """torch weight layout [out, in] -> padded [in_p, out_p]."""
+        return pad_heads(w.t(), self.in_p, self.out_p, self.heads)
+
+    def bias_to_host(self, b: Any) -> Any:
+        return pad_heads(b.reshape(1, -1), 1, self.out_p, self.heads)
+
+    def weight_from_host(self, w: Any) -> Any:
+        return unpad_heads(w, self.in_features, self.out_features, self.heads).t().contiguous()
+
+    def bias_from_host(self, b: Any) -> Any:
+        return unpad_heads(b, 1, self.out_features, self.heads)[0].contiguous()
+
     def sync_from_torch(self) -> None:
-        w, b = linear_to_host(self.mirror.weight, self.mirror.bias, self.in_p, self.out_p)
+        w, b = linear_to_host(self.mirror.weight, self.mirror.bias, self.in_p, self.out_p, self.heads)
         self.w = self.ctx.upload_into(getattr(self, "w", None), w, op="H-6")
         self.b = self.ctx.upload_into(getattr(self, "b", None), b, op="H-6")
 
     def sync_to_torch(self) -> None:
         w = self.ctx.download(self.w, op="H-6", batch_sharded=False)
         b = self.ctx.download(self.b, op="H-6", batch_sharded=False)
-        w_t, b_t = linear_from_host(w, b, self.out_features, self.in_features)
+        w_t, b_t = linear_from_host(w, b, self.out_features, self.in_features, self.heads)
         self.mirror.weight.data.copy_(w_t)
         self.mirror.bias.data.copy_(b_t)
 
@@ -146,9 +164,19 @@ class TTMLP:
         self.layers: list[TTLinear] = []
         self.acts: list[str | None] = []  # activation after each linear (None for the last one)
         mods = list(mirror)
+        # a trailing `Unflatten(-1, (heads, D))` (upstream's MLP for a distribution whose input_dim is a list, e.g. the heteroscedastic Gaussian: [2, A]) splits the
+        # last Linear's output into `heads` blocks of D; on the device that is the layout of `TTLinear(heads=...)`
+        self.heads = 1
+        if len(mods) >= 2 and type(mods[-1]).__name__ == "Unflatten":
+            size = tuple(mods[-1].unflattened_size)
+            if type(mods[-2]).__name__ != "Linear" or mods[-1].dim not in (-1, 1) or len(size) != 2:
+                raise NotImplementedError(f"MLP output reshape {mods[-1]} is outside the supported scope (Linear + Unflatten(-1, (heads, D)))")
+            self.heads = size[0]
+            mods = mods[:-1]
         for i, mod in enumerate(mods):
             if type(mod).__name__ == "Linear":
-                self.layers.append(TTLinear(ctx, mod))
+                last = i == len(mods) - 1
+                self.layers.append(TTLinear(ctx, mod, heads=self.heads if last else 1))
                 nxt = mods[i + 1] if i + 1 < len(mods) else None
                 self.acts.append(_activation_name(nxt))
             elif i == 0 or not _is_activation(mod):
@@ -251,12 +279,37 @@ def _is_activation(mod: Any) -> bool:
     return type(mod).__name__ in {"ELU", "ReLU", "Tanh", "Identity"}
 
 
-class TTGaussianDistribution:
+class _GaussianOps:
+    """Sampling and log-probability of a diagonal Gaussian from the tensors `std`, `two_var`, `log_prob_const` and `mask` of the object (each [1, A_p] for the
+    state-independent distribution, [rows, A_p] for the per-row state of the heteroscedastic one: the same elementwise code broadcasts either way)."""
+
+    def sample(self, mean: Any, noise: Any) -> Any:
+        """mean + std * noise (the noise comes from the host generator in parity mode, allow-list H-4)."""
+        ttnn = self.ctx.ttnn
+        return ttnn.add(ttnn.multiply(noise, self.std), mean, **_acc(ttnn))
+
+    def log_prob(self, actions: Any, mean: Any) -> Any:
+        """Sum over the real action dims of  -(a - mean)^2 / (2 var) - log std - 0.5 log(2 pi); returns [rows, 1]."""
+        ttnn = self.ctx.ttnn
+        diff = ttnn.subtract(actions, mean, **_acc(ttnn))
+        term = ttnn.subtract(ttnn.neg(ttnn.divide(ttnn.square(diff), self.two_var, **_acc(ttnn))), self.log_prob_const, **_acc(ttnn))
+        return ttnn.sum(ttnn.multiply(term, self.mask), dim=-1, keepdim=True, compute_kernel_config=self.ctx.compute_cfg)
+
+    def log_prob_from_diff(self, diff: Any) -> Any:
+        """`log_prob` given diff = actions - mean (the backward pass needs diff as well)."""
+        ttnn = self.ctx.ttnn
+        term = ttnn.subtract(ttnn.neg(ttnn.divide(ttnn.square(diff), self.two_var, **_acc(ttnn))), self.log_prob_const, **_acc(ttnn))
+        return ttnn.sum(ttnn.multiply(term, self.mask), dim=-1, keepdim=True, compute_kernel_config=self.ctx.compute_cfg)
+
+
+class TTGaussianDistribution(_GaussianOps):
     """State-independent diagonal Gaussian (std parameter [1, A_p]); padded action columns are masked out of log_prob / entropy."""
+
+    per_row = False  # std is the same for every row (see TTHeteroscedasticGaussian)
 
     def __init__(self, ctx: TTContext, mirror: Any) -> None:
         if type(mirror).__name__ != "GaussianDistribution":
-            raise NotImplementedError(f"{type(mirror).__name__} is outside the v1 scope (GaussianDistribution, scalar/log std)")
+            raise NotImplementedError(f"{type(mirror).__name__} is not a state-independent GaussianDistribution (scalar/log std)")
         self.ctx, self.mirror = ctx, mirror
         self.dim = mirror.output_dim
         self.dim_p = pad_up(self.dim)
@@ -312,27 +365,147 @@ class TTGaussianDistribution:
             inside = ttnn.multiply(ttnn.ge(self.param, lo), ttnn.le(self.param, hi))
             put("param_gate", ttnn.multiply(ttnn.multiply(inside, self.std), self.mask))  # dstd/dlog_std = std
 
-    # -- compute ----------------------------------------------------------------------------------------------------------
-    def sample(self, mean: Any, noise: Any) -> Any:
-        """mean + std * noise (the noise comes from the host generator in parity mode, allow-list H-4)."""
-        ttnn = self.ctx.ttnn
-        return ttnn.add(ttnn.multiply(noise, self.std), mean, **_acc(ttnn))
-
-    def log_prob(self, actions: Any, mean: Any) -> Any:
-        """Sum over the real action dims of  -(a - mean)^2 / (2 var) - log std - 0.5 log(2 pi); returns [rows, 1]."""
-        ttnn = self.ctx.ttnn
-        diff = ttnn.subtract(actions, mean, **_acc(ttnn))
-        term = ttnn.subtract(ttnn.neg(ttnn.divide(ttnn.square(diff), self.two_var, **_acc(ttnn))), self.log_prob_const, **_acc(ttnn))
-        return ttnn.sum(ttnn.multiply(term, self.mask), dim=-1, keepdim=True, compute_kernel_config=self.ctx.compute_cfg)
-
-    def log_prob_from_diff(self, diff: Any) -> Any:
-        """`log_prob` given diff = actions - mean (the backward pass needs diff as well)."""
-        ttnn = self.ctx.ttnn
-        term = ttnn.subtract(ttnn.neg(ttnn.divide(ttnn.square(diff), self.two_var, **_acc(ttnn))), self.log_prob_const, **_acc(ttnn))
-        return ttnn.sum(ttnn.multiply(term, self.mask), dim=-1, keepdim=True, compute_kernel_config=self.ctx.compute_cfg)
-
     def host_std(self) -> Any:
         return self.ctx.download(self.std, op="H-5", batch_sharded=False)[0, : self.dim]
+
+
+class TTHeteroscedasticGaussian:
+    """State-dependent diagonal Gaussian (upstream `HeteroscedasticGaussianDistribution`): the actor's output layer has two heads, the mean in output columns
+    0..A_p and the std ("scalar") or log std ("log") in A_p..2 A_p, clamped to the std range. There is no parameter of its own: the per-row quantities of every
+    forward pass are computed by `from_output` and handed around as a `HeteroState`. Padded action columns have std 1 and are masked out of every sum."""
+
+    per_row = True
+    learn_std = False  # no std parameter: the std head is part of the MLP
+
+    def __init__(self, ctx: TTContext, mirror: Any) -> None:
+        if type(mirror).__name__ != "HeteroscedasticGaussianDistribution":
+            raise NotImplementedError(f"{type(mirror).__name__} is not a HeteroscedasticGaussianDistribution")
+        self.ctx, self.mirror = ctx, mirror
+        self.dim = mirror.output_dim
+        self.dim_p = pad_up(self.dim)
+        self.std_type = mirror.std_type
+        self.std_range = tuple(mirror.std_range)
+        self.log_std_range = tuple(mirror.log_std_range)
+        self.mask = ctx.upload(mask_row(self.dim, self.dim_p), op="H-6", batch_sharded=False)
+        self.pad_one = ctx.upload(1.0 - mask_row(self.dim, self.dim_p), op="H-6", batch_sharded=False)  # 1 in the padded columns: their std
+
+    def sync_from_torch(self) -> None:
+        pass  # no parameters of its own (they are the MLP's last layer)
+
+    def sync_to_torch(self) -> None:
+        pass
+
+    def refresh(self) -> None:
+        pass
+
+    def from_output(self, out: Any) -> tuple[Any, "HeteroState"]:
+        """Split the actor's output [rows, 2 A_p] into the mean [rows, A_p] and the per-row distribution state."""
+        return out[:, : self.dim_p], HeteroState(self, out[:, self.dim_p : 2 * self.dim_p])
+
+
+class HeteroState(_GaussianOps):
+    """The per-row quantities of a heteroscedastic Gaussian for one batch of rows, computed on first use (the act step needs only std / two_var /
+    log_prob_const, the update step the rest). All tensors are [rows, A_p]; `gate` is what the std head's raw output gradient is multiplied with
+    (torch's clamp passes the gradient where lo <= raw <= hi, inclusive; for the "log" type the chain rule through exp adds the factor std)."""
+
+    per_row = True
+    learn_std = False
+
+    def __init__(self, dist: TTHeteroscedasticGaussian, raw: Any) -> None:
+        self.dist, self.ctx, self.raw, self.mask = dist, dist.ctx, raw, dist.mask
+        self._cache: dict = {}
+
+    def _get(self, key: str, make) -> Any:
+        if key not in self._cache:
+            self._cache[key] = make()
+        return self._cache[key]
+
+    @property
+    def std(self) -> Any:
+        def make() -> Any:
+            ttnn, d = self.ctx.ttnn, self.dist
+            if d.std_type == "scalar":
+                s = ttnn.clamp(self.raw, min=d.std_range[0], max=d.std_range[1])
+                return ttnn.add(ttnn.multiply(s, d.mask), d.pad_one)
+            return ttnn.exp(self.log_std)
+
+        return self._get("std", make)
+
+    @property
+    def log_std(self) -> Any:
+        def make() -> Any:
+            ttnn, d = self.ctx.ttnn, self.dist
+            if d.std_type == "scalar":
+                return ttnn.log(self.std)
+            return ttnn.multiply(ttnn.clamp(self.raw, min=d.log_std_range[0], max=d.log_std_range[1]), d.mask)
+
+        return self._get("log_std", make)
+
+    @property
+    def var(self) -> Any:
+        return self._get("var", lambda: self.ctx.ttnn.square(self.std))
+
+    @property
+    def two_var(self) -> Any:
+        return self._get("two_var", lambda: self.ctx.ttnn.multiply(self.var, 2.0))
+
+    @property
+    def log_prob_const(self) -> Any:
+        return self._get("log_prob_const", lambda: self.ctx.ttnn.add(self.log_std, HALF_LOG_2PI, **_acc(self.ctx.ttnn)))
+
+    @property
+    def inv_std(self) -> Any:
+        return self._get("inv_std", lambda: self.ctx.ttnn.multiply(self.ctx.ttnn.reciprocal(self.std), self.mask))
+
+    @property
+    def inv_var(self) -> Any:
+        return self._get("inv_var", lambda: self.ctx.ttnn.multiply(self.ctx.ttnn.reciprocal(self.var), self.mask))
+
+    @property
+    def inv_std3(self) -> Any:
+        return self._get("inv_std3", lambda: self.ctx.ttnn.multiply(self.inv_var, self.inv_std))
+
+    @property
+    def gate(self) -> Any:
+        def make() -> Any:
+            ttnn, d = self.ctx.ttnn, self.dist
+            lo, hi = d.std_range if d.std_type == "scalar" else d.log_std_range
+            inside = ttnn.multiply(ttnn.ge(self.raw, lo), ttnn.le(self.raw, hi))
+            if d.std_type == "log":
+                inside = ttnn.multiply(inside, self.std)  # dstd / dlog_std = std
+            return ttnn.multiply(inside, d.mask)
+
+        return self._get("gate", make)
+
+    @property
+    def entropy_rows(self) -> Any:
+        """Entropy of every row (summed over the real action dims): [rows, 1]."""
+
+        def make() -> Any:
+            ttnn = self.ctx.ttnn
+            ent = ttnn.add(self.log_std, 0.5 + HALF_LOG_2PI, **_acc(ttnn))
+            return ttnn.sum(ttnn.multiply(ent, self.mask), dim=-1, keepdim=True, compute_kernel_config=self.ctx.compute_cfg)
+
+        return self._get("entropy_rows", make)
+
+    @property
+    def entropy_dev(self) -> Any:
+        """Mean entropy over the rows: [1, 1] (upstream: `entropy_batch.mean()`)."""
+        return self._get("entropy_dev", lambda: self.ctx.ttnn.mean(self.entropy_rows, dim=0, keepdim=True, compute_kernel_config=self.ctx.compute_cfg))
+
+    def host_std(self) -> Any:
+        return self.ctx.download(self.std, op="H-5")[:, : self.dist.dim]
+
+
+def _make_distribution(ctx: TTContext, mirror: Any) -> Any:
+    if mirror is None:
+        return None
+    name = type(mirror).__name__
+    if name == "GaussianDistribution":
+        return TTGaussianDistribution(ctx, mirror)
+    if name == "HeteroscedasticGaussianDistribution":
+        return TTHeteroscedasticGaussian(ctx, mirror)
+    raise NotImplementedError(f"{name} is not supported by the TT port (GaussianDistribution, HeteroscedasticGaussianDistribution)")
 
 
 class TTMLPModel:
@@ -347,7 +520,7 @@ class TTMLPModel:
         self.mlp = TTMLP(ctx, mirror.mlp)
         if self.mlp.in_features != self.obs_dim:
             raise NotImplementedError("only plain MLP models (mlp input == concatenated obs) are in the v1 scope")
-        self.distribution = TTGaussianDistribution(ctx, mirror.distribution) if mirror.distribution is not None else None
+        self.distribution = _make_distribution(ctx, mirror.distribution)
         self.output_dim = self.distribution.dim if self.distribution is not None else self.mlp.out_features
         self.output_dim_p = pad_up(self.output_dim)
 
@@ -378,6 +551,21 @@ class TTMLPModel:
 
     def forward_train(self, obs_dev: Any) -> tuple[Any, list]:
         return self.mlp.forward_train(self.latent(obs_dev))
+
+    def policy_forward(self, obs_dev: Any) -> tuple[Any, Any]:
+        """Actor forward pass: (mean [rows, A_p], distribution state). The state is the (state-independent) distribution itself or, for a heteroscedastic
+        distribution, the per-row `HeteroState`; both have the attributes the losses use (std, var, log_std, inv_var, ..., log_prob, sample)."""
+        out = self.forward(obs_dev)
+        if self.distribution.per_row:
+            return self.distribution.from_output(out)
+        return out, self.distribution
+
+    def policy_forward_train(self, obs_dev: Any) -> tuple[Any, Any, list]:
+        out, cache = self.forward_train(obs_dev)
+        if self.distribution.per_row:
+            mean, state = self.distribution.from_output(out)
+            return mean, state, cache
+        return out, self.distribution, cache
 
     def update_normalization(self, obs_dev: Any, rows: int) -> None:
         if self.normalizer is not None:

@@ -49,6 +49,7 @@ TOLERANCES: dict[str, Tol] = {
     "gae_returns": Tol("GAE returns / advantages (incl. global unbiased-std normalisation)", rel_fro=1e-6, abs_floor_rms=1e-6, doc_tokens=("**1e-6**",)),
     "update_value_loss": Tol("PPO.update value loss (mean over the update's mini-batches)", rel_fro=5e-3, abs_floor_rms=1e-3, doc_tokens=("**5e-3**",)),
     "update_entropy": Tol("PPO.update entropy (mean over the update's mini-batches)", rel_fro=2e-5, doc_tokens=("**2e-5**",)),
+    "update_entropy_hetero": Tol("PPO.update entropy with a state-dependent std (computed from the actor's matmul output)", rel_fro=1.5e-3, doc_tokens=("**1.5e-3**",)),
     "update_surrogate": Tol("PPO.update surrogate loss (advantages are O(1))", max_abs=2e-3, doc_tokens=("**2e-3**",)),
     "adam_step": Tol("Adam step (fp32, torch.optim.Adam formulas)", rel_fro=1e-7, doc_tokens=("**1e-7**",)),
     "clip_grad_norm": Tol("clip_grad_norm_: total norm and clipped gradients", rel_fro=2e-7, doc_tokens=("**2e-7**",)),

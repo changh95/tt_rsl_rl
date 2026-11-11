@@ -45,10 +45,10 @@ def make_obs(rows, groups: dict[str, int], seed=0, scale=1.0, offset=0.0):
     return TensorDict({k: torch.randn(rows, d, generator=g) * scale + offset for k, d in groups.items()}, batch_size=[rows])
 
 
-def make_model(groups, used, out_dim, hidden, activation="elu", norm=False, dist=True, seed=0, std_type="scalar", init_std=1.0, std_range=(1e-6, 1e6)):
+def make_model(groups, used, out_dim, hidden, activation="elu", norm=False, dist=True, seed=0, std_type="scalar", init_std=1.0, std_range=(1e-6, 1e6), distribution="GaussianDistribution"):
     torch.manual_seed(seed)
     obs = make_obs(64, groups, seed=99)
-    cfg = {"class_name": "GaussianDistribution", "init_std": init_std, "std_type": std_type, "std_range": std_range} if dist else None
+    cfg = {"class_name": distribution, "init_std": init_std, "std_type": std_type, "std_range": std_range} if dist else None
     model = MLPModel(obs, {"actor": used}, "actor", out_dim, hidden_dims=hidden, activation=activation, obs_normalization=norm, distribution_cfg=cfg)
     return model
 

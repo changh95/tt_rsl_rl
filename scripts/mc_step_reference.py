@@ -3,10 +3,12 @@
 (`rsl_rl_tt/testing/mc_equiv.py`). Device job on one chip; commit the file (a few hundred KB).
 
     scripts/tt_run.sh --chips 16 --timeout 300 --tag mcref -- python scripts/mc_step_reference.py
+    scripts/tt_run.sh --chips 16 --timeout 300 --tag mcref -- python scripts/mc_step_reference.py --hetero     # heteroscedastic actor (Phase 8.1)
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -20,10 +22,13 @@ from rsl_rl_tt.testing import mc_equiv  # noqa: E402
 
 
 def main() -> None:
-    out = REPO / "tests" / "tt" / "data" / mc_equiv.REFERENCE
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--hetero", action="store_true", help="a heteroscedastic Gaussian actor")
+    args = ap.parse_args()
+    out = REPO / "tests" / "tt" / "data" / (mc_equiv.REFERENCE_HETERO if args.hetero else mc_equiv.REFERENCE)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open_tray_mesh((1, 1)):
-        runner = mc_equiv.make_runner([1, 1])
+        runner = mc_equiv.make_runner([1, 1], hetero=args.hetero)
         alg = runner.alg
         pool, obs = mc_equiv.make_pool(alg)
         res = mc_equiv.run_steps(alg, pool, obs)

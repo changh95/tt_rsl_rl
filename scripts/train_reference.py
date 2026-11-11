@@ -32,14 +32,18 @@ from rsl_rl_tt.testing.envs import ENV_NAMES  # noqa: E402
 FINAL_WINDOW = 10  # "final reward" = mean of Train/mean_reward over the last 10 iterations
 
 
-def _run_one(env_name: str, seed: int, runs_dir: str, iterations: int | None, threads: int) -> dict:
+def _run_one(env_name: str, seed: int, runs_dir: str, iterations: int | None, threads: int, distribution: str = "GaussianDistribution", std_type: str = "scalar") -> dict:
     # imported here so that each worker process builds torch state itself
-    from rsl_rl_tt.testing.reference import train_reference
+    import dataclasses
+
+    from rsl_rl_tt.testing.reference import REF_SPECS, train_reference
+
+    spec = dataclasses.replace(REF_SPECS[env_name], distribution=distribution, std_type=std_type)
 
     log_dir = os.path.join(runs_dir, env_name, f"seed{seed}")
     if os.path.isdir(log_dir):
         shutil.rmtree(log_dir)  # our own output directory under --runs-dir, recreated for every run
-    info = train_reference(env_name, seed, log_dir, iterations=iterations, num_threads=threads)
+    info = train_reference(env_name, seed, log_dir, iterations=iterations, spec=spec, num_threads=threads)
     info["log_dir"] = log_dir
     return info
 
@@ -82,6 +86,8 @@ def main() -> None:
     ap.add_argument("--iterations", type=int, default=None, help="override the per-env default (reference.REF_SPECS)")
     ap.add_argument("--threads", type=int, default=8, help="torch threads per run")
     ap.add_argument("--parallel", type=int, default=3, help="runs executed at the same time")
+    ap.add_argument("--distribution", default="GaussianDistribution", help='action distribution of the actor, e.g. "HeteroscedasticGaussianDistribution" (Phase 8.1)')
+    ap.add_argument("--std-type", default="scalar", choices=("scalar", "log"))
     ap.add_argument("--out", default=str(REPO / "docs" / "porting" / "golden"))
     ap.add_argument("--runs-dir", default=str(REPO / ".run" / "golden_runs"))
     args = ap.parse_args()
@@ -92,7 +98,7 @@ def main() -> None:
     infos: dict[tuple[str, int], dict] = {}
     t0 = time.time()
     with cf.ProcessPoolExecutor(max_workers=args.parallel, mp_context=__import__("multiprocessing").get_context("spawn")) as pool:
-        futs = {pool.submit(_run_one, e, s, args.runs_dir, args.iterations, args.threads): (e, s) for e, s in jobs}
+        futs = {pool.submit(_run_one, e, s, args.runs_dir, args.iterations, args.threads, args.distribution, args.std_type): (e, s) for e, s in jobs}
         for fut in cf.as_completed(futs):
             key = futs[fut]
             infos[key] = fut.result()
@@ -102,6 +108,8 @@ def main() -> None:
 
     summary: dict = {
         "rsl_rl_tag": "v5.5.2",
+        "distribution": args.distribution,
+        "std_type": args.std_type,
         "torch": torch.__version__,
         "python": platform.python_version(),
         "machine": {"cpu_count": os.cpu_count(), "threads_per_run": args.threads, "parallel_runs": args.parallel, "platform": platform.platform()},

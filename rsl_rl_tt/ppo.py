@@ -28,7 +28,7 @@ from rsl_rl_tt.losses import PPOLosses
 from rsl_rl_tt.modules import TTMLPModel
 from rsl_rl_tt.optim import TTAdam, TTAdaptiveLR, clip_grad_norm
 from rsl_rl_tt.storage import TTRolloutStorage
-from rsl_rl_tt.tt_common import SectionTimer, TTContext, linear_from_host, pack_step_scalars, pad_matrix, pad_vector, unit_row
+from rsl_rl_tt.tt_common import SectionTimer, TTContext, pack_step_scalars, pad_matrix, pad_vector, unit_row
 
 
 _CAPTURED_TRACES: dict[int, int] = {}  # id(TrayMesh) -> number of live captured traces on that mesh (guard against the T-15 overwrite hazard)
@@ -80,11 +80,12 @@ class TTPPO(PPO):
         self.tt_actor = TTMLPModel(self.ctx, self._raw_actor)
         self.tt_critic = TTMLPModel(self.ctx, self._raw_critic)
         if self.tt_actor.distribution is None:
-            raise ValueError("the actor needs a distribution_cfg (GaussianDistribution)")
+            raise ValueError("the actor needs a distribution_cfg (GaussianDistribution or HeteroscedasticGaussianDistribution)")
+        self.hetero = self.tt_actor.distribution.per_row  # state-dependent std: the std head is part of the actor MLP and every sample has its own std
         share = self.tt_actor.obs_groups == self.tt_critic.obs_groups
         self.storage = TTRolloutStorage(  # replaces the host RolloutStorage that upstream's construct_algorithm built
             self.ctx, storage.num_envs, storage.num_transitions_per_env, self.tt_actor.obs_dim_p, self.tt_critic.obs_dim_p, self.tt_actor.distribution.dim_p, share,
-            persistent=self.trace_enabled,
+            persistent=self.trace_enabled, store_std=self.hetero,
         )
         self.losses = PPOLosses(
             self.ctx, clip_param=self.clip_param, value_loss_coef=self.value_loss_coef, entropy_coef=self.entropy_coef, use_clipped_value_loss=self.use_clipped_value_loss
@@ -100,6 +101,8 @@ class TTPPO(PPO):
         self.adam: TTAdam | None = TTAdam(self.ctx, self._params())
         for name in ("value", "surrogate", "entropy"):
             self._acc("update.acc." + name)
+        if self.hetero:  # the per-column mean std of the last mini-batch, for the runner's logging (allocated before any capture: T-15)
+            self._buf["update.last_std"] = self.ctx.zeros(1, self.tt_actor.distribution.dim_p, batch_sharded=False)
         if self.trace_enabled:
             self.storage.preallocate()
         self.timer = SectionTimer(self.ctx, enabled=False)  # `alg.timer.enabled = True` profiles the sections below (adds device syncs)
@@ -119,9 +122,20 @@ class TTPPO(PPO):
         ctx.check_batch(batch // self.num_mini_batches, "mini-batch (num_envs*num_steps_per_env/num_mini_batches)")
 
     # -- policy mirror ------------------------------------------------------------------------------------------------------
-    def _refresh_std_mirror(self) -> None:
-        """The runner reads `get_policy().output_std` every iteration (allow-list H-5): keep a cached host copy in the torch mirror."""
-        std = self.tt_actor.distribution.host_std()
+    def _refresh_std_mirror(self, from_device: bool = False) -> None:
+        """The runner reads `get_policy().output_std` every iteration (allow-list H-5): keep a cached host copy in the torch mirror.
+
+        Heteroscedastic: upstream's `output_std` is the std of the last forward pass (a [rows, A] tensor, only ever averaged by the logger); here it is the per-column
+        mean over the rows of the last mini-batch (`from_device`, written by every step), and before any update (construction, `load()`) the std head's bias, i.e. the
+        std of a state-independent initial policy."""
+        dist = self.tt_actor.distribution
+        if not self.hetero:
+            std = dist.host_std()
+        elif from_device:
+            std = self.ctx.download(self._buf["update.last_std"], op="H-5", batch_sharded=False)[0, : dist.dim]
+        else:
+            bias = self._raw_actor.mlp[-2].bias.detach()[dist.dim : 2 * dist.dim]
+            std = bias.clamp(*dist.std_range) if dist.std_type == "scalar" else bias.clamp(*dist.log_std_range).exp()
         self._std_host = std.contiguous()
         self._raw_actor.distribution._distribution = Normal(torch.zeros(1, std.numel()), std)
 
@@ -191,9 +205,9 @@ class TTPPO(PPO):
             for store, key in ((m, "exp_avg"), (v, "exp_avg_sq")):
                 t = state[p][key]
                 if kind == "weight":
-                    store[idx] = ctx.upload(pad_matrix(t.t(), owner.in_p, owner.out_p), op="H-6", batch_sharded=False)
+                    store[idx] = ctx.upload(owner.weight_to_host(t), op="H-6", batch_sharded=False)
                 elif kind == "bias":
-                    store[idx] = ctx.upload(pad_vector(t, owner.out_p), op="H-6", batch_sharded=False)
+                    store[idx] = ctx.upload(owner.bias_to_host(t), op="H-6", batch_sharded=False)
                 else:
                     store[idx] = ctx.upload(pad_vector(t, owner.dim_p), op="H-6", batch_sharded=False)
         self.adam.load_state(m, v, step)
@@ -207,9 +221,9 @@ class TTPPO(PPO):
             for tensor in (self.adam.m[idx], self.adam.v[idx]):
                 t = ctx.download(tensor, op="H-6", batch_sharded=False)
                 if kind == "weight":
-                    host.append(linear_from_host(t, t[:1], owner.out_features, owner.in_features)[0])
+                    host.append(owner.weight_from_host(t))
                 elif kind == "bias":
-                    host.append(t[0, : owner.out_features].contiguous())
+                    host.append(owner.bias_from_host(t))
                 else:
                     host.append(t[0, : owner.dim].contiguous())
             self.optimizer.state[p] = {"step": torch.tensor(float(self.adam.t)), "exp_avg": host[0].clone(), "exp_avg_sq": host[1].clone()}
@@ -274,17 +288,18 @@ class TTPPO(PPO):
         ctx = self.ctx
         ttnn = ctx.ttnn
         actor, critic = self.tt_actor, self.tt_critic
-        dist = actor.distribution
         share = self.storage.share_obs
         if persist:
             actor_in = ttnn.to_layout(actor_in, ttnn.TILE_LAYOUT)
             critic_in = actor_in if share else ttnn.to_layout(critic_in, ttnn.TILE_LAYOUT)
             noise = ttnn.to_layout(noise, ttnn.TILE_LAYOUT)
-        mean = actor.forward(actor_in)
+        mean, dist = actor.policy_forward(actor_in)  # dist: the distribution itself, or the per-row state of a heteroscedastic one
         action = dist.sample(mean, noise)
         logp = dist.log_prob(action, mean)
         value = critic.forward(critic_in)[:, 0:1]
         out = dict(action=action, mean=mean, logp=logp, value=value)
+        if self.hetero:
+            out["std"] = dist.std
         if persist:
             out["actor_obs"] = actor_in
             if not share:
@@ -324,7 +339,7 @@ class TTPPO(PPO):
         with self.timer.section("act.compute"):
             if traced and "act" in self._traces:
                 self._replay("act")
-                out = {k: self._buf["act." + k] for k in ("action", "mean", "logp", "value", "actor_obs") + (() if share else ("critic_obs",))}
+                out = {k: self._buf["act." + k] for k in ("action", "mean", "logp", "value", "actor_obs") + (("std",) if self.hetero else ()) + (() if share else ("critic_obs",))}
             else:
                 out = self._act_graph(actor_in, critic_in, noise, persist=traced)
                 if traced:
@@ -337,6 +352,8 @@ class TTPPO(PPO):
         if traced:  # the (tilized) observations are outputs of the trace
             actor_in, critic_in = out["actor_obs"], (out["actor_obs"] if share else out["critic_obs"])
         self._pending = dict(actor_obs=actor_in, critic_obs=critic_in, action=out["action"], mean=out["mean"], value=out["value"], logp=out["logp"])
+        if self.hetero:
+            self._pending["std"] = out["std"]
         with self.timer.section("act.download_actions"):
             return ctx.download(out["action"], op="H-2")[:, : actor.output_dim].contiguous()  # the one per-step sync point (H-2)
 
@@ -407,16 +424,19 @@ class TTPPO(PPO):
         ctx = self.ctx
         ttnn = ctx.ttnn
         st, actor, critic = self.storage, self.tt_actor, self.tt_critic
-        dist = actor.distribution
         with self.timer.section("update.minibatch.slice"):
             batch = st.split(self._buf["update.table"][i * rows : (i + 1) * rows, :])
             adv = st.normalize(batch["advantages"], rows) if self.normalize_advantage_per_mini_batch and rows > 1 else batch["advantages"]
         with self.timer.section("update.minibatch.forward"):
-            mean, cache_a = actor.forward_train(batch["actor_obs"])
+            mean, dist, cache_a = actor.policy_forward_train(batch["actor_obs"])  # dist: the distribution itself, or the per-row state of a heteroscedastic one
             value_out, cache_c = critic.forward_train(batch["critic_obs"])
             entropy = dist.entropy_dev
         with self.timer.section("update.minibatch.kl_lr"):
-            kl = self.losses.kl_mean(dist, batch["old_mean"], self._buf["update.old_var"], self._buf["update.old_log_std"], mean)
+            if self.hetero:  # the rollout's std of every sample
+                old_var, old_log_std = ttnn.square(batch["old_std"]), ttnn.log(batch["old_std"])
+            else:
+                old_var, old_log_std = self._buf["update.old_var"], self._buf["update.old_log_std"]
+            kl = self.losses.kl_mean(dist, batch["old_mean"], old_var, old_log_std, mean)
             lr = self.lr_sched.update(ctx.mean_over_chips(kl))  # the KL of the adaptive schedule is the mean over the chips; one global learning rate
         with self.timer.section("update.minibatch.loss"):
             la = self.losses.actor(dist, mean, batch["actions"], batch["old_logp"], adv, rows)
@@ -425,7 +445,10 @@ class TTPPO(PPO):
             acc = self._acc("update.acc." + name)  # accumulate BEFORE the optimizer step: `entropy` is a persistent tensor that the step rewrites in place
             ctx.put(acc, ttnn.add(acc, value))
         with self.timer.section("update.minibatch.backward"):
-            grads_a = [t for pair in actor.mlp.backward(cache_a, la["d_mean"]) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
+            d_out = ttnn.concat([la["d_mean"], la["d_raw"]], dim=1) if self.hetero else la["d_mean"]  # [d mean | d raw std-head output] for the two-head output layer
+            grads_a = [t for pair in actor.mlp.backward(cache_a, d_out) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
+            if self.hetero:
+                ctx.put(self._buf["update.last_std"], ttnn.mean(dist.std, dim=0, keepdim=True, compute_kernel_config=ctx.compute_cfg))
             grads_c = [t for pair in critic.mlp.backward(cache_c, ttnn.multiply(lc["d_value"], self._col0)) for t in pair]
         if ctx.n_chips > 1:
             # data parallel: every chip computed the gradient of ITS mini-batch; the exchange averages them BEFORE clipping (upstream reduce_parameters: all-reduce /
@@ -453,8 +476,9 @@ class TTPPO(PPO):
         if self.adam is None:
             self.adam = TTAdam(ctx, self._params())
         # the rollout's std (parameters do not change before the first optimizer step), snapshotted into persistent buffers
-        for key, value in (("update.old_var", dist.var), ("update.old_log_std", dist.log_std)):
-            self._buf[key] = ctx.put(self._buf.get(key), value)
+        if not self.hetero:  # (heteroscedastic: the old std of every sample is in the storage)
+            for key, value in (("update.old_var", dist.var), ("update.old_log_std", dist.log_std)):
+                self._buf[key] = ctx.put(self._buf.get(key), value)
         with self.timer.section("update.pack_table"):
             packed = st.packed_table()
         # one permutation per update, reused by every epoch (upstream mini_batch_generator); drawn on the host (parity mode, H-4); one independent permutation of
@@ -492,7 +516,7 @@ class TTPPO(PPO):
         for group in self.optimizer.param_groups:  # keep the (unused) torch optimizer's lr in line for logging / checkpoints
             group["lr"] = self.learning_rate
         self._weights_stale = self._optimizer_stale = True
-        self._refresh_std_mirror()
+        self._refresh_std_mirror(from_device=True)
         st.clear()
         self._updates += 1
         if ctx.n_chips > 1 and self.replica_check_interval and self._updates % self.replica_check_interval == 0:

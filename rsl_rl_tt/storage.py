@@ -7,7 +7,7 @@ num_envs + env), so the host-drawn permutation of `update()` indexes exactly the
 
 GAE follows `rsl_rl.algorithms.ppo.PPO.compute_returns` line by line, including `advantages = returns - values` after the loop and the
 unbiased-std global advantage normalisation with eps 1e-8. The packed table that `update()` shuffles holds, per row,
-    [actor obs | critic obs (if different) | action | old mean | scalars(32: value, return, advantage, old log-prob)]
+    [actor obs | critic obs (if different) | action | old mean | old std (state-dependent std only) | scalars(32: value, return, advantage, old log-prob)]
 so one row gather moves a whole sample; mini-batches are contiguous row slices of the shuffled table (upstream also reuses the SAME permutation
 in every epoch).
 """
@@ -32,9 +32,13 @@ class TTRolloutStorage:
     docs/porting/TTNN_ISSUES.md T-15). The persistent-state rule of the traced path: everything that survives a replay is allocated first."""
 
     def __init__(
-        self, ctx: TTContext, num_envs: int, num_transitions_per_env: int, actor_dim_p: int, critic_dim_p: int, act_dim_p: int, share_obs: bool, persistent: bool = False
+        self, ctx: TTContext, num_envs: int, num_transitions_per_env: int, actor_dim_p: int, critic_dim_p: int, act_dim_p: int, share_obs: bool, persistent: bool = False,
+        store_std: bool = False,
     ) -> None:
+        """`store_std`: also keep the per-sample std of the action distribution (a state-dependent std: upstream's `distribution_params = (mean, std)`); the packed
+        table then has one more column block. The layout is unchanged otherwise."""
         self.ctx = ctx
+        self.store_std = store_std
         self.num_envs, self.num_transitions_per_env = num_envs, num_transitions_per_env
         self.actor_dim_p, self.critic_dim_p, self.act_dim_p, self.share_obs = actor_dim_p, critic_dim_p, act_dim_p, share_obs
         self.persistent = persistent
@@ -48,7 +52,8 @@ class TTRolloutStorage:
         self.col_critic = actor_dim_p
         self.col_action = actor_dim_p + (0 if share_obs else critic_dim_p)
         self.col_mean = self.col_action + act_dim_p
-        self.col_scalars = self.col_mean + act_dim_p
+        self.col_std = self.col_mean + act_dim_p
+        self.col_scalars = self.col_std + (act_dim_p if store_std else 0)
         self.width = self.col_scalars + SCALAR_BLOCK
         # constant selector rows of `packed_table` (persistent device state: created here, before any trace is captured)
         self._unit_cols = {name: ctx.upload(unit_row(col, SCALAR_BLOCK), op="H-6", batch_sharded=False) for name, col in SCALAR_COLS.items()}
@@ -59,6 +64,8 @@ class TTRolloutStorage:
         slots = []
         for _ in range(self.num_transitions_per_env):
             slot = dict(actor_obs=zeros(self.actor_dim_p), action=zeros(self.act_dim_p), mean=zeros(self.act_dim_p), value=zeros(1), logp=zeros(1), reward=zeros(1), done=zeros(1))
+            if self.store_std:
+                slot["std"] = zeros(self.act_dim_p)
             slot["critic_obs"] = slot["actor_obs"] if self.share_obs else zeros(self.critic_dim_p)
             slots.append(slot)
         self._slots = slots
@@ -74,10 +81,13 @@ class TTRolloutStorage:
         return self.batch_size // self.ctx.n_chips
 
     # -- rollout ----------------------------------------------------------------------------------------------------------
-    def add_transition(self, *, actor_obs: Any, critic_obs: Any, action: Any, mean: Any, value: Any, logp: Any, reward: Any, done: Any) -> None:
+    def add_transition(self, *, actor_obs: Any, critic_obs: Any, action: Any, mean: Any, value: Any, logp: Any, reward: Any, done: Any, std: Any = None) -> None:
         if self.step >= self.num_transitions_per_env:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
         fields = dict(actor_obs=actor_obs, critic_obs=critic_obs, action=action, mean=mean, value=value, logp=logp, reward=reward, done=done)
+        if self.store_std:
+            assert std is not None, "a storage with store_std needs the std of every transition"
+            fields["std"] = std
         if self.persistent:
             assert self._slots is not None, "preallocate() must run before the first transition of a persistent storage"
             slot = self._slots[self.step]
@@ -158,7 +168,7 @@ class TTRolloutStorage:
         parts = [self.all_actor_obs()]
         if not self.share_obs:
             parts.append(self._cat("critic_obs"))
-        parts += [self._cat("action"), self._cat("mean"), scalars]
+        parts += [self._cat("action"), self._cat("mean")] + ([self._cat("std")] if self.store_std else []) + [scalars]
         return ttnn.concat(parts, dim=1)
 
     def shuffle(self, table: Any, permutation: Any) -> Any:
@@ -189,6 +199,7 @@ class TTRolloutStorage:
             "critic_obs": view(self.col_actor, self.col_actor + self.actor_dim_p) if self.share_obs else view(self.col_critic, self.col_critic + self.critic_dim_p),
             "actions": view(self.col_action, self.col_action + self.act_dim_p),
             "old_mean": view(self.col_mean, self.col_mean + self.act_dim_p),
+            **({"old_std": view(self.col_std, self.col_std + self.act_dim_p)} if self.store_std else {}),
             "old_values": view(s + SCALAR_COLS["value"], s + SCALAR_COLS["value"] + 1),
             "returns": view(s + SCALAR_COLS["returns"], s + SCALAR_COLS["returns"] + 1),
             "advantages": view(s + SCALAR_COLS["advantages"], s + SCALAR_COLS["advantages"] + 1),
