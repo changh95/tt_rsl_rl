@@ -91,6 +91,17 @@ optimizer` (`on_policy_runner.py:66`).
 **Consequences.** Upstream stays byte-identical to the tag (tested). Open items: Q1 (which `runner.alg.*` attributes Isaac
 Lab accesses), Q2 (extra cfg keys), Q3 (dtypes of `dones`/`time_outs`).
 
+**Implementation note (Phase 2, 2026-11-11).** `rsl_rl_tt.ppo:TTPPO` subclasses upstream `PPO` and inherits `construct_algorithm` unchanged:
+the runner resolves `cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"`, upstream builds the torch actor/critic (bit-identical
+initialisation for the same seed), and `TTPPO.__init__` receives the TT-only options through the `tt_cfg` keyword (`mesh_shape`,
+optional `fabric_config`/`trace_region_size`/`l1_small_size`), which upstream never sees. No runner subclass and no upstream patch are needed.
+The upstream models stay as **mirrors** (source of the initial weights, sink of `sync_to_torch()` for `get_policy()`, `save()`, export; a
+`_device_ahead` flag decides when a device -> mirror sync is needed). `get_policy().output_std` is served from a cached host std copy
+(H-5), because the runner reads it every iteration. Parity-mode noise: `torch.randn(rows, A)` from the global generator is exactly what
+upstream's `Normal.sample()` consumes (tested bit for bit), so TT and upstream draw the same stream. Everything the TT path uploads or
+downloads goes through `TTContext` (counted per allow-list id; unknown ids raise; a host test forbids `from_torch`/`to_torch` elsewhere and
+forbids any torch import in the device-side model code).
+
 ## ADR-0003 — Environment location and bridge  — *Accepted as the working plan (owner, 2026-11-10); the concrete bridge is decided in Phase 7 once ISAAC_HOST is known*
 The host has no NVIDIA GPU tooling (`ENV.md`), so Isaac Sim is assumed to run on a separate GPU host. Default plan
 (BRIEF 3.8 / Phase 7): `RemoteVecEnv` (an rsl_rl `VecEnv`) on the TT host talking to a small server wrapping the Isaac Lab
@@ -213,3 +224,4 @@ runtime counter that is logged; any other host fallback must fail the tests.
 | H-5 | per-iteration scalars for logging (losses, KL, LR, std) | all phases | log lines |
 | H-6 | weight download for `get_policy()` mirror, `save()`, export | on demand | upstream checkpoint/JIT/ONNX formats |
 | H-7 | **temporary (Phase 2 only):** rollout storage on the host | Phase 2 | moves to the device in Phase 3 (BRIEF Phase 2) |
+| H-8 | upload per-iteration scalars as device tensors (normalizer update rate, learning rate, Adam bias corrections, adaptive-LR value) | all phases | a trace freezes Python scalars, so every value that changes per iteration travels as a tiny device tensor (ADR-0001); added 2026-11-11 in Phase 2 |

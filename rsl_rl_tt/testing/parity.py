@@ -25,6 +25,7 @@ class Tol:
     pcc_min: float | None = None
     exact: bool = False
     rel_floor: float = 1e-3
+    abs_floor_rms: float = 0.0  # rel_fro uses max(||ref||_F, abs_floor_rms * sqrt(numel)) as its denominator: an absolute floor for small outputs
     doc_tokens: tuple[str, ...] = ()  # strings that must appear in docs/porting/TOLERANCES.md (checked by a test)
 
 
@@ -39,6 +40,9 @@ TOLERANCES: dict[str, Tol] = {
     "max_exact": Tol("max over rows", exact=True),
     "cross_chip_sum_gather": Tol("cross-chip sum, gather + ttnn.sum", rel_fro=2e-7, doc_tokens=("**2e-7**",)),
     "cross_chip_sum_all_reduce": Tol("cross-chip ttnn.all_reduce (fallback)", rel_fro=2e-3, doc_tokens=("**2e-3**",)),
+    # Phase 2 composites (measured 2026-11-11, tests/tt/test_tt_modules.py; ~3x the measured floor)
+    "mlp_forward": Tol("MLP forward (actor mean / critic value), 1-4 layers, hidden up to 256", rel_fro=1.5e-2, abs_floor_rms=0.1, doc_tokens=("**1.5e-2**",)),
+    "normalizer_update": Tol("EmpiricalNormalization running mean/var after an update", rel_fro=1e-6, doc_tokens=("**1e-6**",)),
 }
 
 
@@ -50,6 +54,9 @@ class ParityReport:
     max_rel: float
     rel_fro: float
     pcc: float
+    rel_fro_eff: float
+    err_rms: float
+    ref_rms: float
     max_ulp: float
     n_nonfinite: int
     worst_index: tuple[int, ...] | None
@@ -64,7 +71,7 @@ class ParityReport:
     def __str__(self) -> str:
         head = f"parity[{self.name}] {'PASS' if self.passed else 'FAIL'} shape={self.shape}"
         nums = (
-            f"max_abs={self.max_abs:.3e} max_rel={self.max_rel:.3e} rel_fro={self.rel_fro:.3e} pcc={self.pcc:.8f} "
+            f"max_abs={self.max_abs:.3e} max_rel={self.max_rel:.3e} rel_fro={self.rel_fro:.3e} (effective {self.rel_fro_eff:.3e}; err_rms={self.err_rms:.3e} ref_rms={self.ref_rms:.3e}) pcc={self.pcc:.8f} "
             f"max_ulp={self.max_ulp:.3g} nonfinite={self.n_nonfinite}"
         )
         lines = [head, "  " + nums]
@@ -95,7 +102,8 @@ def compare(out, ref, tol: Tol | str, name: str = "") -> ParityReport:
     o, r = _to64(out), _to64(ref)
     name = name or tol.name
     if o.shape != r.shape:
-        return ParityReport(name, tuple(o.shape), float("inf"), float("inf"), float("inf"), 0.0, float("inf"), 0, None, None, None, [f"shape {tuple(o.shape)} != reference {tuple(r.shape)}"])
+        inf = float("inf")
+        return ParityReport(name, tuple(o.shape), inf, inf, inf, 0.0, inf, inf, 0.0, inf, 0, None, None, None, [f"shape {tuple(o.shape)} != reference {tuple(r.shape)}"])
 
     finite_o, finite_r = torch.isfinite(o), torch.isfinite(r)
     # a non-finite value on either side is only acceptable where both sides hold the same one (inf == inf, nan with nan)
@@ -110,6 +118,10 @@ def compare(out, ref, tol: Tol | str, name: str = "") -> ParityReport:
     rel_elem = diff / denom
     fro_ref = float(torch.linalg.vector_norm(torch.where(ok, r, torch.zeros_like(r))))
     rel_fro = float(torch.linalg.vector_norm(diff)) / fro_ref if fro_ref > 0 else (0.0 if float(diff.max() if diff.numel() else 0) == 0 else float("inf"))
+    n = max(o.numel(), 1)
+    err_rms = float(torch.linalg.vector_norm(diff)) / n**0.5
+    ref_rms = fro_ref / n**0.5
+    rel_fro_eff = err_rms / max(ref_rms, tol.abs_floor_rms) if (ref_rms > 0 or tol.abs_floor_rms > 0) else rel_fro
     spacing = torch.from_numpy(np.spacing(np.abs(r.float().numpy())).astype(np.float64))
     ulp = diff / spacing.clamp(min=1e-45)
     worst = int(torch.argmax(diff.flatten())) if diff.numel() else 0
@@ -121,6 +133,9 @@ def compare(out, ref, tol: Tol | str, name: str = "") -> ParityReport:
         max_rel=float(rel_elem.max()) if rel_elem.numel() else 0.0,
         rel_fro=rel_fro,
         pcc=pcc(torch.where(ok, o, torch.zeros_like(o)), torch.where(ok, r, torch.zeros_like(r))),
+        rel_fro_eff=rel_fro_eff,
+        err_rms=err_rms,
+        ref_rms=ref_rms,
         max_ulp=float(ulp.max()) if ulp.numel() else 0.0,
         n_nonfinite=n_nonfinite,
         worst_index=worst_index,
@@ -131,7 +146,7 @@ def compare(out, ref, tol: Tol | str, name: str = "") -> ParityReport:
         rep.failures.append(f"{n_nonfinite} element(s) with a non-finite value that the other side does not share")
     if tol.exact and not torch.equal(o, r):
         rep.failures.append("not bitwise equal")
-    for label, got, limit in (("rel_fro", rep.rel_fro, tol.rel_fro), ("max_rel", rep.max_rel, tol.max_rel), ("max_abs", rep.max_abs, tol.max_abs), ("max_ulp", rep.max_ulp, tol.max_ulp)):
+    for label, got, limit in (("rel_fro", rep.rel_fro_eff, tol.rel_fro), ("max_rel", rep.max_rel, tol.max_rel), ("max_abs", rep.max_abs, tol.max_abs), ("max_ulp", rep.max_ulp, tol.max_ulp)):
         if limit is not None and not got <= limit:
             rep.failures.append(f"{label} {got:.3e} > {limit:.3e}")
     if tol.pcc_min is not None and not rep.pcc >= tol.pcc_min:

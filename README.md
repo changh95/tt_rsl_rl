@@ -16,7 +16,7 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 |-------|-------|--------|
 | 0 | Environment, safety net, research, ADRs, device smoke + noise floors | done (tag `phase-0-done`) |
 | 1 | Reference + parity harness (host only) | done (tag `phase-1-done`) |
-| 2 | 1-chip (1x1 mesh) forward | pending |
+| 2 | 1-chip (1x1 mesh) forward | done (tag `phase-2-done`) |
 | 3 | 1-chip backward, optimizer, PPO update | pending |
 | 4 | 1-chip end-to-end training + checkpoint compatibility | pending |
 | 5 | 1-chip performance (trace, pre-allocation) | pending |

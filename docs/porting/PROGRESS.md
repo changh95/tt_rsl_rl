@@ -3,6 +3,27 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-11 — Phase 2 DONE: 1-chip forward on Blackhole (tag `phase-2-done`)
+**Done**
+- `rsl_rl_tt/tt_common.py` (tile padding, compute config, the ONLY host<->device transfer helpers with per-allow-list-id counters; unknown ids raise),
+  `rsl_rl_tt/modules.py` (device-side `TTLinear`/`TTMLP`/`TTMLPModel`, `TTEmpiricalNormalization` with the upstream Welford recurrence and a device-tensor rate,
+  `TTGaussianDistribution` with scalar/log std, clamping, masked log_prob/entropy; no torch import), `rsl_rl_tt/ppo.py` (`TTPPO(PPO)`, injected via
+  `cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"` into the UNMODIFIED `OnPolicyRunner`; upstream models stay as mirrors), `device.acquire_tray_mesh`.
+- Padding: all device dims are multiples of 32, zero padded (exact: padded outputs are 0), action-dim padding masked in log_prob/entropy; num_envs and
+  mini-batch sizes that are not multiples of 32 per chip are refused with a clear error (tested).
+- Allow-list: H-8 added (per-iteration scalars as device tensors). Everything on the TT path is counted; H-7 (host storage/GAE) is the Phase 2 temporary.
+- Tests: 77 device tests in one process (56 component + 21: random-shape sweep with padding, checkpoint load + resync, teacher-forced rollouts on all three envs
+  against deep copies of the upstream models, exact host-op counts, alignment/config refusals) and 4 new host invariants (347 host tests pass).
+- Measured composite tolerances (`TOLERANCES.md`): MLP forward rel_fro 2.5e-3..3.5e-3 (critic 7.7e-3; tolerance 1.5e-2 with a 0.1 absolute floor), normalizer
+  forward 2 ULP, update 2.8e-7, Gaussian head 1e-7..7.7e-8.
+- Full-size rollouts with TT inference end to end (`scripts/bench_rollout.py`, `measurements/phase2_rollout_timing.json`): act 2.7 / 2.7 / 3.9 ms per step
+  (cartpole 1024 envs / pendulum 1024 / tracking12 2048) vs upstream CPU 0.8 / 1.0 / 2.8 ms; rollout 73 / 96 / 120 ms. Untraced, with 4 downloads per step (H-7):
+  this is the Phase 5 baseline, not a result.
+**Findings**: `fast_and_approximate_mode=False` is rejected for fp32 binary ops (TTNN_ISSUES T-10); accurate fp32 `mean`/`sum` need `fp32_dest_acc_en` in the
+config (T-11); relative error of a small-output network needs an absolute floor (a random-init critic has output rms 0.06).
+**Next**: Phase 3 (1-chip backward, optimizer, PPO update): hand-written VJPs, PPO losses, per-model grad-norm clipping (C-1), device Adam with device-tensor
+scalars, adaptive LR, device RolloutStorage/GAE/mini-batches; gradient parity per parameter vs upstream autograd; Adam step; full `update()`; 20-iteration drift.
+
 ## 2026-11-11 — Phase 1 DONE (host only): CPU test envs, golden baselines, parity utilities
 **Done**
 - Owner approved ADR-0001/0002/0003/0004(A-1) and Phase 1 (2026-11-10); Phase 0 merged to `main`, tag `phase-0-done`.

@@ -226,8 +226,9 @@ _ACTIVE: TrayMesh | None = None
 class TrayMesh:
     """An open mesh on (a subset of) the tray. Use as a context manager; `close()` is idempotent and also runs at interpreter exit."""
 
-    def __init__(self, ttnn: Any, mesh_device: Any, cfg: TrayConfig, fabric_set: bool):
+    def __init__(self, ttnn: Any, mesh_device: Any, cfg: TrayConfig, fabric_set: bool, mesh_shape: tuple[int, int] | None = None):
         self._ttnn, self.mesh_device, self.cfg, self._fabric_set, self._closed = ttnn, mesh_device, cfg, fabric_set, False
+        self.mesh_shape = mesh_shape
 
     def close(self) -> None:
         global _ACTIVE
@@ -313,7 +314,20 @@ def open_tray_mesh(
         _best_effort_close(ttnn, mesh, fabric_set)
         raise
 
-    tray_mesh = TrayMesh(ttnn, mesh, cfg, fabric_set)
+    tray_mesh = TrayMesh(ttnn, mesh, cfg, fabric_set, (rows, cols))
     _ACTIVE = tray_mesh
     atexit.register(tray_mesh.close)
     return tray_mesh
+
+
+def acquire_tray_mesh(mesh_shape: tuple[int, int], **kwargs) -> TrayMesh:
+    """The already open tray mesh if there is one (one open per process), else a freshly opened one (same arguments as `open_tray_mesh`).
+
+    Library code (e.g. `TTPPO`) calls this instead of opening anything itself; whoever opened the mesh first keeps ownership of it.
+    A request for a different mesh shape than the open one is refused.
+    """
+    if _ACTIVE is not None:
+        if _ACTIVE.mesh_shape is not None and tuple(_ACTIVE.mesh_shape) != tuple(mesh_shape):
+            raise TrayGuardError(f"a {_ACTIVE.mesh_shape} tray mesh is already open; cannot switch to {tuple(mesh_shape)} in the same process")
+        return _ACTIVE
+    return open_tray_mesh(tuple(mesh_shape), **kwargs)
