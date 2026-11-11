@@ -1,0 +1,25 @@
+{
+  "metric": "Train/mean_reward",
+  "reference_finals": [
+    189.66835264587402,
+    189.76200718688963,
+    192.67705430603027
+  ],
+  "reference_mean": 190.70247137959797,
+  "reference_std": 1.3967643784312507,
+  "tt_finals": [
+    190.84825653076172
+  ],
+  "tt_mean": 190.84825653076172,
+  "threshold": 181.16734781061808,
+  "all_finite": true,
+  "passes": true,
+  "reference_iterations": [
+    300,
+    300,
+    300
+  ],
+  "tt_iterations": [
+    300
+  ]
+}

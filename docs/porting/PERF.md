@@ -138,6 +138,28 @@ Late collapse on cartpole. With a maximum reward of 500 reached, PPO with the ad
 not specific to the mesh: seeds 3-20 collapsed 2 of 18 (1 chip), 5 of 18 (1x2), 1 of 18 (2x4) (`measurements/stability_cartpole_*.json`; Fisher exact p = 0.40 for 1x2 vs 1 chip, 1.0 for 2x4 vs 1 chip: no trend with the chip count). The
 criterion of Phase 4 averages three seeds and was met; the CPU golden runs (3 seeds) did not collapse.
 
+## 7c. Environment bridge (Phase 7, ADR-0003)
+
+The environment lives on another host (Isaac Lab on a GPU machine) or in another process; `RemoteVecEnv` (TT host) talks to `serve(env, endpoint)` over ZeroMQ with a JSON header and raw float32 buffers
+(`rsl_rl_tt/bridge/`). Round trip of ONE step on loopback (server in its own process, `scripts/bench_bridge.py`, median of 100 steps; payload = actions down, observations of the tracking12 shapes, rewards, dones and
+time-outs up: 342 bytes per environment):
+
+| num_envs | MB per step | ZeroMQ tcp (the bridge) ms | ZeroMQ ipc ms | raw TCP socket, no serialisation ms | ZeroMQ + pickle ms | bridge throughput | bridge cost per iteration (24 steps) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 0.10 | 0.63 | 0.45 | 0.04 | 1.6 | 0.2 GB/s | 15 ms |
+| 4096 | 1.60 | 0.88 | 0.69 | 0.25 | 4.2 | 1.8 GB/s | 21 ms |
+| 16384 | 6.39 | 4.46 | 3.88 | 0.97 | 8.2 | 1.4 GB/s | 107 ms |
+| 65536 | 25.56 | 8.87 | 11.86 | 5.01 | 74.6 | 2.9 GB/s | 213 ms |
+
+* The bridge costs 0.6-0.9 ms per step up to 4096 environments (5 % of a TT iteration at 4096 environments: 21 ms of 447 ms on one chip; 15 % at 256 environments: 15 of 99 ms) and 8.9 ms at 65536 environments (213 ms of an 8-chip iteration of 1068 ms: 20 %,
+  on loopback; a real network adds its latency and divides the bytes by its bandwidth: ~25.6 MB per step is 20 ms at 10 GbE).
+* Raw buffers beat pickling the same tensors by 2.6x (256 envs) to 8x (65536 envs); the gap to a bare socket (0.04-5 ms) is ZeroMQ's fixed cost (~0.6 ms) and the single copy into the tensors. gRPC and Arrow Flight were
+  NOT measured: they would add `grpcio` / `pyarrow` to the Isaac Lab Python (a dependency and version risk on the GPU host) for a transport whose loopback cost is already a few percent of an iteration.
+  Shared memory only helps if both processes are on one host, which is the same-host case that needs no bridge at all.
+* End to end on loopback with the user-facing scripts (`isaac_env_server.py --local-env tracking12` + `train_isaac.py`, TTPPO on one chip, traced, 300 iterations): 83 s against 77 s with the environment in process;
+  7200 steps, mean round trip 2.1 ms (it includes the 2048-environment step of the CPU environment itself), 0.7 GB sent and 5.0 GB received. The recorded run reproduces the in-process run in every logged scalar
+  (`docs/porting/isaac_loopback/`, `tests/tt/test_bridge.py`).
+
 ## 8. Reproduce
 
 ```bash
@@ -146,6 +168,7 @@ scripts/run_bench_matrix.sh                      # TT traced matrix: num_envs {4
 scripts/run_bench_cpu.sh                         # upstream CPU matrix + real env cost (host only)
 scripts/run_bench_small.sh                       # small regimes (TT + CPU) and eager TT at 4096 envs
 scripts/run_bench_scaling.sh                     # Phase 6: chips {1, 2, 8} x num_envs x hidden (traced, null env)
+python scripts/bench_bridge.py --out docs/porting/measurements/bridge_bench.json     # Phase 7: environment bridge, host only
 scripts/tt_run.sh --chips 16 --timeout 900 -- python scripts/profile_ops.py --envs 65536 --hidden 512 256 128      # op profile
 scripts/tt_run.sh --chips 16 --timeout 900 -- python scripts/bench_matrix.py --backend tt --trace --profile --envs 4096 --hidden 512 256 128   # section profile
 scripts/tt_run.sh --chips 16 --timeout 3600 -- python scripts/train_tt.py --trace --out docs/porting/tt_runs_trace  # end-to-end on the traced path

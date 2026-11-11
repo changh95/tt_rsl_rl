@@ -65,6 +65,10 @@ scripts/run_phase5_final.sh
 scripts/tt_run.sh --chips 16,17 --timeout 900 --tag p6 -- env TT_TEST_MESH=1x2 python -m pytest -m tt tests/tt/test_tt_multichip.py -q -p no:cacheprovider
 scripts/tt_run.sh --timeout 900 --tag p6 -- env TT_TEST_MESH=2x4 python -m pytest -m tt tests/tt/test_tt_multichip.py -q -p no:cacheprovider
 scripts/run_phase6_final.sh      # all device suites on 1 chip, 1x2 and 2x4, fail-fast; scripts/run_bench_scaling.sh = chips x num_envs benchmark
+# Phase 7: environment bridge (host tests; loopback; the device test needs one chip)
+python -m pytest tests/tt/test_bridge.py -q          # 14 host tests (needs pyzmq in the venv)
+scripts/tt_run.sh --chips 16 --timeout 900 --tag p7 -- python -m pytest -m tt tests/tt/test_tt_bridge_device.py -q -p no:cacheprovider
+# GPU-host procedure and scripts: docs/porting/ISAAC_RUNBOOK.md (isaac_env_server.py, train_isaac.py, bridge_smoke.py, tb_to_csv.py, compare_curves.py)
 # MULTI-CHIP RULE (ADR-0004): chip-local loss / advantage normalisation / shuffle, gradients and KL averaged over the chips (gather + fp32 sum, never ttnn.all_reduce), global normalizer statistics.
 # TRACED-PATH RULE (TTNN_ISSUES T-15): everything that keeps a value across trace replays is allocated BEFORE the first capture; one TTPPO per process.
 

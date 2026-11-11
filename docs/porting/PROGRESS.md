@@ -3,6 +3,24 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-12 — Phase 7 DONE on the TT host: environment bridge, scripts and runbook; Isaac Lab itself NOT run (no GPU host / Isaac Lab available)
+**Done**
+- `rsl_rl_tt/bridge/` (ADR-0003 plan as accepted: ZeroMQ + raw float32 buffers): `protocol.py` (JSON header + raw buffers, numpy only), `server.py` (`serve(env, endpoint, agent_cfg=...)` for any rsl_rl-style env, e.g. Isaac Lab's
+  `RslRlVecEnvWrapper`; no rsl_rl / ttnn import, so it runs in an Isaac Lab Python of another version), `client.py` (`RemoteVecEnv`, an rsl_rl `VecEnv`: dones long, bool time_outs, episode logs, settable
+  `episode_length_buf`, `TimeoutError` instead of a hang), `config.py` (`tt_agent_cfg`: the agent configuration of the environment host with only the TT-defining keys changed, v5 format required). Dependency: `pyzmq==26.4.0` (ENV.md).
+- Scripts: `isaac_env_server.py` (`--local-env` loopback, VERIFIED; `--task` Isaac Lab mode, written against the public Isaac Lab v2.3.0 `train.py` / `RslRlVecEnvWrapper` and NOT run), `train_isaac.py` (TT host: connect, take the
+  configuration from the server, train on 1 / 2 / 8 chips, CSV + upstream-format checkpoints), `bridge_smoke.py` (connection check against the real server), `tb_to_csv.py` + `compare_curves.py` (GPU reference vs TT: the Phase 4
+  criterion and a figure), `bench_bridge.py`. Runbook for the GPU host: `docs/porting/ISAAC_RUNBOOK.md` (Isaac-Cartpole, a locomotion task, TT checkpoint replay in `play.py`).
+- Evidence: an environment behind the bridge is indistinguishable from the same one in process (`tests/tt/test_bridge.py`, 14 host tests: obs / rewards / dones / time-outs / logs step by step over 350 steps, upstream PPO training:
+  every logged scalar; `tests/tt/test_tt_bridge_device.py`: TTPPO every scalar and every parameter, cartpole and tracking12). User-facing path on loopback: `isaac_env_server.py --local-env tracking12` + `train_isaac.py` on one chip,
+  traced, 300 iterations, configuration received from the server: identical to the Phase 5 in-process run in every logged scalar, golden criterion met (`docs/porting/isaac_loopback/`, committed and tested), 83 s vs 77 s.
+- Measured on loopback (PERF.md 7c): 0.6-0.9 ms per step up to 4096 environments, 8.9 ms at 65536 (25.6 MB per step, 2.9 GB/s); pickling the tensors is 2.6-8x slower; raw TCP floor 0.04-5 ms. gRPC / Arrow Flight not measured (extra
+  dependencies on the Isaac Lab Python; the transport costs 5 % of an iteration already).
+**Not done (needs the owner / the GPU host)**: ISAAC_HOST is still unknown. Running the Isaac mode of the server, the Isaac-Cartpole and locomotion comparisons against GPU reference runs and the replay of a TT checkpoint
+in Isaac Lab's `play.py` follow the runbook; its first step (`bridge_smoke.py`) shows within a minute whether the server matches your Isaac Lab. Isaac Lab v2.3.0 trains with the rsl_rl 3.x configuration format; the TT backend needs 5.x
+(Isaac Lab `main`): `tt_agent_cfg` says so explicitly if it receives the old one.
+**v1 status**: all seven phases are done on the TT host (tags `phase-0-done` ... `phase-7-done`).
+
 ## 2026-11-11 — Phase 6 DONE: tray multi-chip data parallel, 1x2 and 2x4 (tag `phase-6-done`)
 **Done**
 - `TTPPO` runs on a mesh (`tt_cfg["mesh_shape"]` = [1, 2] or [2, 4], fabric FABRIC_1D set automatically): the batch is sharded over the chips; parameters, Adam state and the learning rate are replicated; every chip computes the
