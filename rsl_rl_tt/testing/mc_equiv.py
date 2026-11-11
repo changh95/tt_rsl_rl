@@ -37,12 +37,14 @@ STEPS = 3  # mini-batch steps (adaptive learning rate included: the KL of the 2n
 ENV = "tracking12"  # separate actor / critic observation groups (36 / 84), 12 actions
 SEED = 0
 REFERENCE = "mc_step_reference.npz"  # .npz, not .pt: checkpoints (*.pt) are git-ignored on purpose (BRIEF 2-10); this is a small test fixture
+REFERENCE_HETERO = "mc_step_reference_hetero.npz"  # the same with a heteroscedastic actor (Phase 8.1)
 
 
-def make_runner(mesh_shape: list[int]):
-    """The TTPPO runner of the test (eager, no rollout is ever run on it)."""
+def make_runner(mesh_shape: list[int], hetero: bool = False):
+    """The TTPPO runner of the test (eager, no rollout is ever run on it); `hetero`: a heteroscedastic Gaussian actor (state-dependent std)."""
     base = REF_SPECS[ENV]
-    spec = RefSpec(num_envs=256, num_steps=8, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1})
+    spec = RefSpec(num_envs=256, num_steps=8, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1},
+                   **({"distribution": "HeteroscedasticGaussianDistribution"} if hetero else {}))
     runner, _, _ = build_reference_runner(ENV, SEED, None, spec, tt=True, tt_cfg={"mesh_shape": list(mesh_shape)})
     return runner
 
@@ -63,9 +65,15 @@ def make_pool(alg: Any, seed: int = 1) -> tuple[torch.Tensor, TensorDict]:
     with torch.no_grad():
         mean = actor(obs)  # deterministic output = the distribution mean
         value = critic(obs)[:, 0]
-        std = alg.tt_actor.distribution.host_std()[: mean.shape[1]]
+        if alg.hetero:
+            actor(obs, stochastic_output=True)
+            std = actor.output_std.clone()  # [rows, A]: every row has its own std
+        else:
+            std = alg.tt_actor.distribution.host_std()[: mean.shape[1]]
         action = mean + std * torch.randn(mean.shape, generator=g)
         old_mean = mean + 0.05 * torch.randn(mean.shape, generator=g)  # the policy moved a little since the rollout: ratios and KL are not trivial
+        if alg.hetero:
+            std = std * (1.0 + 0.1 * torch.rand(std.shape, generator=g))  # ... and so did the std (the stored one differs from the current one)
         old_logp = torch.distributions.Normal(old_mean, std).log_prob(action).sum(-1)
         old_value = value + 0.1 * torch.randn(rows, generator=g)
         returns = value + torch.randn(rows, generator=g)
@@ -77,6 +85,8 @@ def make_pool(alg: Any, seed: int = 1) -> tuple[torch.Tensor, TensorDict]:
         table[:, st.col_critic : st.col_critic + st.critic_dim_p] = stage_obs(obs, alg.tt_critic.obs_groups, st.critic_dim_p)
     table[:, st.col_action : st.col_action + st.act_dim_p] = pad_matrix(action, rows, st.act_dim_p)
     table[:, st.col_mean : st.col_mean + st.act_dim_p] = pad_matrix(old_mean, rows, st.act_dim_p)
+    if alg.hetero:
+        table[:, st.col_std : st.col_std + st.act_dim_p] = pad_matrix(std, rows, st.act_dim_p, fill=1.0)  # a stored std is 1 in the padded columns
     for name, col in (("value", old_value), ("returns", returns), ("advantages", adv), ("old_logp", old_logp)):
         table[:, st.col_scalars + {"value": 0, "returns": 1, "advantages": 2, "old_logp": 3}[name]] = col
     return table, obs
@@ -100,14 +110,16 @@ def run_steps(alg: Any, pool: torch.Tensor, eval_obs: TensorDict) -> dict:
     dist = alg.tt_actor.distribution
 
     def outputs():
-        a = ctx.download(alg.tt_actor.forward(alg.tt_actor.obs_to_device(eval_obs)), op="H-2")[:, : alg.tt_actor.output_dim]
+        a = ctx.download(alg.tt_actor.forward(alg.tt_actor.obs_to_device(eval_obs)), op="H-2")
+        a = torch.cat([a[:, : dist.dim], a[:, dist.dim_p : dist.dim_p + dist.dim]], dim=1) if alg.hetero else a[:, : alg.tt_actor.output_dim]  # hetero: mean and std head
         c = ctx.download(alg.tt_critic.forward(alg.tt_critic.obs_to_device(eval_obs)), op="H-2")[:, :1]
         return a, c
 
     before = outputs()
     alg._buf["update.table"] = ctx.upload(chip_layout(pool, n), op="H-6", batch_sharded=True)
-    for key, value in (("update.old_var", dist.var), ("update.old_log_std", dist.log_std)):
-        alg._buf[key] = ctx.put(alg._buf.get(key), value)
+    if not alg.hetero:
+        for key, value in (("update.old_var", dist.var), ("update.old_log_std", dist.log_std)):
+            alg._buf[key] = ctx.put(alg._buf.get(key), value)
     lrs = []
     for k in range(STEPS):
         alg.adam.prepare_step()

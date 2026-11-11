@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from rsl_rl_tt.modules import TTGaussianDistribution
 from rsl_rl_tt.tt_common import TTContext
 
 
@@ -28,10 +27,12 @@ class PPOLosses:
         return self.ctx.ttnn.mean(x, dim=0, keepdim=True, compute_kernel_config=self.ctx.compute_cfg)
 
     # -- actor ------------------------------------------------------------------------------------------------------------
-    def actor(self, dist: TTGaussianDistribution, mean: Any, actions: Any, old_logp: Any, adv: Any, rows: int) -> dict:
+    def actor(self, dist: Any, mean: Any, actions: Any, old_logp: Any, adv: Any, rows: int) -> dict:
         """Surrogate loss and the gradients w.r.t. the distribution mean (-> MLP backward) and the std parameter.
 
-        Returns {"logp", "surrogate_loss" [1,1], "d_mean" [rows, A_p], "d_param" [1, A_p] or None}."""
+        `dist` is the (state-independent) distribution or the per-row state of a heteroscedastic one (`dist.per_row`).
+        Returns {"logp", "surrogate_loss" [1,1], "d_mean" [rows, A_p], "d_param" [1, A_p] or None, "d_raw" [rows, A_p] or None}; `d_raw` is the gradient w.r.t. the
+        raw output of the std head (heteroscedastic only), to be concatenated with `d_mean` for the output layer."""
         ttnn = self.ctx.ttnn
         cfg = self.ctx.compute_cfg
         diff = ttnn.subtract(actions, mean)
@@ -47,14 +48,18 @@ class PPOLosses:
         gate = ttnn.maximum(inside, ttnn.gt(s1, s2))
         d_logp = ttnn.multiply(ttnn.multiply(ttnn.multiply(neg_adv, gate), ratio), 1.0 / rows)  # [rows, 1]: dL/dlogp per sample
         d_mean = ttnn.multiply(ttnn.multiply(diff, dist.inv_var), d_logp)  # dlogp/dmean = diff / var (masked row)
-        d_param = None
-        if dist.learn_std:
+        d_param = d_raw = None
+        if dist.per_row:
+            # per row and column: dL/dstd = dL/dlogp (diff^2 / std^3 - 1 / std) - c_e / (rows std)   (the entropy bonus: -c_e * mean over rows of sum_cols log std)
+            d_std = ttnn.subtract(ttnn.multiply(ttnn.multiply(ttnn.square(diff), d_logp), dist.inv_std3), ttnn.multiply(ttnn.add(d_logp, self.c_e / rows), dist.inv_std))
+            d_raw = ttnn.multiply(d_std, dist.gate)
+        elif dist.learn_std:
             s1_cols = ttnn.sum(ttnn.multiply(ttnn.square(diff), d_logp), dim=0, keepdim=True, compute_kernel_config=cfg)  # sum_i dL/dlogp_i diff^2
             s0 = ttnn.sum(d_logp, dim=0, keepdim=True, compute_kernel_config=cfg)  # sum_i dL/dlogp_i  -> [1, 1]
             # dlogp/dstd = diff^2/std^3 - 1/std ; entropy bonus: -c_e * d(mean entropy)/dstd = -c_e / std
             d_std = ttnn.subtract(ttnn.multiply(s1_cols, dist.inv_std3), ttnn.multiply(ttnn.add(s0, self.c_e), dist.inv_std))
             d_param = ttnn.multiply(d_std, dist.param_gate)
-        return {"logp": logp, "surrogate_loss": surrogate_loss, "d_mean": d_mean, "d_param": d_param}
+        return {"logp": logp, "surrogate_loss": surrogate_loss, "d_mean": d_mean, "d_param": d_param, "d_raw": d_raw}
 
     # -- critic -----------------------------------------------------------------------------------------------------------
     def critic(self, value: Any, old_value: Any, returns: Any, rows: int) -> dict:
@@ -81,8 +86,9 @@ class PPOLosses:
         return {"value_loss": value_loss, "d_value": ttnn.multiply(d, self.c_v / rows)}
 
     # -- KL (adaptive learning rate; no gradient) ---------------------------------------------------------------------------
-    def kl_mean(self, dist: TTGaussianDistribution, old_mean: Any, old_var: Any, old_log_std: Any, mean: Any) -> Any:
-        """mean over rows of KL(N(old_mean, old_std) || N(mean, std)) summed over the real action dims: a [1, 1] device scalar."""
+    def kl_mean(self, dist: Any, old_mean: Any, old_var: Any, old_log_std: Any, mean: Any) -> Any:
+        """mean over rows of KL(N(old_mean, old_std) || N(mean, std)) summed over the real action dims: a [1, 1] device scalar. `old_var` / `old_log_std` are
+        [1, A_p] rows (state-independent distribution) or [rows, A_p] (heteroscedastic: the stored std of every sample)."""
         ttnn = self.ctx.ttnn
         cfg = self.ctx.compute_cfg
         var_ratio = ttnn.multiply(old_var, dist.inv_var)  # rows of the (masked) 1 / new var; padded columns are 0 -> handled by the mask below

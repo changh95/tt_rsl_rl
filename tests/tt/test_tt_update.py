@@ -148,11 +148,12 @@ def tt_params(alg):
     out = {}
     for tag, model in (("actor", alg.tt_actor), ("critic", alg.tt_critic)):
         for i, layer in enumerate(model.mlp.layers):
-            w = ctx.download(layer.w, op="H-6", batch_sharded=False)[: layer.in_features, : layer.out_features].t()
-            b = ctx.download(layer.b, op="H-6", batch_sharded=False)[0, : layer.out_features]
+            w = layer.weight_from_host(ctx.download(layer.w, op="H-6", batch_sharded=False))
+            b = layer.bias_from_host(ctx.download(layer.b, op="H-6", batch_sharded=False))
             out[f"{tag}.mlp.{i}.weight"], out[f"{tag}.mlp.{i}.bias"] = w, b
     d = alg.tt_actor.distribution
-    out["actor.std"] = ctx.download(d.param, op="H-6", batch_sharded=False)[0, : d.dim]
+    if not d.per_row:  # a heteroscedastic std is part of the actor's last layer
+        out["actor.std"] = ctx.download(d.param, op="H-6", batch_sharded=False)[0, : d.dim]
     return out
 
 
@@ -163,7 +164,8 @@ def ref_params(ref_alg):
         for i, lin in enumerate(lins):
             out[f"{tag}.mlp.{i}.weight"], out[f"{tag}.mlp.{i}.bias"] = lin.weight.detach().clone(), lin.bias.detach().clone()
     d = ref_alg._raw_actor.distribution
-    out["actor.std"] = (d.std_param if d.std_type == "scalar" else d.log_std_param).detach().clone()
+    if type(d).__name__ == "GaussianDistribution":
+        out["actor.std"] = (d.std_param if d.std_type == "scalar" else d.log_std_param).detach().clone()
     return out
 
 
@@ -223,7 +225,7 @@ def rollout_into_both(alg, ref_alg, env, obs, steps):
             tr.values = dl(ctx, pend["value"])[:, :1].clone()
             tr.actions_log_prob = dl(ctx, pend["logp"])[:, 0].clone()
             mean = dl(ctx, pend["mean"])[:, :A].clone()
-            std = alg._std_host.reshape(1, A).expand(env.num_envs, A).clone()
+            std = dl(ctx, pend["std"])[:, :A].clone() if alg.hetero else alg._std_host.reshape(1, A).expand(env.num_envs, A).clone()
             tr.distribution_params = (mean, std)
             tr.hidden_states = (None, None)
             obs, rewards, dones, extras = env.step(actions)
@@ -270,7 +272,11 @@ def function_outputs(params, ref_alg, obs):
             mapping[f"mlp.{mod_i}.weight"] = params[f"{tag}.mlp.{k}.weight"]
             mapping[f"mlp.{mod_i}.bias"] = params[f"{tag}.mlp.{k}.bias"]
         with torch.no_grad():
-            res[tag] = torch.func.functional_call(model, mapping, (obs,))
+            if tag == "actor" and model.distribution is not None and type(model.distribution).__name__ == "HeteroscedasticGaussianDistribution":
+                # the std head is part of the function: compare the whole output of the MLP (mean and std head), not only the mean
+                res[tag] = torch.func.functional_call(model.mlp, {k[len("mlp."):]: v for k, v in mapping.items()}, (model.get_latent(obs),)).flatten(-2)
+            else:
+                res[tag] = torch.func.functional_call(model, mapping, (obs,))
     return res
 
 
@@ -289,9 +295,9 @@ def function_deviation(p_a, p_b, p_0, ref_alg, obs_eval):
     return {tag: float((fa[tag] - fb[tag]).double().norm() / (fb[tag] - f0[tag]).double().norm().clamp(min=1e-30)) for tag in ("actor", "critic")}
 
 
-def run_update_pair(name, tmp_path, algorithm_over, warm_iterations=2, noise=4e-3, resync=True):
+def run_update_pair(name, tmp_path, algorithm_over, warm_iterations=2, noise=4e-3, resync=True, spec_over=None):
     base = small_spec(name)
-    spec = RefSpec(**{**base.__dict__, "algorithm": {**base.algorithm, **algorithm_over}})
+    spec = RefSpec(**{**base.__dict__, "algorithm": {**base.algorithm, **algorithm_over}, **(spec_over or {})})
     runner, env, cfg, ref_alg = make_pair(name, tmp_path, spec=spec)
     alg = runner.alg
     alg.train_mode(); ref_alg.train_mode()

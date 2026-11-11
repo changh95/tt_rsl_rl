@@ -214,16 +214,32 @@ def pad_vector(v: torch.Tensor, cols: int, fill: float = 0.0) -> torch.Tensor:
     return out
 
 
-def linear_to_host(weight: torch.Tensor, bias: torch.Tensor | None, in_p: int, out_p: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """torch Linear (weight [out, in], bias [out]) -> padded device layout: W^T as [in_p, out_p] and the bias as a [1, out_p] row."""
-    w = pad_matrix(weight.detach().t(), in_p, out_p)
-    b = pad_vector(bias if bias is not None else torch.zeros(weight.shape[0]), out_p)
+def pad_heads(m: torch.Tensor, rows_p: int, cols_p: int, heads: int = 1) -> torch.Tensor:
+    """[R, heads * D] -> [rows_p, cols_p] where every one of the `heads` blocks of D columns is zero-padded on its own to cols_p / heads columns
+    (heads == 1 is `pad_matrix`). The two-head output layer of a heteroscedastic actor (mean | std) uses this layout: both halves start on a tile boundary."""
+    d, d_p = m.shape[1] // heads, cols_p // heads
+    out = torch.zeros(rows_p, cols_p)
+    for h in range(heads):
+        out[: m.shape[0], h * d_p : h * d_p + d] = m[:, h * d : (h + 1) * d].detach().to(torch.float32)
+    return out
+
+
+def unpad_heads(m: torch.Tensor, rows: int, cols: int, heads: int = 1) -> torch.Tensor:
+    """Inverse of `pad_heads`: [rows_p, cols_p] -> [rows, cols] (cols = heads * D)."""
+    d, d_p = cols // heads, m.shape[1] // heads
+    return torch.cat([m[:rows, h * d_p : h * d_p + d] for h in range(heads)], dim=1)
+
+
+def linear_to_host(weight: torch.Tensor, bias: torch.Tensor | None, in_p: int, out_p: int, heads: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    """torch Linear (weight [out, in], bias [out]) -> padded device layout: W^T as [in_p, out_p] and the bias as a [1, out_p] row (`heads` output blocks, see `pad_heads`)."""
+    w = pad_heads(weight.detach().t(), in_p, out_p, heads)
+    b = pad_heads((bias if bias is not None else torch.zeros(weight.shape[0])).detach().reshape(1, -1), 1, out_p, heads)
     return w, b
 
 
-def linear_from_host(w: torch.Tensor, b: torch.Tensor, out_features: int, in_features: int) -> tuple[torch.Tensor, torch.Tensor]:
+def linear_from_host(w: torch.Tensor, b: torch.Tensor, out_features: int, in_features: int, heads: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     """Inverse of `linear_to_host`: padded [in_p, out_p] / [1, out_p] -> torch layout [out, in] / [out]."""
-    return w[:in_features, :out_features].t().contiguous(), b[0, :out_features].contiguous()
+    return unpad_heads(w, in_features, out_features, heads).t().contiguous(), unpad_heads(b, 1, out_features, heads)[0].contiguous()
 
 
 def mask_row(dim: int, dim_p: int) -> torch.Tensor:

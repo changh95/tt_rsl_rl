@@ -27,6 +27,8 @@ class RefSpec:
     algorithm: dict
     init_std: float = 1.0
     obs_normalization: bool = True
+    distribution: str = "GaussianDistribution"  # or "HeteroscedasticGaussianDistribution" (the std is an output of the actor MLP)
+    std_type: str = "scalar"
 
 
 _PPO = {
@@ -58,7 +60,7 @@ REF_SPECS: dict[str, RefSpec] = {
 
 def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | None = CSV_LOGGER) -> dict:
     spec = spec or REF_SPECS[env_name]
-    dist = {"class_name": "GaussianDistribution", "init_std": spec.init_std, "std_type": "scalar"}
+    dist = {"class_name": spec.distribution, "init_std": spec.init_std, "std_type": spec.std_type}
     cfg = {
         "num_steps_per_env": spec.num_steps,
         "save_interval": 10_000,

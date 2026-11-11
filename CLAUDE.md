@@ -78,6 +78,11 @@ MUJOCO_GL=egl python examples/g1_walk/play.py --checkpoint random .run/examples/
 # MULTI-CHIP RULE (ADR-0004): chip-local loss / advantage normalisation / shuffle, gradients and KL averaged over the chips (gather + fp32 sum, never ttnn.all_reduce), global normalizer statistics.
 # TRACED-PATH RULE (TTNN_ISSUES T-15): everything that keeps a value across trace replays is allocated BEFORE the first capture; one TTPPO per process.
 
+# Phase 8.1 (heteroscedastic Gaussian): all device suites (v1 + 8.x) on 1 chip, 1x2 and 2x4, fail-fast (~3 min); the 1-chip reference of the multi-chip hetero test: scripts/mc_step_reference.py --hetero
+scripts/run_phase8_final.sh
+python scripts/train_reference.py --distribution HeteroscedasticGaussianDistribution --out docs/porting/golden_hetero --runs-dir .run/golden_hetero_runs     # upstream CPU curves (host only)
+scripts/tt_run.sh --chips 16 --timeout 3600 --tag p8e -- python scripts/train_tt.py --distribution HeteroscedasticGaussianDistribution --golden docs/porting/golden_hetero --out docs/porting/tt_runs_hetero --runs-dir .run/tt_runs_hetero --trace
+
 # stop only jobs started by this repo (reads .run/pids)
 scripts/kill_my_jobs.sh
 

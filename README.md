@@ -22,6 +22,7 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 | 5 | 1-chip performance (trace, pre-allocation) | done (tag `phase-5-done`): 7-19x faster than upstream CPU per iteration, [`PERF.md`](docs/porting/PERF.md) |
 | 6 | Tray multi-chip data parallel (8 chips) | done (tag `phase-6-done`): 1x2 and 2x4, 5.3x at 65536 envs on 8 chips, [`PERF.md`](docs/porting/PERF.md) 7b |
 | 7 | Isaac Lab integration | done on the TT host (tag `phase-7-done`): env bridge, scripts, [`ISAAC_RUNBOOK.md`](docs/porting/ISAAC_RUNBOOK.md); the Isaac Lab side is unverified (no GPU host) |
+| 8.1 | Post-v1: `HeteroscedasticGaussianDistribution` (state-dependent std) on the device | done (tag `phase-8-1-done`): 1 chip, 1x2, 2x4; order of the further items (RND, symmetry, distillation, RNN, CNN, SAC) in [`POST_V1.md`](docs/porting/POST_V1.md) |
 
 > This is a work in progress on shared hardware; it only ever touches one dedicated 8-chip tray (see `CLAUDE.md`).
 

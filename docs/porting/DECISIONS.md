@@ -227,6 +227,15 @@ github.com/tenstorrent/sfpi, its sha256 (`de16ebb1...b610b954`, from the wheel's
 `ttnn.__init__` sets its runtime root to the installed package directory automatically (no env var needed). Whether the wheel works with
 KMD 2.10.0 and this hardware is verified by the first device job.
 
+## ADR-0007 — Post-v1 features: order, and the heteroscedastic Gaussian  — *Working decision (assistant, 2026-11-11, after the owner said to leave the GPU host aside and start on something else); the owner can veto*
+
+* **Order** (BRIEF §1 "v1 이후"; `POST_V1.md`): by effort and by how much new machinery each needs on top of the traced fixed-shape design: 8.1 heteroscedastic Gaussian, 8.2 RND, 8.3 symmetry, 8.4 distillation, 8.5 RNNModel, 8.6 CNNModel, 8.7 SAC (not in the pinned
+  upstream tag). Every item has the v1 acceptance set (component parity, update parity, traced == eager bit for bit, multi-chip equivalence in function space, end-to-end run against upstream, checkpoint compatibility); no tolerance of an existing row is loosened.
+* **8.1 design** (details in `POST_V1.md`): the actor's output layer keeps upstream's `[mean | std]` shape and becomes a two-head `TTLinear` (each head tile-aligned); the std head is trained through the ordinary MLP backward (`d_out = [d_mean | d_raw]`); the rollout storage
+  stores the std of every sample (one more column block, only for this distribution); the KL uses it. No new host computation (allow-list unchanged).
+* **A new tolerance row, `update_entropy_hetero` (rel_fro 1.5e-3), with its root cause** (`TOLERANCES.md`): with a state-dependent std the update's entropy is a function of the actor's matmul output, so it carries the matmul noise (measured <= 3.7e-4); with a state-independent std
+  (v1) it depends on a parameter only and keeps its 2e-5 row. The formula itself is verified to 7e-6 on identical network outputs.
+
 ## Host-computation allow-list (BRIEF 2-8)
 *H-7 (temporary host rollout storage, Phase 2) was retired on 2026-11-11: storage, GAE and mini-batches are on the device since Phase 3.*
 Silent torch/host fallbacks on the TT path are forbidden. Only the items below may run on the host. Each is counted by a
