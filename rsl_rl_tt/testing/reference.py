@@ -72,6 +72,19 @@ def with_rnd(env_name: str, spec: RefSpec) -> RefSpec:
     return dataclasses.replace(spec, algorithm={**spec.algorithm, "rnd_cfg": rnd})
 
 
+# Symmetry of the end-to-end runs (Phase 8.3, `--symmetry` of the scripts): the true symmetries of `rsl_rl_tt/testing/symmetry.py`, mirrored samples appended to every mini-batch AND the mirror loss
+SYMMETRY_FUNCS = {"cartpole": "cartpole_mirror", "pendulum": "pendulum_mirror", "tracking12": "tracking12_sign_mirror"}
+
+
+def symmetry_cfg(env_name: str, *, data_augmentation: bool = True, mirror_loss: bool = True, coeff: float = 0.2, func: str | None = None) -> dict:
+    return {"data_augmentation_func": f"rsl_rl_tt.testing.symmetry:{func or SYMMETRY_FUNCS[env_name]}", "use_data_augmentation": data_augmentation, "use_mirror_loss": mirror_loss, "mirror_loss_coeff": coeff}
+
+
+def with_symmetry(env_name: str, spec: RefSpec, **kwargs) -> RefSpec:
+    """`spec` with the symmetry extension (`symmetry_cfg`) added to its algorithm."""
+    return dataclasses.replace(spec, algorithm={**spec.algorithm, "symmetry_cfg": symmetry_cfg(env_name, **kwargs)})
+
+
 def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | None = CSV_LOGGER) -> dict:
     spec = spec or REF_SPECS[env_name]
     dist = {"class_name": spec.distribution, "init_std": spec.init_std, "std_type": spec.std_type}

@@ -24,6 +24,7 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 | 7 | Isaac Lab integration | done on the TT host (tag `phase-7-done`): env bridge, scripts, [`ISAAC_RUNBOOK.md`](docs/porting/ISAAC_RUNBOOK.md); the Isaac Lab side is unverified (no GPU host) |
 | 8.1 | Post-v1: `HeteroscedasticGaussianDistribution` (state-dependent std) on the device | done (tag `phase-8-1-done`): 1 chip, 1x2, 2x4; order of the further items (RND, symmetry, distillation, RNN, CNN, SAC) in [`POST_V1.md`](docs/porting/POST_V1.md) |
 | 8.2 | Post-v1: Random Network Distillation (`rnd_cfg`: intrinsic reward, predictor / target on the device) | done (tag `phase-8-2-done`): 1 chip, 1x2, 2x4; +31 % per iteration |
+| 8.3 | Post-v1: symmetry (`symmetry_cfg`: data augmentation and mirror loss for affine mirror functions) | done (tag `phase-8-3-done`): 1 chip, 1x2, 2x4; +38 % per iteration with 2 copies |
 
 > This is a work in progress on shared hardware; it only ever touches one dedicated 8-chip tray (see `CLAUDE.md`).
 

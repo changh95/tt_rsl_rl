@@ -175,6 +175,19 @@ time-outs up: 342 bytes per environment):
 The first version ran the reward path eagerly (about 30 ops per environment step): 114 ms per iteration for the reward alone, +67 % for the iteration. Tracing it (the warm-up on clones of the state, see `DECISIONS.md` ADR-0007 A-2) took it to 21 ms. Left on the table: the observation of the new
 state is uploaded twice (once for the reward, once by the next `act`), and the predictor's step could share the actor's tilized input when the RND state is the actor's observation. (Measured by a scratch script around `SectionTimer`; `scripts/train_tt.py --rnd` writes the wall times of the end-to-end runs: `docs/porting/tt_runs_rnd`.)
 
+## 7e. What the symmetry extension costs (Phase 8.3, post-v1)
+
+`tracking12`, 2048 environments x 24 steps, one chip, traced, ms per iteration (20 iterations after 5 warm-up iterations; the extension with 2 copies: data augmentation AND the mirror loss):
+
+| | without | with symmetry (K = 2) |
+|---|---:|---:|
+| iteration | **209** | **289** (+38 %) |
+| PPO update replay | 121 | 191 (each mini-batch has twice the rows; the mirror loss adds one reduction and one small matmul per step) |
+| `update.pack_table` (incl. the mirrored copies of the whole rollout: 3 x 3 bf16 matmuls) | 1.5 | 4.3 |
+| rollout (act, process_env_step) | unchanged | unchanged |
+
+The rollout is not touched; the update's cost grows with the number of copies (K = 4: the mini-batches have four times the rows).
+
 ## 8. Reproduce
 
 ```bash

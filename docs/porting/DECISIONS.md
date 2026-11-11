@@ -250,6 +250,12 @@ KMD 2.10.0 and this hardware is verified by the first device job.
   is systematically 0.5 % lower than upstream's: the two embeddings share the rounding of the matmul inputs, which cancels in their difference).
 * **Not in this item**: the observation upload of the RND state is repeated (the next `act` uploads the same observation again); performance work, measured in `PERF.md` (8.2: +31 % per iteration with RND on tracking12, traced).
 
+### ADR-0007 amendment A-3 — 8.3 symmetry (2026-11-11, assistant; the owner can veto)
+* **Design** (details in `POST_V1.md`): the user's symmetry function is evaluated on the host ONCE (new allow-list entry **H-10**) to derive affine mirror maps, which are verified against the function and then applied on the device (signed permutations exactly, via a bf16 split); the mirrored copies of the rollout are extra columns of the packed
+  table. Functions that are not affine are refused at construction with a reason (the alternative, a host callback per mini-batch, would download every mini-batch and cannot be captured in a trace). The combination with the heteroscedastic Gaussian is refused.
+* **A new tolerance row, `update_symmetry_loss` 5e-2** (measured <= 1.56e-2; root cause in `TOLERANCES.md`: the mirror loss is the mean squared difference of two actor outputs, so its relative error is the matmul floor over the small difference). The exactness of the gradient formulas is tested on the SMOOTH objective for one step (the mirrored copies' ratios spread far from 1, so the clipped objective sits on the
+  gates, where forward noise flips them: the standard whole-update limit applies there), as in v1.
+
 ## Host-computation allow-list (BRIEF 2-8)
 *H-7 (temporary host rollout storage, Phase 2) was retired on 2026-11-11: storage, GAE and mini-batches are on the device since Phase 3.*
 Silent torch/host fallbacks on the TT path are forbidden. Only the items below may run on the host. Each is counted by a
@@ -265,3 +271,4 @@ runtime counter that is logged; any other host fallback must fail the tests.
 | H-6 | weight / statistics transfers between the torch mirrors and the device: initial upload, download for `get_policy()`, `save()`, export, and one-time constants | on demand | upstream checkpoint/JIT/ONNX formats |
 | H-8 | upload per-iteration scalars as device tensors (normalizer update rate, learning rate, Adam bias corrections, adaptive-LR value) | all phases | a trace freezes Python scalars, so every value that changes per iteration travels as a tiny device tensor (ADR-0001); added 2026-11-11 in Phase 2 |
 | H-9 | download of the per-step intrinsic reward of RND (`[num_envs]` floats): the upstream runner reads `alg.intrinsic_rewards` after every `process_env_step` for its episode statistics | RND runs only | logging only: the value that is added to the reward never leaves the device; added 2026-11-11 in Phase 8.2 |
+| H-10 | evaluating the USER's `data_augmentation_func` on the host at construction, on probe tensors (a zero row, unit vectors, 64 random rows), to derive the affine mirror maps and verify them | symmetry runs only | the function is arbitrary Python: it cannot run inside a trace or on the device; what it computes is a fixed affine map, applied on the device from then on (once per construction, never per step); added 2026-11-11 in Phase 8.3 |

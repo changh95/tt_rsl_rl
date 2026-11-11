@@ -8,7 +8,7 @@ parity test, traced == eager bit for bit, 1x2 / 2x4 mesh equivalence in function
 |---|---|---|---|---|
 | 8.1 | `HeteroscedasticGaussianDistribution` (state-dependent std from the MLP) | per-row std in log-prob / entropy / KL, an output layer with two heads, the rollout storing the std, gradient through the std head | small-medium | **done** (branch `tt/phase-8-1-heteroscedastic`, results in `PROGRESS.md`) |
 | 8.2 | RND (`rsl_rl/extensions/rnd.py`) | a second pair of MLPs (predictor + frozen target) with its own Adam, an intrinsic reward added before GAE, its own normalizers | medium | **done** (branch `tt/phase-8-2-rnd`, results in `PROGRESS.md`) |
-| 8.3 | Symmetry augmentation / mirror loss | user callbacks (`data_augmentation_func`) that act on observations and actions: either a host callback (a new allow-list entry) or a fixed mirror matrix on the device | medium | not started |
+| 8.3 | Symmetry augmentation / mirror loss | user callbacks (`data_augmentation_func`) that act on observations and actions: either a host callback (a new allow-list entry) or a fixed mirror matrix on the device | medium | **done** (branch `tt/phase-8-3-symmetry`, results in `PROGRESS.md`) |
 | 8.4 | Distillation (`algorithms/distillation.py`, teacher / student, behaviour cloning) | a second algorithm class, a loss without a critic, the teacher's forward on the device | medium | not started |
 | 8.5 | `RNNModel` (GRU, LSTM) | storage of hidden states, trajectory splitting / padding with masks (shapes that vary per update: needs a fixed maximum length for the traces), GRU / LSTM forward and backward on the device | large | not started |
 | 8.6 | `CNNModel` | conv2d forward / backward, image observation groups | large | not started |
@@ -51,3 +51,19 @@ learning rate, no clipping, one step per mini-batch); the state normalizer learn
   discounted-reward accumulator is not part of a checkpoint upstream either).
 * **Multi-chip.** The predictor's gradients are averaged over the chips, the state and reward statistics are global, the accumulator is chip-local (it is per environment); `replica_max_diff` covers all replicated RND state.
 * **Not in this item:** sharing the observation upload with the next `act()` (performance only), RND with recurrent / CNN models (not available yet).
+
+## 8.3 Symmetry: design
+
+Upstream (`rsl_rl/extensions/symmetry.py`, `PPO.update`): a USER function `data_augmentation_func(env, obs, actions)` returns the observations (a TensorDict of all groups) / actions followed by their mirrored copies (`[R * K, ...]`, original rows first). With
+`use_data_augmentation` every mini-batch is replaced by that augmented batch (old log-probabilities, values, advantages and returns repeated K times; the surrogate and value losses average over all K R samples; entropy and KL use the first R rows); with
+`use_mirror_loss` the loss gets `coeff * mse(actor(mirrored obs), mirror(actor(obs)).detach())` (the mean actions, the mirrored copies only); with neither flag the mirror loss is computed for logging only (`Loss/symmetry`).
+
+* **Why the function is probed once.** It is arbitrary Python on torch tensors; it cannot run inside a trace, and a per-step host call would download every mini-batch. Every symmetry of a robot policy is a signed permutation of the observation / action entries, i.e. AFFINE, so `rsl_rl_tt/symmetry.py`
+  evaluates the function ONCE at construction (allow-list H-10) on a zero row + unit vectors and derives `mirrored_k(x) = x @ W_k + b_k` per observation group and for the actions, then VERIFIES the maps against the function on random inputs in both ways upstream calls it
+  (observations and actions together, each alone). Refused with a reason, never approximated: a function that is not affine, whose mirrored group depends on another group, whose first block is not the original, or that returns a different number of copies for the actions. Only the groups of the actor and critic are checked.
+* **On the device.** A map whose entries are exactly representable in bfloat16 (every signed permutation) is applied EXACTLY: the fp32 input is split into three bf16 parts (like the shuffle), each is multiplied with the bf16 matrix (fp32 accumulation; products with 0 / +-1 are exact) and the parts are added; a plain fp32 matmul
+  would round the inputs (4e-4 relative, measured). Other matrices use the fp32 HiFi4 matmul (1.2e-3 measured). The mirrored copies of the whole rollout (actor observations, with augmentation also critic observations and actions) are computed once per update and are extra COLUMNS of the packed table
+  (`TTRolloutStorage(extra_cols=...)`), so the shuffle moves them with their rows and the traced mini-batch step only slices and concatenates; the mirrored action means of the mirror loss are computed in the step.
+* **The step.** K copies: concatenate the slices, repeat the per-sample scalars, run the ordinary forward / loss / backward on K R rows (denominators K R), KL on the first R rows. Mirror loss with augmentation: the augmented forward's means are the loss's (rows >= R against the mirrored means of rows < R), its gradient (x coefficient) is added to
+  the PPO gradient of those rows. Mirror loss without augmentation: one more forward on the mirrored observations only (the original rows' mean is the PPO forward's), its backward is added to the actor's gradients before the clip. Logging only: the same forward, no backward.
+* **Not in this item**: non-affine symmetry functions; the combination with the heteroscedastic Gaussian (refused with a message: the per-row std would need the entropy / KL on the original rows only); recurrent models (upstream refuses them too).

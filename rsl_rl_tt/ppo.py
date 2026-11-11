@@ -30,6 +30,7 @@ from rsl_rl_tt.losses import PPOLosses
 from rsl_rl_tt.modules import TTMLPModel
 from rsl_rl_tt.optim import TTAdam, TTAdaptiveLR, clip_grad_norm
 from rsl_rl_tt.rnd import TTRND
+from rsl_rl_tt.symmetry import TTSymmetry
 from rsl_rl_tt.storage import TTRolloutStorage
 from rsl_rl_tt.tt_common import SectionTimer, TTContext, pack_step_scalars, pad_matrix, pad_vector, unit_row
 
@@ -41,8 +42,6 @@ class TTPPO(PPO):
     """PPO on the tray mesh (a single chip until Phase 6)."""
 
     def __init__(self, actor, critic, storage, *, tt_cfg: dict | None = None, **kwargs) -> None:
-        if kwargs.get("symmetry_cfg"):
-            raise NotImplementedError("the symmetry extension is not implemented in the TT port yet (post-v1 item 8.3)")
         if kwargs.get("multi_gpu_cfg") is not None:
             raise NotImplementedError("rsl_rl's torch.distributed multi-GPU mode is replaced by the mesh data-parallel design (Phase 6)")
         if getattr(actor, "is_recurrent", False) or getattr(critic, "is_recurrent", False):
@@ -86,6 +85,14 @@ class TTPPO(PPO):
             raise ValueError("the actor needs a distribution_cfg (GaussianDistribution or HeteroscedasticGaussianDistribution)")
         self.hetero = self.tt_actor.distribution.per_row  # state-dependent std: the std head is part of the actor MLP and every sample has its own std
         share = self.tt_actor.obs_groups == self.tt_critic.obs_groups
+        self.sym_tt: TTSymmetry | None = None  # symmetry augmentation / mirror loss (the mirror is `self.symmetry`, built by upstream's PPO.__init__ from symmetry_cfg)
+        extra_cols: list = []
+        if self.symmetry is not None:
+            if self.hetero:
+                raise NotImplementedError("the symmetry extension is implemented for the state-independent Gaussian std only (not together with HeteroscedasticGaussianDistribution)")
+            obs_dims = {k: int(v.shape[-1]) for k, v in storage.observations.items()}  # the user's function gets the whole observation TensorDict, like upstream
+            self.sym_tt = TTSymmetry(self.ctx, self.symmetry, obs_dims, self.tt_actor.obs_groups, self.tt_critic.obs_groups, self.tt_actor.distribution.dim, share)
+            extra_cols = self.sym_tt.extra_columns(self.tt_actor.obs_dim_p, self.tt_critic.obs_dim_p, self.tt_actor.distribution.dim_p)
         self.rnd_tt: TTRND | None = None  # Random Network Distillation (the mirror is `self.rnd`, built by upstream's PPO.__init__ from rnd_cfg)
         self.intrinsic_rewards = None  # the runner reads the last step's intrinsic reward (a host tensor [num_envs]) after every process_env_step when RND is on
         rnd_source, rnd_dim_p = None, 0
@@ -97,7 +104,7 @@ class TTPPO(PPO):
                 self.rnd_tt.allocate_act_buffers()
         self.storage = TTRolloutStorage(  # replaces the host RolloutStorage that upstream's construct_algorithm built
             self.ctx, storage.num_envs, storage.num_transitions_per_env, self.tt_actor.obs_dim_p, self.tt_critic.obs_dim_p, self.tt_actor.distribution.dim_p, share,
-            persistent=self.trace_enabled, store_std=self.hetero, rnd_dim_p=rnd_dim_p, rnd_source=rnd_source,
+            persistent=self.trace_enabled, store_std=self.hetero, rnd_dim_p=rnd_dim_p, rnd_source=rnd_source, extra_cols=extra_cols,
         )
         self.losses = PPOLosses(
             self.ctx, clip_param=self.clip_param, value_loss_coef=self.value_loss_coef, entropy_coef=self.entropy_coef, use_clipped_value_loss=self.use_clipped_value_loss
@@ -111,7 +118,7 @@ class TTPPO(PPO):
         # value across replays must be allocated BEFORE the first capture. Here: Adam moments, loss accumulators, the rollout storage slots (and the
         # constants of storage / losses / distribution created above). Buffers that are rewritten before every use (update.table, act inputs) are exempt.
         self.adam: TTAdam | None = TTAdam(self.ctx, self._params())
-        for name in ("value", "surrogate", "entropy") + (("rnd",) if self.rnd_tt else ()):
+        for name in self._loss_names():
             self._acc("update.acc." + name)
         if self.hetero:  # the per-column mean std of the last mini-batch, for the runner's logging (allocated before any capture: T-15)
             self._buf["update.last_std"] = self.ctx.zeros(1, self.tt_actor.distribution.dim_p, batch_sharded=False)
@@ -457,6 +464,10 @@ class TTPPO(PPO):
             k += 1
         c.mlp.set_parameters(new[k:])
 
+    def _loss_names(self) -> tuple:
+        """The losses the update logs (upstream's loss dict): value, surrogate, entropy, and RND's / the symmetry's when those extensions are on."""
+        return ("value", "surrogate", "entropy") + (("rnd",) if self.rnd_tt else ()) + (("symmetry",) if self.sym_tt else ())
+
     def _acc(self, name: str):
         """Persistent [1, 1] loss accumulators (in-place adds, so a traced mini-batch step keeps writing the same tensors)."""
         if name not in self._buf:
@@ -471,29 +482,61 @@ class TTPPO(PPO):
         ctx = self.ctx
         ttnn = ctx.ttnn
         st, actor, critic = self.storage, self.tt_actor, self.tt_critic
+        sym = self.sym_tt
+        K = sym.num_aug if sym is not None and sym.use_da else 1  # data augmentation: every mini-batch is its rows followed by K - 1 mirrored copies
         with self.timer.section("update.minibatch.slice"):
             batch = st.split(self._buf["update.table"][i * rows : (i + 1) * rows, :])
-            adv = st.normalize(batch["advantages"], rows) if self.normalize_advantage_per_mini_batch and rows > 1 else batch["advantages"]
+            adv = st.normalize(batch["advantages"], rows) if self.normalize_advantage_per_mini_batch and rows > 1 else batch["advantages"]  # (upstream normalises BEFORE augmenting)
+            if K > 1:
+                cat = lambda first, prefix: ttnn.concat([first] + [batch[f"{prefix}_{k}"] for k in range(1, K)], dim=0)
+                rep = lambda t: ttnn.concat([t] * K, dim=0)
+                actor_obs, actions = cat(batch["actor_obs"], "sym_actor"), cat(batch["actions"], "sym_action")
+                critic_obs = actor_obs if st.share_obs else cat(batch["critic_obs"], "sym_critic")
+                old_logp, old_values, returns, adv = rep(batch["old_logp"]), rep(batch["old_values"]), rep(batch["returns"]), rep(adv)
+            else:
+                actor_obs, critic_obs, actions = batch["actor_obs"], batch["critic_obs"], batch["actions"]
+                old_logp, old_values, returns = batch["old_logp"], batch["old_values"], batch["returns"]
+        n_rows = K * rows  # the samples of the PPO losses
         with self.timer.section("update.minibatch.forward"):
-            mean, dist, cache_a = actor.policy_forward_train(batch["actor_obs"])  # dist: the distribution itself, or the per-row state of a heteroscedastic one
-            value_out, cache_c = critic.forward_train(batch["critic_obs"])
+            mean, dist, cache_a = actor.policy_forward_train(actor_obs)  # dist: the distribution itself, or the per-row state of a heteroscedastic one
+            value_out, cache_c = critic.forward_train(critic_obs)
             entropy = dist.entropy_dev
         with self.timer.section("update.minibatch.kl_lr"):
             if self.hetero:  # the rollout's std of every sample
                 old_var, old_log_std = ttnn.square(batch["old_std"]), ttnn.log(batch["old_std"])
             else:
                 old_var, old_log_std = self._buf["update.old_var"], self._buf["update.old_log_std"]
-            kl = self.losses.kl_mean(dist, batch["old_mean"], old_var, old_log_std, mean)
+            kl = self.losses.kl_mean(dist, batch["old_mean"], old_var, old_log_std, mean[0:rows, :] if K > 1 else mean)  # the KL of the original rows only
             lr = self.lr_sched.update(ctx.mean_over_chips(kl))  # the KL of the adaptive schedule is the mean over the chips; one global learning rate
         with self.timer.section("update.minibatch.loss"):
-            la = self.losses.actor(dist, mean, batch["actions"], batch["old_logp"], adv, rows)
-            lc = self.losses.critic(value_out[:, 0:1], batch["old_values"], batch["returns"], rows)
-        for name, value in (("value", lc["value_loss"]), ("surrogate", la["surrogate_loss"]), ("entropy", entropy)):
+            la = self.losses.actor(dist, mean, actions, old_logp, adv, n_rows)
+            lc = self.losses.critic(value_out[:, 0:1], old_values, returns, n_rows)
+            d_mean = la["d_mean"]
+            sym_grads = None
+            if sym is not None:
+                # upstream `Symmetry.compute_loss`: MSE between the actor's mean on the mirrored observations and the mirrored mean on the original ones (a constant: no gradient through it),
+                # logged always, added to the loss (x coefficient) only with `use_mirror_loss`
+                if K > 1:  # the means of the augmented forward: the original rows first, then the mirrored copies
+                    sym_loss, d_sym = sym.loss_and_grad(mean[rows : K * rows, :], sym.mirror_actions(mean[0:rows, :]))
+                    if sym.use_loss:
+                        d_mean = ttnn.concat([d_mean[0:rows, :], ttnn.add(d_mean[rows : K * rows, :], ttnn.multiply(d_sym, sym.coeff))], dim=0)
+                else:  # no augmentation: one more forward, on the mirrored observations only (the original rows' mean is the PPO forward's)
+                    obs_m = ttnn.concat([batch[f"sym_actor_{k}"] for k in range(1, sym.num_aug)], dim=0) if sym.num_aug > 2 else batch["sym_actor_1"]
+                    if sym.use_loss:
+                        mean_m, cache_s = actor.forward_train(obs_m)
+                    else:
+                        mean_m = actor.forward(obs_m)
+                    sym_loss, d_sym = sym.loss_and_grad(mean_m, sym.mirror_actions(mean))
+                    if sym.use_loss:
+                        sym_grads = [t for pair in actor.mlp.backward(cache_s, ttnn.multiply(d_sym, sym.coeff)) for t in pair]
+        for name, value in (("value", lc["value_loss"]), ("surrogate", la["surrogate_loss"]), ("entropy", entropy)) + ((("symmetry", sym_loss),) if sym is not None else ()):
             acc = self._acc("update.acc." + name)  # accumulate BEFORE the optimizer step: `entropy` is a persistent tensor that the step rewrites in place
             ctx.put(acc, ttnn.add(acc, value))
         with self.timer.section("update.minibatch.backward"):
-            d_out = ttnn.concat([la["d_mean"], la["d_raw"]], dim=1) if self.hetero else la["d_mean"]  # [d mean | d raw std-head output] for the two-head output layer
+            d_out = ttnn.concat([d_mean, la["d_raw"]], dim=1) if self.hetero else d_mean  # [d mean | d raw std-head output] for the two-head output layer
             grads_a = [t for pair in actor.mlp.backward(cache_a, d_out) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
+            if sym_grads is not None:  # the mirror loss without augmentation went through its own forward: its gradient adds to the actor's MLP gradient
+                grads_a = [ttnn.add(g, h) for g, h in zip(grads_a[: len(sym_grads)], sym_grads)] + grads_a[len(sym_grads) :]
             if self.hetero:
                 ctx.put(self._buf["update.last_std"], ttnn.mean(dist.std, dim=0, keepdim=True, compute_kernel_config=ctx.compute_cfg))
             grads_c = [t for pair in critic.mlp.backward(cache_c, ttnn.multiply(lc["d_value"], self._col0)) for t in pair]
@@ -535,14 +578,14 @@ class TTPPO(PPO):
             for key, value in (("update.old_var", dist.var), ("update.old_log_std", dist.log_std)):
                 self._buf[key] = ctx.put(self._buf.get(key), value)
         with self.timer.section("update.pack_table"):
-            packed = st.packed_table()
+            packed = st.packed_table(extra=self.sym_tt.mirror_blocks(st) if self.sym_tt is not None else None)
         # one permutation per update, reused by every epoch (upstream mini_batch_generator); drawn on the host (parity mode, H-4); one independent permutation of
         # each chip's own rows (a randperm per rank), the chips' permutations one after the other
         with self.timer.section("update.shuffle_gather"):
             permutations = torch.cat([torch.randperm(n) for _ in range(ctx.n_chips)])
             shuffled = st.shuffle(packed, ctx.upload_index(permutations, op="H-4"))
             self._buf["update.table"] = ctx.put(self._buf.get("update.table"), shuffled)
-        for name in ("value", "surrogate", "entropy") + (("rnd",) if self.rnd_tt else ()):
+        for name in self._loss_names():
             acc = self._acc("update.acc." + name)
             ctx.put(acc, ttnn.multiply(acc, 0.0))
 
@@ -570,7 +613,7 @@ class TTPPO(PPO):
 
         num_updates = self.num_learning_epochs * mb
         host = lambda t: float(ctx.download(t, op="H-5", batch_sharded=False)[0, 0])
-        loss_dict = {k: host(self._acc("update.acc." + k)) / num_updates for k in ("value", "surrogate", "entropy") + (("rnd",) if self.rnd_tt else ())}
+        loss_dict = {k: host(self._acc("update.acc." + k)) / num_updates for k in self._loss_names()}
         self.learning_rate = host(self.lr_sched.lr)
         for group in self.optimizer.param_groups:  # keep the (unused) torch optimizer's lr in line for logging / checkpoints
             group["lr"] = self.learning_rate
