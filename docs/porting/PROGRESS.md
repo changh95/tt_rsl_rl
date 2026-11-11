@@ -3,7 +3,7 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
-## 2026-11-11 — G1 video: the strip under the panels now shows tracking error, value loss and reward terms (branch `tt/demo-g1-metrics`, not merged)
+## 2026-11-11 — G1 video: the strip under the panels now shows tracking error, value loss and reward terms (branch `tt/demo-g1-metrics`, merged to `main` at the owner's request)
 **Why**: the owner asked for (1) the velocity tracking error, (2) the loss of the estimation layer / encoder, (3) the reward the actor-critic uses (penalties included) instead of the mean-return / speed curves. **Done** (`rsl_rl_tt/demos/g1_render.py`: `tracking_error`, `tracking_curve`, `reward_rates`, `REWARD_GROUPS`, new `curve_strip`;
 `scripts/eval_g1_tracking.py`, `--tracking` of `scripts/render_g1_demo.py`; `examples/g1_walk/play.py` measures the tracking error of the checkpoints next to the metrics once): `g1.mp4` is now 1440x752, `g1.gif` 3.2 MB. (1) Tracking error = length of (command - body-frame velocity) and
 |yaw-rate error|, 128 robots, the commands of the video, deterministic policy, measured on the 16 saved checkpoints (`tracking_error.json`): 0.48 m/s untrained (40 falls per robot-minute), 0.54 at iteration 101 (stands still), 0.13 at 201, 0.075 at 1500 (yaw rate 0.24 -> 0.056 rad/s); only 16 points, so it is not dense
