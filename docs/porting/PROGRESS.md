@@ -4,7 +4,7 @@ Newest entry first. Each entry: date, phase, done / next / blocked / key numbers
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
 ## 2026-11-11 — Demo 2 follow-up (branch `tt/demo-g1-gait`, not merged): `examples/g1_walk/`, initial / middle / final video, eight-chip scaling profile
-**Done**: (1) `examples/` (`README.md`, `g1_walk/{train.py, play.py, README.md}`): the G1 demo as a short example on top of the public rsl_rl API (`MujocoG1VecEnv` + `g1_train_cfg` + `tt_agent_cfg` + the upstream `OnPolicyRunner`); `train.py` smoke-tested on one chip
+**Commit `0aa87d7`.** **Done**: (1) `examples/` (`README.md`, `g1_walk/{train.py, play.py, README.md}`): the G1 demo as a short example on top of the public rsl_rl API (`MujocoG1VecEnv` + `g1_train_cfg` + `tt_agent_cfg` + the upstream `OnPolicyRunner`); `train.py` smoke-tested on one chip
 (3 iterations, 256 robots), `play.py` on its checkpoint. The evaluation / rendering code moved from `scripts/render_g1_demo.py` into the library module `rsl_rl_tt/demos/g1_render.py` (the scripts are thin wrappers); `tests/tt/test_g1_render.py` (8 host tests: labels, checkpoint
 load path == upstream inference policy exactly, measurement, tiny EGL render, video / GIF writers, `--help` of the four scripts). (2) New comparison video / GIF `docs/porting/demo_g1/g1.{mp4,gif}`: untrained / iteration 101 / iteration 1500 (before: 201 instead of 101; iteration 101
 keeps its balance but does not move (0.00-0.01 m/s, 0 falls), 201 already follows the commands, so 101 is the stage that still looks different); `eval.json` now has the four checkpoints (256 robots x 600 steps each). (3) `gait.mp4`: slow-motion two-view close-up of the final gait with foot contacts
