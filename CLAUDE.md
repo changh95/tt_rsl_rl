@@ -75,7 +75,10 @@ MUJOCO_GL=egl python scripts/render_humanoid_demo.py --checkpoints random .run/h
 MUJOCO_GL=egl python scripts/render_humanoid_demo.py --checkpoints random .run/humanoid/tt_1chip/model_150.pt .run/humanoid/tt_1chip/model_599.pt --seconds 15 --fps 33 --size 352 480 --no-eval --video docs/porting/demo_humanoid/walk.mp4
 # Demo 2 (on main since 2026-11-12): Unitree G1 walking on command, MuJoCo on the CPU, PPO on all eight chips (docs/porting/demo_g1/README.md)
 scripts/fetch_g1_model.sh && scripts/tt_run.sh --timeout 14400 --tag g1 -- python scripts/train_g1_demo.py --mesh 2x4 --envs 4096 --iterations 1500 --out docs/porting/demo_g1/tt_8chips
-MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_200.pt .run/g1/tt_8chips/model_1499.pt --video docs/porting/demo_g1/g1.mp4
+MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_100.pt .run/g1/tt_8chips/model_1499.pt --video docs/porting/demo_g1/g1.mp4
+# Examples (examples/README.md): the G1 demo as a short example; play.py needs no device
+scripts/tt_run.sh --timeout 14400 --tag g1 -- python examples/g1_walk/train.py --mesh 2x4 --envs 4096 --iterations 1500      # -> .run/examples/g1_walk
+MUJOCO_GL=egl python examples/g1_walk/play.py --checkpoint random .run/examples/g1_walk/model_100.pt .run/examples/g1_walk/model_1499.pt --video g1.mp4 --gif g1.gif
 # MULTI-CHIP RULE (ADR-0004): chip-local loss / advantage normalisation / shuffle, gradients and KL averaged over the chips (gather + fp32 sum, never ttnn.all_reduce), global normalizer statistics.
 # TRACED-PATH RULE (TTNN_ISSUES T-15): everything that keeps a value across trace replays is allocated BEFORE the first capture; one TTPPO per process.
 
@@ -90,5 +93,5 @@ git diff v5.5.2 -- rsl_rl/        # must be empty (also tested)
 ## Where things are
 - `docs/porting/BRIEF.md` work order · `PROGRESS.md` log + next steps · `DECISIONS.md` ADRs · `TOLERANCES.md` · `PERF.md` · `TTNN_ISSUES.md`
 - `docs/porting/UPSTREAM_MAP.md`, `UPSTREAM_SEMANTICS.md`, `TTRL_NOTES.md`, `TTNN_OP_SURVEY.md`, `ENV.md`
-- `rsl_rl/` upstream (untouched) · `rsl_rl_tt/` TT implementation (`device.py` = the only place that opens devices; `testing/` = host-only CPU envs, reference runs, golden access, parity utilities) · `tests/tt/` · `scripts/` · `.claude/`
+- `examples/` runnable examples (`g1_walk/`) · `rsl_rl/` upstream (untouched) · `rsl_rl_tt/` TT implementation (`device.py` = the only place that opens devices; `testing/` = host-only CPU envs, reference runs, golden access, parity utilities) · `tests/tt/` · `scripts/` · `.claude/`
 - `docs/porting/golden/` golden baselines of the upstream reference (regenerate: `python scripts/train_reference.py`)

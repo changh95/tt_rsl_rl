@@ -25,6 +25,8 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 
 > This is a work in progress on shared hardware; it only ever touches one dedicated 8-chip tray (see `CLAUDE.md`).
 
+**Examples:** [`examples/`](examples/README.md) — [`g1_walk/`](examples/g1_walk/README.md): train a Unitree G1 to walk (`train.py`, MuJoCo on the CPU, PPO on the tray) and replay / record it (`play.py`).
+
 ## Demo: a MuJoCo humanoid learns to run, physics on the CPU, training on one Blackhole chip
 
 [![untrained / iteration 151 / iteration 600](docs/porting/demo_humanoid/walk.gif)](docs/porting/demo_humanoid/walk.mp4)
@@ -35,9 +37,11 @@ Upstream PPO on the CPU learns the same way but needs 3.7 s per iteration instea
 
 ## Demo: a Unitree G1 learns to walk on command, trained on all eight chips
 
-[![untrained / iteration 201 / iteration 1500](docs/porting/demo_g1/g1.gif)](docs/porting/demo_g1/g1.mp4)
+[![untrained / iteration 101 / iteration 1500](docs/porting/demo_g1/g1.gif)](docs/porting/demo_g1/g1.mp4)
 
-**[Video (MP4, 20 s, real time)](docs/porting/demo_g1/g1.mp4)** · [details, numbers and how to reproduce](docs/porting/demo_g1/README.md). The G1 model of MuJoCo Menagerie, 4096 robots simulated on the CPU, PPO on the whole 2x4 tray: 1500
+Left to right: **initial** (untrained: falls after 1.6 s, again and again), **middle** (iteration 101: keeps its balance, does not move yet), **final** (iteration 1500: follows the commands 0.4 m/s, 0.8 m/s, turning) —
+the same commands for all three. **[Video (MP4, 20 s, real time)](docs/porting/demo_g1/g1.mp4)** · [slow-motion close-up of the gait](docs/porting/demo_g1/gait.mp4) · [**example to run yourself: `examples/g1_walk/`**](examples/g1_walk/README.md) ·
+[details, numbers and how to reproduce](docs/porting/demo_g1/README.md). The G1 model of MuJoCo Menagerie, 4096 robots simulated on the CPU, PPO on the whole 2x4 tray: 1500
 iterations (147 M samples, 28 min) take it from falling after 1.6 s to following velocity commands (0.4 / 0.8 m/s, turning) without a fall (0.39 / 0.78 m/s achieved). The training part of an iteration takes 0.27 s on eight
 chips against 3.05 s for upstream PPO on the CPU; the CPU simulation (76 % of the time) is the bottleneck now. Simulation only, one seed.
 

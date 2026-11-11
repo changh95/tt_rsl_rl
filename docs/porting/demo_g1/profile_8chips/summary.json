@@ -1,0 +1,36 @@
+{
+  "backend": "tt 2x4 (traced, 8 chips)",
+  "num_envs": 4096,
+  "steps_per_iteration": 24,
+  "iterations": 40,
+  "samples": 3932160,
+  "hidden": [
+    512,
+    256,
+    128
+  ],
+  "seed": 0,
+  "wall_s": 44.9,
+  "seconds_per_iteration": 1.123,
+  "cpu_simulation_s": 33.8,
+  "algorithm_s": 11.2,
+  "final": {
+    "Train/mean_reward": 5.009,
+    "Train/mean_episode_length": 193.96,
+    "Metrics/forward_speed": -0.054,
+    "Metrics/command_vx": 0.488,
+    "Episode_Termination/fell": 1.0
+  },
+  "env_threads": 60,
+  "sections_ms_per_iteration": {
+    "update.minibatch.replay": 112.1,
+    "process_env_step": 33.6,
+    "act.upload_obs": 19.1,
+    "act.download_actions": 16.3,
+    "update.normalizers": 9.0,
+    "act.compute": 6.4,
+    "update.shuffle_gather": 2.4,
+    "compute_returns": 1.8,
+    "update.pack_table": 1.3
+  }
+}
