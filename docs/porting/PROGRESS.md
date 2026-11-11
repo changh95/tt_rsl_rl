@@ -3,6 +3,19 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-11 — Phase 4 DONE: 1-chip end-to-end training and checkpoint compatibility (tag `phase-4-done`)
+**Done**
+- TT training of all three envs x 3 seeds (same config/seeds/iterations as the golden runs) with the unmodified `OnPolicyRunner` + `TTPPO` on one chip: `docs/porting/tt_runs/` (CSVs, `summary.json`,
+  `<env>_vs_golden.png`). Phase 4 criterion met on every env, no NaN/Inf anywhere: cartpole 500.0 x3 (golden 500.0, threshold 475.0), pendulum -154.2 (golden -152.1, threshold -159.7), tracking12 193.7 (golden 190.7,
+  threshold 181.2). Wall time per run 68 s / 143 s / 322 s (golden CPU 20 / 50 / 230 s), total 27 min.
+- Checkpoint compatibility (7 device tests): TT save -> unmodified upstream `load()` gives bit-identical inference and an optimizer state with the exact structure of an upstream checkpoint; upstream save -> TT `load()`
+  reproduces weights, normalizer statistics, Adam moments (exp_avg compared tensor by tensor), step counter and learning rate on the device, and TT continues training; a partial load (no optimizer) keeps the current
+  moments like upstream; a TT-trained policy exports to TorchScript and ONNX through the runner's own export methods and onnxruntime reproduces it (1e-5), consistent with the device forward.
+- `TTPPO.load()/save()` with device<->torch Adam-state conversion; `get_policy()` no longer downloads Adam (cheap per-iteration logging); `onnxruntime==1.23.2` added to the venv (ENV.md).
+- Host tests: 360 pass (incl. the committed TT runs); device tests: 156 in two single-process invocations.
+**Next**: Phase 5 (1-chip performance): trace for act / update / GAE with preallocated buffers, fewer syncs, the shuffle (T-12: the fp32 row gather is ~50 ns/element), iteration-time breakdown and op profile,
+benchmark matrix (num_envs 4096/16384/65536 x hidden [512,256,128]/[1024,1024,512]), `PERF.md`.
+
 ## 2026-11-11 — Phase 3 DONE: 1-chip backward, Adam, PPO update, device storage/GAE (tag `phase-3-done`)
 **Done**
 - `rsl_rl_tt/losses.py` (clipped surrogate/value losses and their gradients with torch's `max`-tie and inclusive-`clamp` rules, entropy bonus through the std, masked padded dims, KL),

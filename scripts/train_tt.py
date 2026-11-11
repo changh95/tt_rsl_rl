@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: BSD-3-Clause
+"""Train the test envs with the UNMODIFIED upstream OnPolicyRunner + `rsl_rl_tt.ppo:TTPPO` on one chip and compare with the golden baselines (BRIEF Phase 4).
+
+Device job: run ONLY through the wrapper (one process, runs executed one after the other on the open 1x1 mesh):
+
+    scripts/tt_run.sh --chips 16 --timeout 3600 --tag train -- python scripts/train_tt.py [--envs cartpole ...] [--seeds 0 1 2] [--iterations N]
+
+Writes `<out>/<env>/seed<k>.csv` (same columns as the golden CSVs), `<out>/summary.json` (wall times, final rewards, the Phase 4 criterion per env) and
+`<out>/<env>_vs_golden.png`. Full run directories (config.json, checkpoints) go to `--runs-dir` (.run/tt_runs, not committed).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import statistics
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from rsl_rl_tt.testing.envs import ENV_NAMES  # noqa: E402
+from rsl_rl_tt.testing.golden import GOLDEN_DIR, final_reward, load_curve, tt_vs_golden  # noqa: E402
+from rsl_rl_tt.testing.reference import REF_SPECS, train_reference  # noqa: E402
+
+
+def plot(env_name: str, seeds, tt_dir: Path, out_png: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6.4, 3.8))
+    for seed in seeds:
+        g = load_curve(env_name, seed, GOLDEN_DIR)
+        ax.plot([r["iteration"] for r in g if r.get("Train/mean_reward") is not None], [r["Train/mean_reward"] for r in g if r.get("Train/mean_reward") is not None], color="0.65", linewidth=1.0, label="upstream CPU (golden)" if seed == seeds[0] else None)
+        t = load_curve(env_name, seed, tt_dir)
+        ax.plot([r["iteration"] for r in t if r.get("Train/mean_reward") is not None], [r["Train/mean_reward"] for r in t if r.get("Train/mean_reward") is not None], linewidth=1.2, label=f"TT 1 chip, seed {seed}")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("Train/mean_reward")
+    ax.set_title(f"{env_name}: TT (1 chip) vs upstream CPU golden curves")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=110)
+    plt.close(fig)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--envs", nargs="+", default=list(ENV_NAMES), choices=ENV_NAMES)
+    ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    ap.add_argument("--iterations", type=int, default=None)
+    ap.add_argument("--threads", type=int, default=4, help="torch threads for the host-side work (env, noise, permutation)")
+    ap.add_argument("--out", default=str(REPO / "docs" / "porting" / "tt_runs"))
+    ap.add_argument("--runs-dir", default=str(REPO / ".run" / "tt_runs"))
+    args = ap.parse_args()
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    summary: dict = {"backend": "TTPPO on one Blackhole chip (tray 3, node 16), fp32, unmodified OnPolicyRunner", "envs": {}}
+    t_all = time.time()
+    for env_name in args.envs:
+        (out / env_name).mkdir(exist_ok=True)
+        per_seed = {}
+        for seed in args.seeds:
+            log_dir = os.path.join(args.runs_dir, env_name, f"seed{seed}")
+            if os.path.isdir(log_dir):
+                shutil.rmtree(log_dir)  # our own output directory under --runs-dir
+            info = train_reference(env_name, seed, log_dir, iterations=args.iterations, num_threads=args.threads, tt=True)
+            shutil.copyfile(os.path.join(log_dir, "metrics.csv"), out / env_name / f"seed{seed}.csv")
+            rows = load_curve(env_name, seed, out)
+            per_seed[str(seed)] = {"iterations": info["iterations"], "wall_s": round(info["wall_s"], 1), "final_reward": final_reward(rows)}
+            print(f"done {env_name} seed {seed}: {info['wall_s']:.0f} s, final reward {per_seed[str(seed)]['final_reward']:.2f}", flush=True)
+        entry = {"seeds": per_seed, "num_envs": REF_SPECS[env_name].num_envs, "num_steps_per_env": REF_SPECS[env_name].num_steps}
+        entry["criterion"] = tt_vs_golden(env_name, args.seeds, out, GOLDEN_DIR)
+        summary["envs"][env_name] = entry
+        plot(env_name, args.seeds, out, out / f"{env_name}_vs_golden.png")
+        print(env_name, json.dumps(entry["criterion"]), flush=True)
+    summary["total_wall_s"] = round(time.time() - t_all, 1)
+    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()

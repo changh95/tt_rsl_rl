@@ -18,7 +18,7 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 | 1 | Reference + parity harness (host only) | done (tag `phase-1-done`) |
 | 2 | 1-chip (1x1 mesh) forward | done (tag `phase-2-done`) |
 | 3 | 1-chip backward, optimizer, PPO update | done (tag `phase-3-done`) |
-| 4 | 1-chip end-to-end training + checkpoint compatibility | pending |
+| 4 | 1-chip end-to-end training + checkpoint compatibility | done (tag `phase-4-done`) |
 | 5 | 1-chip performance (trace, pre-allocation) | pending |
 | 6 | Tray multi-chip data parallel (8 chips) | pending |
 | 7 | Isaac Lab integration | pending |

@@ -73,23 +73,30 @@ def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | No
     return cfg
 
 
-def build_reference_runner(env_name: str, seed: int, log_dir: str | None, spec: RefSpec | None = None, num_envs: int | None = None):
-    """Seed torch and the env, build env + upstream OnPolicyRunner (device cpu). Returns (runner, env, spec)."""
+def build_reference_runner(env_name: str, seed: int, log_dir: str | None, spec: RefSpec | None = None, num_envs: int | None = None, tt: bool = False):
+    """Seed torch and the env, build env + the UNMODIFIED upstream OnPolicyRunner (device cpu). Returns (runner, env, spec).
+
+    tt=True swaps only the algorithm class (`rsl_rl_tt.ppo:TTPPO`, single chip); everything else, including the runner, is upstream's.
+    That needs an open tray mesh, i.e. a process started through scripts/tt_run.sh."""
     spec = spec or REF_SPECS[env_name]
     torch.manual_seed(seed)
     env = make_env(env_name, num_envs or spec.num_envs, seed=seed)
-    runner = OnPolicyRunner(env, make_train_cfg(env_name, spec), log_dir=log_dir, device="cpu")
+    cfg = make_train_cfg(env_name, spec)
+    if tt:
+        cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"
+        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [1, 1]}
+    runner = OnPolicyRunner(env, cfg, log_dir=log_dir, device="cpu")
     return runner, env, spec
 
 
-def train_reference(env_name: str, seed: int, log_dir: str, iterations: int | None = None, spec: RefSpec | None = None, num_threads: int | None = None) -> dict:
-    """Train with the unmodified upstream runner; the CSV metrics land in `log_dir/metrics.csv`. Returns a small timing summary."""
+def train_reference(env_name: str, seed: int, log_dir: str, iterations: int | None = None, spec: RefSpec | None = None, num_threads: int | None = None, tt: bool = False) -> dict:
+    """Train with the unmodified upstream runner (algorithm = upstream PPO, or TTPPO with tt=True); the CSV metrics land in `log_dir/metrics.csv`."""
     if num_threads is not None:
         torch.set_num_threads(num_threads)
     os.makedirs(log_dir, exist_ok=True)
-    runner, _, spec = build_reference_runner(env_name, seed, log_dir, spec)
+    runner, _, spec = build_reference_runner(env_name, seed, log_dir, spec, tt=tt)
     n_it = iterations if iterations is not None else spec.iterations
     t0 = time.time()
     runner.learn(num_learning_iterations=n_it, init_at_random_ep_len=True)
     wall = time.time() - t0
-    return {"env": env_name, "seed": seed, "iterations": n_it, "wall_s": wall, "num_threads": torch.get_num_threads(), "num_envs": spec.num_envs, "num_steps": spec.num_steps}
+    return {"env": env_name, "seed": seed, "backend": "tt" if tt else "upstream-cpu", "iterations": n_it, "wall_s": wall, "num_threads": torch.get_num_threads(), "num_envs": spec.num_envs, "num_steps": spec.num_steps}

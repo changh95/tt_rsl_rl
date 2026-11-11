@@ -38,3 +38,23 @@ def tt_run_passes(env_name: str, tt_final_rewards: list[float], golden_dir: Path
     if not tt_final_rewards or any(not math.isfinite(x) for x in tt_final_rewards):
         return False
     return statistics.mean(tt_final_rewards) >= phase4_threshold(env_name, golden_dir)
+
+
+TT_RUNS_DIR = GOLDEN_DIR.parent / "tt_runs"
+
+
+def load_tt_curve(env_name: str, seed: int, tt_dir: Path = TT_RUNS_DIR) -> list[dict[str, float | None]]:
+    return load_curve(env_name, seed, tt_dir)
+
+
+def tt_vs_golden(env_name: str, seeds=(0, 1, 2), tt_dir: Path = TT_RUNS_DIR, golden_dir: Path = GOLDEN_DIR) -> dict:
+    """The Phase 4 end-to-end criterion for one env: TT final reward (mean over seeds) >= reference mean - max(reference seed std, 5 % |mean|), no NaN/Inf."""
+    finals, finite = [], True
+    for seed in seeds:
+        rows = load_curve(env_name, seed, tt_dir)
+        finite &= all(v is None or math.isfinite(v) for r in rows for v in r.values())
+        finals.append(final_reward(rows))
+    ref = load_summary(golden_dir)["envs"][env_name]
+    thr = phase4_threshold(env_name, golden_dir)
+    mean = statistics.mean(finals)
+    return {"tt_final_rewards": finals, "tt_mean": mean, "reference_mean": ref["final_reward_mean"], "reference_std": ref["final_reward_std"], "threshold": thr, "all_finite": bool(finite), "passes": bool(finite and mean >= thr)}

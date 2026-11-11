@@ -73,6 +73,12 @@ Numerical findings: (1) a parameter-by-parameter comparison against upstream aft
 function space against a noise baseline (TOLERANCES.md); (2) the clipped objectives are discontinuous at the clip boundaries, so a whole update deviates ~2 % (20 steps) from upstream unless the
 objective is smooth (then 0.1 %); (3) with identical state the first mini-batch's KL is exactly 0 on the device, so the adaptive LR rule is compared separately.
 
+**Implementation note (Phase 4, 2026-11-11).** Checkpoints are the upstream ones: `TTPPO.save()` syncs the device into the torch mirrors (weights, normalizer statistics, and the Adam moments written into
+`optimizer.state` in torch's layout: `step`, `exp_avg`, `exp_avg_sq` per parameter in the optimizer's order, std parameter first) and returns upstream's own dict; `TTPPO.load()` first brings the torch optimizer
+up to date, runs upstream's `PPO.load` and rebuilds the device copies (weights, normalizers, Adam moments and step counter, learning rate as a device tensor). `get_policy()` syncs only the models (not Adam), so the
+runner's per-iteration logging stays cheap. A TT checkpoint therefore loads into an unmodified upstream runner (bit-identical inference), an upstream checkpoint resumes on TT (device state compared tensor by
+tensor), and the optimizer state has exactly the structure of an upstream one (tested). Upstream exports ONNX with a fixed batch of 1; the exported TT-trained policy matches the torch mirror (1e-5) and the device forward.
+
 ## ADR-0002 — Plugin injection point and runner subclass  — *Accepted (owner, 2026-11-10)*
 **Context.** Upstream resolves the algorithm from `cfg["algorithm"]["class_name"]` via `resolve_callable`
 (`utils.py:167-176`) and calls the static `construct_algorithm(obs, env, cfg, device)` (`on_policy_runner.py:39-40`).

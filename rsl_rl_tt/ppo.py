@@ -69,7 +69,8 @@ class TTPPO(PPO):
         self.adam: TTAdam | None = None
         self._col0 = self.ctx.upload(unit_row(0, 32), op="H-6", batch_sharded=False)  # places the critic's single output in column 0
         self._pending: dict | None = None
-        self._device_ahead = False  # True while the device holds newer parameters than the torch mirrors
+        self._weights_stale = False  # True while the device holds newer parameters than the torch mirrors
+        self._optimizer_stale = False  # the same for the Adam moments
         self._refresh_std_mirror()
 
     # -- configuration checks -----------------------------------------------------------------------------------------------
@@ -90,12 +91,17 @@ class TTPPO(PPO):
         self._std_host = std.contiguous()
         self._raw_actor.distribution._distribution = Normal(torch.zeros(1, std.numel()), std)
 
-    def sync_to_torch(self) -> None:
-        """Device parameters, statistics and Adam state -> the upstream torch models and optimizer (H-6). Called before save/export when the device is ahead."""
-        self.tt_actor.sync_to_torch()
-        self.tt_critic.sync_to_torch()
-        self._optimizer_state_to_torch()
-        self._device_ahead = False
+    def sync_to_torch(self, optimizer: bool = False) -> None:
+        """Device parameters and statistics -> the upstream torch models (H-6); with `optimizer=True` also the Adam moments -> the torch optimizer.
+
+        `get_policy()` (export, inference, the runner's per-iteration logging) needs only the models; `save()` needs the optimizer state as well."""
+        if self._weights_stale:
+            self.tt_actor.sync_to_torch()
+            self.tt_critic.sync_to_torch()
+            self._weights_stale = False
+        if optimizer and self._optimizer_stale:
+            self._optimizer_state_to_torch()
+            self._optimizer_stale = False
 
     def sync_from_torch(self) -> None:
         """The upstream torch models / optimizer (e.g. after `load()`) -> the device copies, incl. Adam moments and the learning rate (H-6, H-8)."""
@@ -105,10 +111,14 @@ class TTPPO(PPO):
         self.lr_sched.set(self.learning_rate)
         self._optimizer_state_from_torch()
         self._refresh_std_mirror()
-        self._device_ahead = False
+        self._weights_stale = self._optimizer_stale = False
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        ok = super().load(loaded_dict, load_cfg, strict)  # fills the torch mirrors and the torch optimizer (upstream code)
+        """Upstream's `PPO.load` on the torch mirrors/optimizer, then the device copies are rebuilt from them (also the Adam moments and the LR).
+
+        Before loading, the torch optimizer is brought up to date with the device, so that `load_cfg` without "optimizer" keeps the CURRENT moments exactly like upstream."""
+        self.sync_to_torch(optimizer=True)
+        ok = super().load(loaded_dict, load_cfg, strict)
         self.sync_from_torch()
         return ok
 
@@ -173,13 +183,11 @@ class TTPPO(PPO):
             self.optimizer.state[p] = {"step": torch.tensor(float(self.adam.t)), "exp_avg": host[0].clone(), "exp_avg_sq": host[1].clone()}
 
     def get_policy(self):
-        if self._device_ahead:
-            self.sync_to_torch()
+        self.sync_to_torch()
         return super().get_policy()
 
     def save(self) -> dict:
-        if self._device_ahead:
-            self.sync_to_torch()
+        self.sync_to_torch(optimizer=True)
         return super().save()
 
     def train_mode(self) -> None:
@@ -294,7 +302,7 @@ class TTPPO(PPO):
         self.learning_rate = host(self.lr_sched.lr)
         for group in self.optimizer.param_groups:  # keep the (unused) torch optimizer's lr in line for logging / checkpoints
             group["lr"] = self.learning_rate
-        self._device_ahead = True
+        self._weights_stale = self._optimizer_stale = True
         self._refresh_std_mirror()
         st.clear()
         return loss_dict
