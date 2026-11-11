@@ -3,14 +3,14 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
-## 2026-11-12 — Demo 2 (not a phase, branch `tt/demo-g1`): Unitree G1 walking on command, CPU simulation + training on ALL EIGHT chips
+## 2026-11-12 — Demo 2 (not a phase; merged from branch `tt/demo-g1`): Unitree G1 walking on command, CPU simulation + training on ALL EIGHT chips
 **Done**: `rsl_rl_tt/demos/mujoco_g1.py` (G1 MJX model of MuJoCo Menagerie, pinned commit, fetched by `scripts/fetch_g1_model.sh`: velocity-command task, 12 leg joints, privileged critic observations, phase-based gait rewards;
 4096 robots stepped by MuJoCo's multithreaded `rollout`), `g1_cfg.py`, `scripts/train_g1_demo.py` / `render_g1_demo.py` / `plot_g1_curves.py`, 9 host tests (`tests/tt/test_mujoco_g1.py`: conventions, determinism, geometry, rollout == `mj_step` EXACTLY
 with the warm start and within 2.6e-3 rad cold-started, fall / time-out / reset, commands, private RNG, short upstream-PPO run with the asymmetric critic). Result (`docs/porting/demo_g1/README.md`): 2x4 mesh, 4096 envs, 1500 iterations
 (147 M samples, 27.6 min, replicas bit-identical at every 10th update): follows 0.4 / 0.8 m/s and a turn command (0.39 / 0.78 / 0.51 m/s + 0.38 rad/s achieved) with 0 falls in 12 s x 256 robots; video `g1.mp4` (20 s), curves.
 Per iteration: upstream CPU PPO 3.93 s (algorithm 3.05), TT one chip 1.35 s (0.51), TT eight chips 1.10 s (0.27): the CPU simulation is 76 % of the eight-chip run.
 **Two failed attempts, recorded**: (1) the model's PD gains (ankle kp 20, roll range 0.26 rad => ~5 N*m) made stepping physically impossible; (2) with a sparse contact reward the policy stood still for 450+ iterations; fixed by raising the leg / waist gains
-and a dense foot-height-vs-phase reward. One seed; simulation only (no randomisation, no noise); not merged to `main`.
+and a dense foot-height-vs-phase reward. One seed; simulation only (no randomisation, no noise). Merged to `main` on 2026-11-12 at the owner's explicit request (not a phase, so no `phase-N-done` tag).
 
 ## 2026-11-12 — Demo (not a phase; merged from branch `tt/demo-humanoid`): MuJoCo humanoid walking, CPU simulation + TT training
 **Done**: `rsl_rl_tt/demos/` (`MujocoHumanoidVecEnv`: Gymnasium Humanoid-v5 task as an rsl_rl `VecEnv` with Isaac Lab conventions, thousands of environments stepped by MuJoCo's multithreaded `rollout`, 165 k env-steps/s on 64 threads;
