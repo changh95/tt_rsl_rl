@@ -3,6 +3,30 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-11 — Phase 1 DONE (host only): CPU test envs, golden baselines, parity utilities
+**Done**
+- Owner approved ADR-0001/0002/0003/0004(A-1) and Phase 1 (2026-11-10); Phase 0 merged to `main`, tag `phase-0-done`.
+- `rsl_rl_tt/testing/envs.py`: three seed-deterministic batched `VecEnv`s with TensorDict obs groups, Isaac Lab wrapper conventions
+  (`dones` long, `time_outs` bool, obs after reset, `extras["log"]` on reset steps, private RNG so PPO's global RNG is untouched):
+  `cartpole` (early termination, 500-step time-out), `pendulum` (gym swing-up, 200 steps), `tracking12` (12 double-integrator actuators,
+  command tracking, critic-only privileged domain-randomisation group, 300-step time-out AND early termination). 4096 envs step in 0.3-2 ms.
+- `rsl_rl_tt/testing/reference.py`, `csv_writer.py`: the UNMODIFIED upstream `OnPolicyRunner` is configured per env and a `LogWriter` subclass
+  (injected through `cfg["logger"]`, no upstream patch) records every Logger scalar per iteration; `scripts/train_reference.py` produces the goldens.
+- Golden baselines (`docs/porting/golden/`, 3 seeds each, CSV + `summary.json` + curve PNGs): cartpole 500.0 +- 0.0 in ~20 s/run, pendulum
+  -152.1 +- 2.4 in ~50 s, tracking12 190.7 +- 1.4 in ~230 s (random policies: 25.5 / -1224 / 14.9). Training is bit-reproducible for a given
+  seed/torch build/thread count (tested).
+- `rsl_rl_tt/testing/parity.py`: max abs/rel error, rel_fro, PCC, fp32 ULP, exact mode, non-finite handling, worst-element report; the registry
+  `TOLERANCES` mirrors `TOLERANCES.md` (a test checks the numbers appear in the table). `golden.py` encodes the Phase 4 acceptance rule.
+- Host tests: 343 pass (envs 24, parity 10, reference 10, golden 16, plus the Phase 0 suite).
+**Findings worth knowing**
+- A first `tracking12` reward (tiny tracking kernel, only penalties otherwise) taught the agent to terminate early; fixed with a wider kernel and a
+  termination penalty (as in Isaac Lab tasks). With actions clipped by the env, an entropy bonus inflates std for free, so `entropy_coef = 0` there.
+- The upstream `Logger` stores a git diff of the whole repo (`git/rsl_rl.diff`), not of `rsl_rl/` only; the "rsl_rl equals the tag" check stays the
+  invariants test.
+- Reference specs already satisfy the Phase 2 tile rule (batch and mini-batch multiples of 32), tested.
+**Next**: Phase 2 (1-chip forward): TT `MLPModel` forward, `EmpiricalNormalization`, `GaussianDistribution`, torch->TT weight copy, padding path, `act()` wired
+to the CPU env rollouts (rollout storage may stay on the host in this phase: H-7). First device job of the project phase uses `tt_run.sh --chips 16`.
+
 ## 2026-11-10 (later) — Phase 0 DONE, waiting for the owner's approval before Phase 1
 **Done**
 - Owner decisions received: ADR-0005 delegated to the assistant ("do not disturb the other trays") -> option II implemented; ADR-0006 wheel;

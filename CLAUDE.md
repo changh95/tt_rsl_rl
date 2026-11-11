@@ -65,4 +65,5 @@ git diff v5.5.2 -- rsl_rl/        # must be empty (also tested)
 ## Where things are
 - `docs/porting/BRIEF.md` work order · `PROGRESS.md` log + next steps · `DECISIONS.md` ADRs · `TOLERANCES.md` · `PERF.md` · `TTNN_ISSUES.md`
 - `docs/porting/UPSTREAM_MAP.md`, `UPSTREAM_SEMANTICS.md`, `TTRL_NOTES.md`, `TTNN_OP_SURVEY.md`, `ENV.md`
-- `rsl_rl/` upstream (untouched) · `rsl_rl_tt/` TT implementation (`device.py` = the only place that opens devices) · `tests/tt/` · `scripts/` · `.claude/`
+- `rsl_rl/` upstream (untouched) · `rsl_rl_tt/` TT implementation (`device.py` = the only place that opens devices; `testing/` = host-only CPU envs, reference runs, golden access, parity utilities) · `tests/tt/` · `scripts/` · `.claude/`
+- `docs/porting/golden/` golden baselines of the upstream reference (regenerate: `python scripts/train_reference.py`)
