@@ -3,7 +3,7 @@
 (speed tracking and falls at held commands). Thin command line over `rsl_rl_tt/demos/g1_render.py`; see `examples/g1_walk/play.py` for the short version.
 
     MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_100.pt .run/g1/tt_8chips/model_1499.pt \
-        --video docs/porting/demo_g1/g1.mp4 --gif docs/porting/demo_g1/g1.gif --eval-out docs/porting/demo_g1/eval.json
+        --metrics docs/porting/demo_g1/tt_8chips/metrics.csv --video docs/porting/demo_g1/g1.mp4 --gif docs/porting/demo_g1/g1.gif --eval-out docs/porting/demo_g1/eval.json
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ def main() -> None:
     ap.add_argument("--no-eval", action="store_true")
     ap.add_argument("--video", default=None)
     ap.add_argument("--gif", default=None)
+    ap.add_argument("--metrics", default=None, help="metrics.csv of the training run: adds the live return under every panel and the training curve under all panels")
     ap.add_argument("--eval-out", default=None, help="evaluation JSON")
     args = ap.parse_args()
     hidden = tuple(args.hidden)
@@ -47,7 +48,7 @@ def main() -> None:
         if args.eval_out:
             Path(args.eval_out).write_text(json.dumps(report, indent=2))
     if args.video or args.gif:
-        render_comparison(args.checkpoints, hidden=hidden, fps=args.fps, size=tuple(args.size), seed=args.seed, video=args.video, gif=args.gif)
+        render_comparison(args.checkpoints, hidden=hidden, fps=args.fps, size=tuple(args.size), seed=args.seed, video=args.video, gif=args.gif, metrics=args.metrics)
 
 
 if __name__ == "__main__":

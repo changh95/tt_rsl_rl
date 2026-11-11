@@ -3,6 +3,12 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-11 — Demo clean-up (branch `tt/demo-g1-curves`, not merged): G1 video with reward and learning curve; humanoid demo removed
+**Done** (both at the owner's request): (1) `g1.mp4` / `g1.gif` now show, under every panel, the live return of that robot's current episode (one scale for all panels, red ticks = falls) and, under all panels, the training curve of the run (mean episode return, and achieved vs commanded
+speed, against the iteration on a log axis) with the iteration of every panel marked in its colour (`rsl_rl_tt/demos/g1_render.py`: `render_panel_traced`, `draw_return_strip`, `curve_strip`; `--metrics` of `scripts/render_g1_demo.py`, `examples/g1_walk/play.py` finds the `metrics.csv` next to the checkpoints; 3 new host tests).
+At the end of the 20 s the returns are 84.1 (iteration 1500; curve 83), 54.4 (101; curve 45) and ~5 (untrained; curve 0.4). (2) The MuJoCo humanoid demo is removed from the repository (code, scripts, tests, README section, `docs/porting/demo_humanoid/`); the G1 demo does not use any of it; it stays in the git history.
+Host tests: 434 (431 after removing the 8 humanoid tests, +3).
+
 ## 2026-11-11 — Demo 2 follow-up (branch `tt/demo-g1-gait`, merged to `main` as `5823028` at the owner's explicit request; not a phase, so no tag): `examples/g1_walk/`, initial / middle / final video, eight-chip scaling profile
 **Commit `0aa87d7`.** **Done**: (1) `examples/` (`README.md`, `g1_walk/{train.py, play.py, README.md}`): the G1 demo as a short example on top of the public rsl_rl API (`MujocoG1VecEnv` + `g1_train_cfg` + `tt_agent_cfg` + the upstream `OnPolicyRunner`); `train.py` smoke-tested on one chip
 (3 iterations, 256 robots), `play.py` on its checkpoint. The evaluation / rendering code moved from `scripts/render_g1_demo.py` into the library module `rsl_rl_tt/demos/g1_render.py` (the scripts are thin wrappers); `tests/tt/test_g1_render.py` (8 host tests: labels, checkpoint
@@ -20,7 +26,7 @@ Per iteration: upstream CPU PPO 3.93 s (algorithm 3.05), TT one chip 1.35 s (0.5
 **Two failed attempts, recorded**: (1) the model's PD gains (ankle kp 20, roll range 0.26 rad => ~5 N*m) made stepping physically impossible; (2) with a sparse contact reward the policy stood still for 450+ iterations; fixed by raising the leg / waist gains
 and a dense foot-height-vs-phase reward. One seed; simulation only (no randomisation, no noise). Merged to `main` on 2026-11-12 at the owner's explicit request (not a phase, so no `phase-N-done` tag).
 
-## 2026-11-12 — Demo (not a phase; merged from branch `tt/demo-humanoid`): MuJoCo humanoid walking, CPU simulation + TT training
+## 2026-11-12 — Demo (not a phase; merged from branch `tt/demo-humanoid`): MuJoCo humanoid walking, CPU simulation + TT training  — **REMOVED from the repository on 2026-11-11 at the owner's request** (code, scripts, tests, README section and `docs/porting/demo_humanoid/`; it stays in the git history)
 **Done**: `rsl_rl_tt/demos/` (`MujocoHumanoidVecEnv`: Gymnasium Humanoid-v5 task as an rsl_rl `VecEnv` with Isaac Lab conventions, thousands of environments stepped by MuJoCo's multithreaded `rollout`, 165 k env-steps/s on 64 threads;
 `humanoid_cfg.py`), `scripts/train_humanoid_demo.py` / `render_humanoid_demo.py` / `plot_humanoid_curves.py`, 8 host tests (`tests/tt/test_mujoco_humanoid.py`: conventions, determinism, reward formula, rollout == plain `mj_step` to 5e-8,
 fall / time-out / auto-reset, private RNG, a short upstream-PPO training), dependency `gymnasium[mujoco]==1.4.0` (ENV.md). Result (`docs/porting/demo_humanoid/README.md`): TT, one chip, 4096 envs, 600 iterations (59 M samples, 13.3 min):

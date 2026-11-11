@@ -81,6 +81,39 @@ def test_a_tiny_headless_render_and_the_writers(tmp_path):
     assert video.stat().st_size > 0 and gif.read_bytes()[:3] == b"GIF"
 
 
+def test_iteration_numbers_and_episode_returns():
+    assert [g1_render.iteration_of(c) for c in ("random", "model_0.pt", "/x/model_100.pt", "model_1499.pt")] == [1, 1, 101, 1500]
+    trace = {"rewards": np.array([1.0, 2.0, -2.0, 0.5, 0.5]), "dones": np.array([False, False, True, False, False]), "dt": 0.02}
+    # the return of the current episode: the step that ends an episode is included, the next step starts again from zero
+    assert np.allclose(g1_render.episode_returns(trace), [1.0, 3.0, 1.0, 0.5, 1.0])
+
+
+def test_the_reward_strip_and_the_learning_curve_have_the_requested_sizes(tmp_path):
+    trace = {"rewards": np.linspace(0.0, 0.1, 50), "dones": np.zeros(50, dtype=bool), "dt": 0.02}
+    trace["dones"][20] = True
+    cum = g1_render.episode_returns(trace)
+    strip = g1_render.draw_return_strip(trace, cum, 30, (32, 192), (0.0, float(cum.max())), g1_render.COLORS[0], "x")
+    assert strip.shape == (32, 192, 3) and strip.dtype == np.uint8 and (strip != np.array(g1_render.BACKGROUND)).any()
+    metrics = tmp_path / "metrics.csv"
+    rows = ["iteration,Train/mean_reward,Metrics/forward_speed,Metrics/command_vx"] + [f"{i},{i * 0.1},{'' if i < 3 else 0.01 * i},0.5" for i in range(120)]
+    metrics.write_text("\n".join(rows))
+    img = g1_render.curve_strip(str(metrics), ["random", "model_100.pt"], (64, 384), ["a", "b"])
+    assert img.shape == (64, 384, 3) and img.dtype == np.uint8 and img.std() > 1.0
+
+
+def test_a_comparison_with_reward_and_curve_strips(tmp_path):
+    import mujoco
+
+    metrics = tmp_path / "metrics.csv"
+    metrics.write_text("\n".join(["iteration,Train/mean_reward,Metrics/forward_speed,Metrics/command_vx"] + [f"{i},{i * 0.1},{0.01 * i},0.5" for i in range(120)]))
+    video = tmp_path / "c.mp4"
+    try:
+        n = g1_render.render_comparison(["random", "random"], size=(128, 192), schedule=[((0.4, 0.0, 0.0), 0.2)], video=str(video), metrics=str(metrics), fps=25)
+    except (mujoco.FatalError, ImportError, RuntimeError) as e:
+        pytest.skip(f"headless rendering unavailable: {e}")
+    assert n >= 2 and video.stat().st_size > 0
+
+
 @pytest.mark.parametrize("script", ["examples/g1_walk/train.py", "examples/g1_walk/play.py", "scripts/render_g1_demo.py", "scripts/render_g1_gait.py"])
 def test_the_scripts_start_and_describe_themselves(script):
     out = subprocess.run([sys.executable, str(REPO / script), "--help"], capture_output=True, text=True, timeout=120, cwd=REPO)
