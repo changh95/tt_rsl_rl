@@ -19,7 +19,7 @@ from typing import Any
 
 from rsl_rl_tt.tt_common import TTContext, unit_row
 
-SCALAR_COLS = {"value": 0, "returns": 1, "advantages": 2, "old_logp": 3}
+SCALAR_COLS = {"value": 0, "returns": 1, "advantages": 2, "old_logp": 3, "done": 4}  # "done" only when `store_done` (recurrent models: the state is reset after a done step)
 SCALAR_BLOCK = 32
 
 
@@ -34,7 +34,7 @@ class TTRolloutStorage:
 
     def __init__(
         self, ctx: TTContext, num_envs: int, num_transitions_per_env: int, actor_dim_p: int, critic_dim_p: int, act_dim_p: int, share_obs: bool, persistent: bool = False,
-        store_std: bool = False, rnd_dim_p: int = 0, rnd_source: str | None = None, extra_cols: list | None = None,
+        store_std: bool = False, rnd_dim_p: int = 0, rnd_source: str | None = None, extra_cols: list | None = None, store_done: bool = False,
     ) -> None:
         """`store_std`: also keep the per-sample std of the action distribution (a state-dependent std: upstream's `distribution_params = (mean, std)`); the packed
         table then has one more column block. The layout is unchanged otherwise.
@@ -46,6 +46,7 @@ class TTRolloutStorage:
         symmetry extension, which are computed once per update and must be shuffled together with the rows they belong to."""
         self.ctx = ctx
         self.store_std = store_std
+        self.store_done = store_done  # recurrent models: the packed table gets the done flag of every step
         assert rnd_source in (None, "actor", "critic", "own"), rnd_source
         self.rnd_source = rnd_source
         self.rnd_own = rnd_source == "own"
@@ -189,7 +190,7 @@ class TTRolloutStorage:
         ttnn = self.ctx.ttnn
         assert self.returns is not None, "compute_returns() must run before update()"
         scalars = None
-        for name, column in (("value", self._cat("value")), ("returns", self.returns), ("advantages", self.advantages), ("old_logp", self._cat("logp"))):
+        for name, column in (("value", self._cat("value")), ("returns", self.returns), ("advantages", self.advantages), ("old_logp", self._cat("logp"))) + ((("done", self._cat("done")),) if self.store_done else ()):
             block = ttnn.multiply(column, self._unit(name))  # [rows, 1] x [1, 32] -> [rows, 32], exact (x * 1.0 / x * 0.0)
             scalars = block if scalars is None else ttnn.add(scalars, block)
         parts = [self.all_actor_obs()]
@@ -234,4 +235,5 @@ class TTRolloutStorage:
             "returns": view(s + SCALAR_COLS["returns"], s + SCALAR_COLS["returns"] + 1),
             "advantages": view(s + SCALAR_COLS["advantages"], s + SCALAR_COLS["advantages"] + 1),
             "old_logp": view(s + SCALAR_COLS["old_logp"], s + SCALAR_COLS["old_logp"] + 1),
+            **({"done": view(s + SCALAR_COLS["done"], s + SCALAR_COLS["done"] + 1)} if self.store_done else {}),
         }

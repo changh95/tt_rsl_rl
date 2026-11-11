@@ -262,6 +262,12 @@ KMD 2.10.0 and this hardware is verified by the first device job.
 * **Two new tolerance rows with measured bases** (`TOLERANCES.md`): `update_behavior_loss` 2e-2 (measured <= 6.8e-3) and `distill_many_steps` 3e-2 (measured <= 1.6e-2). The second is NOT a loosening of the PPO rows: a smooth regression loss has a CONSISTENT gradient, so the noise-floor sign flips of the first Adam step are never averaged out (measured window by window: they appear in the first step and stay the same size);
   updates of one or two Adam steps keep the strict noise-baseline limit. The noise baseline of these tests injects the matmul-sized noise at the output of every linear layer of upstream's student (the gradient of a regression shrinks as the student learns, the forward noise does not).
 
+### ADR-0007 amendment A-5 — 8.5 recurrent models (2026-11-11, assistant; the owner can veto)
+* **Design** (details in `POST_V1.md`): GRU / LSTM stacks on the device with a hand-written forward and BPTT (`rsl_rl_tt/rnn.py`); upstream's split-at-dones-and-pad mini-batches are replaced by their exact fixed-shape equivalent (one sequence per environment over T steps with the state zeroed after every done and started from the state saved at the rollout start; the recurrent generator does not shuffle, so the
+  mini-batch layout is a fixed gather). No new allow-list entry (the only new host work is a constant index tensor built at construction, H-6).
+* **One new tolerance rule, `rnn_noise_factor` 20** (`TOLERANCES.md`; the PPO rows keep 10): the noise baseline of the update tests (upstream with gradient noise) cannot reproduce the matmul noise that accumulates through the T steps x layers of a recurrent forward; measured TT deviations are <= 4.6e-3 of the update (baseline 3.6e-4).
+* **Trap found on the way** (a test bug, not a defect): the device storage of several chips holds a chip's rows one chip after the other; a reference test that reshapes a download to `[steps, environments]` must undo that.
+
 ## Host-computation allow-list (BRIEF 2-8)
 *H-7 (temporary host rollout storage, Phase 2) was retired on 2026-11-11: storage, GAE and mini-batches are on the device since Phase 3.*
 Silent torch/host fallbacks on the TT path are forbidden. Only the items below may run on the host. Each is counted by a

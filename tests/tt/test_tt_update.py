@@ -211,6 +211,9 @@ def copy_storage(src_alg, dst_alg):
     b.observations.copy_(a.observations)
     b.advantages = a.advantages.clone()
     b.distribution_params = None if a.distribution_params is None else tuple(p.clone() for p in a.distribution_params)
+    for field in ("saved_hidden_state_a", "saved_hidden_state_c"):  # recurrent models: the hidden states saved at every step
+        saved = getattr(a, field)
+        setattr(b, field, None if saved is None else [t.clone() for t in saved])
     b.step = a.step
 
 

@@ -1,0 +1,58 @@
+{
+  "backend": "TTPPO on one Blackhole chip (tray 3, node 16), fp32 policy, math fidelity HiFi4, traced, unmodified OnPolicyRunner",
+  "envs": {
+    "cartpole_po": {
+      "seeds": {
+        "0": {
+          "iterations": 150,
+          "wall_s": 67.3,
+          "final_reward": 176.796
+        },
+        "1": {
+          "iterations": 150,
+          "wall_s": 61.8,
+          "final_reward": 500.0
+        },
+        "2": {
+          "iterations": 150,
+          "wall_s": 60.8,
+          "final_reward": 128.184
+        },
+        "3": {
+          "iterations": 150,
+          "wall_s": 59.3,
+          "final_reward": 378.466
+        },
+        "4": {
+          "iterations": 150,
+          "wall_s": 61.9,
+          "final_reward": 308.84
+        },
+        "5": {
+          "iterations": 150,
+          "wall_s": 62.1,
+          "final_reward": 474.838
+        }
+      },
+      "num_envs": 512,
+      "num_steps_per_env": 24,
+      "criterion": {
+        "tt_final_rewards": [
+          176.796,
+          500.0,
+          128.184,
+          378.466,
+          308.84,
+          474.838
+        ],
+        "tt_mean": 327.854,
+        "reference_mean": 374.48466666666667,
+        "reference_std": 152.31104742890088,
+        "threshold": 222.1736192377658,
+        "all_finite": true,
+        "passes": true
+      }
+    }
+  },
+  "total_wall_s": 374.4
+}

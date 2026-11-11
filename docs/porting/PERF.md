@@ -188,6 +188,19 @@ state is uploaded twice (once for the reward, once by the next `act`), and the p
 
 The rollout is not touched; the update's cost grows with the number of copies (K = 4: the mini-batches have four times the rows).
 
+## 7f. Recurrent models (Phase 8.5, post-v1)
+
+The partially observable cart-pole (`cartpole_po`), one layer, actor AND critic recurrent, 24 steps per environment, 4 mini-batches x 5 epochs, one chip traced vs upstream PPO with its recurrent mini-batch generator on the CPU (16 threads), seconds per iteration (3 warm-up iterations, then 6 / 3 timed):
+
+| | TT traced | upstream CPU | factor |
+|---|---:|---:|---:|
+| 512 environments, GRU 64 | 0.378 | 0.632 | 1.7x |
+| 4096 environments, GRU 256 | 0.884 | 6.05 | **6.8x** |
+| 4096 environments, LSTM 256 | 0.990 | 6.09 | **6.2x** |
+
+At 4096 environments, GRU 256 the PPO update replay (20 mini-batch steps: each one the 24-step forward, the hand-written BPTT through 24 steps and the optimizer step) is 703 ms of the 884 ms; the rollout (act 41 + 15 + 12, process_env_step 44) is the rest. The update is a long chain of small ops (the recurrence cannot be batched over time), which is why small
+networks gain little (1.7x) while the CPU's cost grows with the batch (6 s). The end-to-end runs of `docs/porting/` (512 environments, GRU 64, 150 iterations, six seeds): TT 73.7 s per run, CPU 90.9 s (GRU); LSTM 62.2 s vs 51.8 s: at this size the CPU environment and the small kernels dominate, no speed-up is claimed there.
+
 ## 8. Reproduce
 
 ```bash

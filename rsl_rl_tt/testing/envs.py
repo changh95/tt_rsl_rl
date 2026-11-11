@@ -142,6 +142,16 @@ class BatchedCartPole(_BatchedEnv):
         return TensorDict({"policy": self._s.clone()}, batch_size=[self.num_envs], device=self.device)
 
 
+class BatchedCartPolePO(BatchedCartPole):
+    """The cart-pole of `BatchedCartPole` WITHOUT the velocities: the policy sees only the cart position and the pole angle, so a feed-forward policy cannot balance the pole for long, while
+    a recurrent one can estimate the velocities from the history (Phase 8.5, `rsl_rl_tt.testing.reference.with_rnn`). Everything else (dynamics, reward, termination) is the same."""
+
+    obs_group_dims = {"policy": 2}
+
+    def _compute_obs(self) -> TensorDict:
+        return TensorDict({"policy": self._s[:, [0, 2]].clone()}, batch_size=[self.num_envs], device=self.device)
+
+
 class BatchedPendulum(_BatchedEnv):
     """Gym Pendulum-v1 dynamics, torque in [-1, 1] scaled by 2. Reward = -(angle^2 + 0.1 w^2 + 0.001 u^2); 200 steps, no termination."""
 
@@ -245,9 +255,18 @@ class Tracking12(_BatchedEnv):
 
 ENV_CLASSES = {"cartpole": BatchedCartPole, "pendulum": BatchedPendulum, "tracking12": Tracking12}
 ENV_NAMES = tuple(ENV_CLASSES)
+RECURRENT_ENV_CLASSES = {"cartpole_po": BatchedCartPolePO}  # environments that need a memory (not part of ENV_NAMES: the golden curves and the v1 suites are defined on the three above)
+
+
+def env_class(name: str):
+    if name in ENV_CLASSES:
+        return ENV_CLASSES[name]
+    if name in RECURRENT_ENV_CLASSES:
+        return RECURRENT_ENV_CLASSES[name]
+    raise ValueError(f"unknown test env {name!r}; choose one of {ENV_NAMES + tuple(RECURRENT_ENV_CLASSES)}")
 
 
 def make_env(name: str, num_envs: int, seed: int = 0, device: str = "cpu", **kwargs) -> VecEnv:
-    if name not in ENV_CLASSES:
-        raise ValueError(f"unknown test env {name!r}; choose one of {ENV_NAMES}")
-    return ENV_CLASSES[name](num_envs, seed=seed, device=device, **kwargs)
+    if name not in ENV_CLASSES and name not in RECURRENT_ENV_CLASSES:
+        raise ValueError(f"unknown test env {name!r}; choose one of {ENV_NAMES + tuple(RECURRENT_ENV_CLASSES)}")
+    return env_class(name)(num_envs, seed=seed, device=device, **kwargs)

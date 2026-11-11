@@ -42,8 +42,6 @@ class TTPPO(TraceMixin, PPO):
     def __init__(self, actor, critic, storage, *, tt_cfg: dict | None = None, **kwargs) -> None:
         if kwargs.get("multi_gpu_cfg") is not None:
             raise NotImplementedError("rsl_rl's torch.distributed multi-GPU mode is replaced by the mesh data-parallel design (Phase 6)")
-        if getattr(actor, "is_recurrent", False) or getattr(critic, "is_recurrent", False):
-            raise NotImplementedError("recurrent models are outside the v1 scope")
         if str(kwargs.get("optimizer", "adam")).lower() != "adam":
             raise NotImplementedError("v1 implements Adam only (BRIEF 1: other optimizers need approval)")
         if kwargs.get("use_mixed_precision"):
@@ -62,7 +60,12 @@ class TTPPO(TraceMixin, PPO):
             # one trace per mini-batch step plus the act step; a trace of this graph takes ~8.3 MB regardless of the tensor sizes (it records commands, not data;
             # measured at 16 mini-batches, hidden [1024, 1024, 512]), so the region grows with num_mini_batches (default 12 MiB per trace, at least 128 MiB)
             # (x2 on several chips: the gradient exchange adds ~40 collective ops to every mini-batch trace)
-            self._mesh_kwargs.setdefault("trace_region_size", max(128, 12 * (self.num_mini_batches + 2)) * (2 if mesh_shape[0] * mesh_shape[1] > 1 else 1) * 1024 * 1024)
+            # a recurrent mini-batch step unrolls T steps x layers of the cell forward and the BPTT: its trace is about T x layers times larger
+            unroll = 1
+            for model in (actor, critic):
+                if getattr(model, "is_recurrent", False):
+                    unroll += storage.num_transitions_per_env * model.rnn.rnn.num_layers
+            self._mesh_kwargs.setdefault("trace_region_size", max(128, 12 * (self.num_mini_batches + 2)) * unroll * (2 if mesh_shape[0] * mesh_shape[1] > 1 else 1) * 1024 * 1024)
         if mesh_shape[0] * mesh_shape[1] > 1:
             self._mesh_kwargs.setdefault("fabric_config", "FABRIC_1D")  # the cross-chip gather / sum needs the fabric (ADR-0004 A-1; measured on the tray subset)
         self.tray = acquire_tray_mesh(mesh_shape, **self._mesh_kwargs)
@@ -82,6 +85,18 @@ class TTPPO(TraceMixin, PPO):
         if self.tt_actor.distribution is None:
             raise ValueError("the actor needs a distribution_cfg (GaussianDistribution or HeteroscedasticGaussianDistribution)")
         self.hetero = self.tt_actor.distribution.per_row  # state-dependent std: the std head is part of the actor MLP and every sample has its own std
+        # recurrent models (RNNModel, post-v1 item 8.5): either model recurrent selects upstream's recurrent mini-batch generator for BOTH (fixed env slices, whole trajectories, no shuffling)
+        self.recurrent = self.tt_actor.recurrent or self.tt_critic.recurrent
+        if self.recurrent:
+            if self.hetero:
+                raise NotImplementedError("a recurrent actor / critic is not supported together with the heteroscedastic Gaussian")
+            if kwargs.get("rnd_cfg"):
+                raise NotImplementedError("RND with recurrent models: upstream feeds the padded trajectories to the RND networks (padding included in the loss): not supported")
+            per_chip = storage.num_envs // self.ctx.n_chips
+            if per_chip % self.num_mini_batches != 0 or (per_chip // self.num_mini_batches) % 32 != 0:
+                raise ValueError(f"recurrent mini-batches are slices of the environments: the environments of a chip ({per_chip}) / num_mini_batches ({self.num_mini_batches}) must be a multiple of 32")
+            for model in (self.tt_actor, self.tt_critic):
+                model.allocate_state(storage.num_envs)  # persistent hidden states (T-15: before any capture)
         share = self.tt_actor.obs_groups == self.tt_critic.obs_groups
         self.sym_tt: TTSymmetry | None = None  # symmetry augmentation / mirror loss (the mirror is `self.symmetry`, built by upstream's PPO.__init__ from symmetry_cfg)
         extra_cols: list = []
@@ -102,7 +117,7 @@ class TTPPO(TraceMixin, PPO):
                 self.rnd_tt.allocate_act_buffers()
         self.storage = TTRolloutStorage(  # replaces the host RolloutStorage that upstream's construct_algorithm built
             self.ctx, storage.num_envs, storage.num_transitions_per_env, self.tt_actor.obs_dim_p, self.tt_critic.obs_dim_p, self.tt_actor.distribution.dim_p, share,
-            persistent=self.trace_enabled, store_std=self.hetero, rnd_dim_p=rnd_dim_p, rnd_source=rnd_source, extra_cols=extra_cols,
+            persistent=self.trace_enabled, store_std=self.hetero, rnd_dim_p=rnd_dim_p, rnd_source=rnd_source, extra_cols=extra_cols, store_done=self.recurrent,
         )
         self.losses = PPOLosses(
             self.ctx, clip_param=self.clip_param, value_loss_coef=self.value_loss_coef, entropy_coef=self.entropy_coef, use_clipped_value_loss=self.use_clipped_value_loss
@@ -118,6 +133,15 @@ class TTPPO(TraceMixin, PPO):
         self.adam: TTAdam | None = TTAdam(self.ctx, self._params())
         for name in self._loss_names():
             self._acc("update.acc." + name)
+        if self.recurrent:
+            # the hidden state at the START of the rollout (upstream stores it at every step but uses only the first one and the zeros after dones) and the fixed permutation that puts the rollout into
+            # mini-batch order: mini-batch i = the environments [i E, (i + 1) E) of a chip, all T steps, time-major (row = t E + e)
+            self._h0 = {id(m): [ttnn_zeros for ttnn_zeros in m.snapshot_state()] for m in (self.tt_actor, self.tt_critic) if m.recurrent}
+            steps, mb = self.storage.num_transitions_per_env, self.num_mini_batches
+            n_local = storage.num_envs // self.ctx.n_chips
+            e_mb = n_local // mb
+            order = torch.stack([torch.arange(e_mb) + i * e_mb + t * n_local for i in range(mb) for t in range(steps)]).reshape(-1)  # source row (step t, env i E + e) of the packed table
+            self._rec_perm = self.ctx.upload_index(torch.cat([order] * self.ctx.n_chips), op="H-6")
         if self.hetero:  # the per-column mean std of the last mini-batch, for the runner's logging (allocated before any capture: T-15)
             self._buf["update.last_std"] = self.ctx.zeros(1, self.tt_actor.distribution.dim_p, batch_sharded=False)
         if self.trace_enabled:
@@ -193,21 +217,27 @@ class TTPPO(TraceMixin, PPO):
 
     # -- optimizer state <-> torch.optim.Adam layout (checkpoint compatibility) -------------------------------------------------
     def _param_slots(self) -> list[tuple]:
-        """For every parameter of the torch optimizer, in its order: (torch param, device index in `_params()`, kind, layer-or-dist)."""
+        """For every parameter of the torch optimizer, in its order: (torch param, device index in `_params()`, kind, owner); kind "rnn" has owner = (TTRNN, layer, kind of the parameter)."""
         a, c = self.tt_actor, self.tt_critic
-        n_a = len(a.mlp.parameters())
         learn = a.distribution.learn_std
         slots = {}
-        for tag, tt_model, mirror, base in (("actor", a, self._raw_actor, 0), ("critic", c, self._raw_critic, n_a + (1 if learn else 0))):
+        base = 0
+        for tag, tt_model, mirror in (("actor", a, self._raw_actor), ("critic", c, self._raw_critic)):
             lin_idx = [i for i, m in enumerate(mirror.mlp) if type(m).__name__ == "Linear"]
             for k, mod_i in enumerate(lin_idx):
                 lin = mirror.mlp[mod_i]
                 slots[id(lin.weight)] = (lin.weight, base + 2 * k, "weight", tt_model.mlp.layers[k])
                 slots[id(lin.bias)] = (lin.bias, base + 2 * k + 1, "bias", tt_model.mlp.layers[k])
-        if learn:
-            d = self._raw_actor.distribution
-            std_param = d.std_param if d.std_type == "scalar" else d.log_std_param
-            slots[id(std_param)] = (std_param, n_a, "std", a.distribution)
+            base += len(tt_model.mlp.parameters())
+            if tag == "actor" and learn:
+                d = self._raw_actor.distribution
+                std_param = d.std_param if d.std_type == "scalar" else d.log_std_param
+                slots[id(std_param)] = (std_param, base, "std", a.distribution)
+                base += 1
+            if tt_model.recurrent:
+                for p, idx, layer, kind in tt_model.rnn.param_slots():
+                    slots[id(p)] = (p, base + idx, "rnn", (tt_model.rnn, layer, kind))
+                base += len(tt_model.rnn.parameters())
         return [slots[id(p)] for p in self.optimizer.param_groups[0]["params"] if id(p) in slots]
 
     def _optimizer_state_from_torch(self) -> None:
@@ -229,6 +259,9 @@ class TTPPO(TraceMixin, PPO):
                     store[idx] = ctx.upload(owner.weight_to_host(t), op="H-6", batch_sharded=False)
                 elif kind == "bias":
                     store[idx] = ctx.upload(owner.bias_to_host(t), op="H-6", batch_sharded=False)
+                elif kind == "rnn":
+                    rnn, layer, rnn_kind = owner
+                    store[idx] = ctx.upload(rnn.weight_to_host(layer, rnn_kind, t), op="H-6", batch_sharded=False)
                 else:
                     store[idx] = ctx.upload(pad_vector(t, owner.dim_p), op="H-6", batch_sharded=False)
         self.adam.load_state(m, v, step)
@@ -245,6 +278,9 @@ class TTPPO(TraceMixin, PPO):
                     host.append(owner.weight_from_host(t))
                 elif kind == "bias":
                     host.append(owner.bias_from_host(t))
+                elif kind == "rnn":
+                    rnn, layer, rnn_kind = owner
+                    host.append(rnn.weight_from_host(layer, rnn_kind, t))
                 else:
                     host.append(t[0, : owner.dim].contiguous())
             self.optimizer.state[p] = {"step": torch.tensor(float(self.adam.t)), "exp_avg": host[0].clone(), "exp_avg_sq": host[1].clone()}
@@ -329,15 +365,24 @@ class TTPPO(TraceMixin, PPO):
                 actor_in = actor.obs_to_device(obs)
                 critic_in = actor_in if share else critic.obs_to_device(obs)
                 noise = ctx.upload(noise_host, op="H-4", batch_sharded=True)
+        if self.recurrent and self.storage.step == 0:  # the hidden state at the start of the rollout (carried over from the previous one): the start of every mini-batch's first trajectory
+            for m in (actor, critic):
+                if m.recurrent:
+                    self._h0[id(m)] = [ctx.put(h, s) for h, s in zip(self._h0[id(m)], m.state)]
         with self.timer.section("act.compute"):
             if traced and "act" in self._traces:
                 self._replay("act")
                 out = {k: self._buf["act." + k] for k in ("action", "mean", "logp", "value", "actor_obs") + (("std",) if self.hetero else ()) + (() if share else ("critic_obs",))}
             else:
+                saved = [m.snapshot_state() for m in (actor, critic)] if self.recurrent and traced else None  # (the warm-up passes below advance the recurrent state: it is put back in between)
                 out = self._act_graph(actor_in, critic_in, noise, persist=traced)
                 if traced:
                     # warm-up: the first persist=True pass ADOPTS the outputs as persistent buffers; only the second one runs the in-place `ttnn.copy`
                     # programs, and a program that is not in the program cache cannot be loaded during capture ("Warm up before capturing a trace")
+                    if saved is not None:  # pass 1 was the real step; pass 2 must start from the state pass 1 started from, so that it ends in the same state
+                        for m, sv in zip((actor, critic), saved):
+                            if m.recurrent:
+                                m.restore_state(sv)
                     out = self._act_graph(actor_in, critic_in, noise, persist=True)
                     self._capture("act", lambda: self._act_graph(actor_in, critic_in, noise, persist=True))
         # Traced: these are the trace's persistent buffers, overwritten by the next replay; `process_env_step` -> `add_transition` copies them into this
@@ -372,6 +417,10 @@ class TTPPO(TraceMixin, PPO):
             # upstream: rewards += gamma * values * time_outs  (the pre-step value V(s_t), see UPSTREAM_SEMANTICS)
             reward = ttnn.add(reward, ttnn.multiply(ttnn.multiply(pending["value"], time_out), self.gamma))
             self.storage.add_transition(reward=reward, done=done, **pending)
+            if self.recurrent:  # upstream `actor.reset(dones)`, `critic.reset(dones)` after every step: the hidden state of the environments that were done is zeroed
+                keep = ttnn.subtract(1.0, done)
+                self.tt_actor.reset_state(keep)
+                self.tt_critic.reset_state(keep)
 
     def _rnd_reward(self, obs: TensorDict) -> Any:
         """The intrinsic reward of one environment step (`TTRND`): stage the new observation and the step's scalars, run the reward graph (replayed from a trace when tracing is on: the first call
@@ -395,7 +444,7 @@ class TTPPO(TraceMixin, PPO):
         critic = self.tt_critic
         with self.timer.section("compute_returns"):
             if not self.trace_enabled:
-                last_values = critic.forward(critic.obs_to_device(obs))[:, 0:1]
+                last_values = critic.forward(critic.obs_to_device(obs), advance=False)[:, 0:1]
                 self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantages=not self.normalize_advantage_per_mini_batch)
                 return
             critic_in = critic.obs_to_device_rm(obs, into=self._buf.get("gae.critic_in"))
@@ -411,24 +460,33 @@ class TTPPO(TraceMixin, PPO):
     def _gae_graph(self, critic_in_rm) -> None:
         """The device ops of `compute_returns` (traced): tilize the last observation, critic forward, GAE, advantage normalisation."""
         ttnn = self.ctx.ttnn
-        last_values = self.tt_critic.forward(ttnn.to_layout(critic_in_rm, ttnn.TILE_LAYOUT))[:, 0:1]
+        last_values = self.tt_critic.forward(ttnn.to_layout(critic_in_rm, ttnn.TILE_LAYOUT), advance=False)[:, 0:1]  # (a recurrent critic's state is not advanced by this call, like upstream's restore)
         self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantages=not self.normalize_advantage_per_mini_batch)
 
     # -- update -------------------------------------------------------------------------------------------------------------
     def _params(self) -> list:
+        """The device parameters in one flat list: actor MLP, actor std (if learned), actor RNN, critic MLP, critic RNN (a model without an RNN contributes none)."""
         a, c = self.tt_actor, self.tt_critic
-        return a.mlp.parameters() + ([a.distribution.param] if a.distribution.learn_std else []) + c.mlp.parameters()
+        return (a.mlp.parameters() + ([a.distribution.param] if a.distribution.learn_std else []) + (a.rnn.parameters() if a.recurrent else [])
+                + c.mlp.parameters() + (c.rnn.parameters() if c.recurrent else []))
 
     def _set_params(self, new: list) -> None:
         a, c = self.tt_actor, self.tt_critic
-        na = len(a.mlp.parameters())
-        a.mlp.set_parameters(new[:na])
-        k = na
+        k = len(a.mlp.parameters())
+        a.mlp.set_parameters(new[:k])
         if a.distribution.learn_std:
             a.distribution.param = self.ctx.put(a.distribution.param, new[k])
             a.distribution.refresh()
             k += 1
-        c.mlp.set_parameters(new[k:])
+        if a.recurrent:
+            n = len(a.rnn.parameters())
+            a.rnn.set_parameters(new[k : k + n])
+            k += n
+        n = len(c.mlp.parameters())
+        c.mlp.set_parameters(new[k : k + n])
+        k += n
+        if c.recurrent:
+            c.rnn.set_parameters(new[k:])
 
     def _loss_names(self) -> tuple:
         """The losses the update logs (upstream's loss dict): value, surrogate, entropy, and RND's / the symmetry's when those extensions are on."""
@@ -464,8 +522,26 @@ class TTPPO(TraceMixin, PPO):
                 old_logp, old_values, returns = batch["old_logp"], batch["old_values"], batch["returns"]
         n_rows = K * rows  # the samples of the PPO losses
         with self.timer.section("update.minibatch.forward"):
-            mean, dist, cache_a = actor.policy_forward_train(actor_obs)  # dist: the distribution itself, or the per-row state of a heteroscedastic one
-            value_out, cache_c = critic.forward_train(critic_obs)
+            if self.recurrent:
+                # the rows of the mini-batch are the T steps of E environments, time-major (row = t E + e): one sequence per environment, the hidden state starts from the one saved at the start
+                # of the rollout and is zeroed after every done step (see rsl_rl_tt/rnn.py); a model without an RNN just runs its MLP on all the rows
+                steps = st.num_transitions_per_env
+                e_rows = rows // steps
+                chunk = lambda t, tensor: tensor[t * e_rows : (t + 1) * e_rows, :]
+                keeps = [ttnn.subtract(1.0, chunk(t, batch["done"])) for t in range(steps)]
+                state0 = lambda m: [h[i * e_rows : (i + 1) * e_rows, :] for h in self._h0[id(m)]]
+                if actor.recurrent:
+                    mean, cache_a = actor.sequence_forward_train([chunk(t, actor_obs) for t in range(steps)], state0(actor), keeps)
+                    dist = actor.distribution
+                else:
+                    mean, dist, cache_a = actor.policy_forward_train(actor_obs)
+                if critic.recurrent:
+                    value_out, cache_c = critic.sequence_forward_train([chunk(t, critic_obs) for t in range(steps)], state0(critic), keeps)
+                else:
+                    value_out, cache_c = critic.forward_train(critic_obs)
+            else:
+                mean, dist, cache_a = actor.policy_forward_train(actor_obs)  # dist: the distribution itself, or the per-row state of a heteroscedastic one
+                value_out, cache_c = critic.forward_train(critic_obs)
             entropy = dist.entropy_dev
         with self.timer.section("update.minibatch.kl_lr"):
             if self.hetero:  # the rollout's std of every sample
@@ -500,12 +576,21 @@ class TTPPO(TraceMixin, PPO):
             ctx.put(acc, ttnn.add(acc, value))
         with self.timer.section("update.minibatch.backward"):
             d_out = ttnn.concat([d_mean, la["d_raw"]], dim=1) if self.hetero else d_mean  # [d mean | d raw std-head output] for the two-head output layer
-            grads_a = [t for pair in actor.mlp.backward(cache_a, d_out) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
+            if self.recurrent and actor.recurrent:
+                mlp_grads, rnn_grads = actor.sequence_backward(cache_a, d_out, keeps)
+                grads_a = [t for pair in mlp_grads for t in pair] + ([la["d_param"]] if dist.learn_std else []) + rnn_grads
+            else:
+                grads_a = [t for pair in actor.mlp.backward(cache_a, d_out) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
             if sym_grads is not None:  # the mirror loss without augmentation went through its own forward: its gradient adds to the actor's MLP gradient
                 grads_a = [ttnn.add(g, h) for g, h in zip(grads_a[: len(sym_grads)], sym_grads)] + grads_a[len(sym_grads) :]
             if self.hetero:
                 ctx.put(self._buf["update.last_std"], ttnn.mean(dist.std, dim=0, keepdim=True, compute_kernel_config=ctx.compute_cfg))
-            grads_c = [t for pair in critic.mlp.backward(cache_c, ttnn.multiply(lc["d_value"], self._col0)) for t in pair]
+            d_value = ttnn.multiply(lc["d_value"], self._col0)
+            if self.recurrent and critic.recurrent:
+                mlp_grads, rnn_grads = critic.sequence_backward(cache_c, d_value, keeps)
+                grads_c = [t for pair in mlp_grads for t in pair] + rnn_grads
+            else:
+                grads_c = [t for pair in critic.mlp.backward(cache_c, d_value) for t in pair]
         if ctx.n_chips > 1:
             # data parallel: every chip computed the gradient of ITS mini-batch; the exchange averages them BEFORE clipping (upstream reduce_parameters: all-reduce /
             # world_size, then clip_grad_norm_), so every chip clips and steps with the same gradient and the replicas stay identical (ADR-0004 A-1)
@@ -548,8 +633,11 @@ class TTPPO(TraceMixin, PPO):
         # one permutation per update, reused by every epoch (upstream mini_batch_generator); drawn on the host (parity mode, H-4); one independent permutation of
         # each chip's own rows (a randperm per rank), the chips' permutations one after the other
         with self.timer.section("update.shuffle_gather"):
-            permutations = torch.cat([torch.randperm(n) for _ in range(ctx.n_chips)])
-            shuffled = st.shuffle(packed, ctx.upload_index(permutations, op="H-4"))
+            if self.recurrent:  # upstream's recurrent generator does not shuffle: mini-batch i = the environments [i E, (i + 1) E), whole trajectories, the same ones in every epoch: a FIXED gather
+                shuffled = st.shuffle(packed, self._rec_perm)
+            else:
+                permutations = torch.cat([torch.randperm(n) for _ in range(ctx.n_chips)])
+                shuffled = st.shuffle(packed, ctx.upload_index(permutations, op="H-4"))
             self._buf["update.table"] = ctx.put(self._buf.get("update.table"), shuffled)
         for name in self._loss_names():
             acc = self._acc("update.acc." + name)

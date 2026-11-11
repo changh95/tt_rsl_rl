@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from rsl_rl_tt.rnn import TTRNN
 from rsl_rl_tt.tt_common import TTContext, linear_from_host, linear_to_host, mask_row, pad_heads, pad_up, pad_vector, stage_obs, unpad_heads
 
 HALF_LOG_2PI = 0.5 * math.log(2.0 * math.pi)
@@ -214,8 +215,8 @@ class TTMLP:
             x = a
         return x, cache
 
-    def backward(self, cache: list, grad_out: Any) -> list[tuple[Any, Any]]:
-        """Hand-written VJP of the Linear + activation stack: returns [(dW [in_p, out_p], db [1, out_p])] per layer.
+    def backward(self, cache: list, grad_out: Any, input_grad: bool = False) -> Any:
+        """Hand-written VJP of the Linear + activation stack: returns [(dW [in_p, out_p], db [1, out_p])] per layer (with `input_grad`: that list and d loss / d input as a pair).
 
         Padding stays inert: padded inputs are zero (so padded rows of dW are zero), grad_out has zero padded columns (masked by the
         caller), and padded weight rows are zero (so no gradient leaks into padded hidden units)."""
@@ -238,9 +239,9 @@ class TTMLP:
             dw = ttnn.matmul(x_in, g, transpose_a=True, compute_kernel_config=cfg)
             db = ttnn.sum(g, dim=0, keepdim=True, compute_kernel_config=cfg)
             grads[i] = (dw, db)
-            if i > 0:
+            if i > 0 or input_grad:
                 g = ttnn.matmul(g, self.layers[i].w, transpose_b=True, compute_kernel_config=cfg)
-        return grads
+        return (grads, g) if input_grad else grads
 
     def parameters(self) -> list:
         """Device parameter tensors in torch order: weight0, bias0, weight1, bias1, ..."""
@@ -518,8 +519,11 @@ class TTMLPModel:
         self.obs_dim_p = pad_up(self.obs_dim)
         self.normalizer = TTEmpiricalNormalization(ctx, mirror.obs_normalizer, self.obs_dim) if mirror.obs_normalization else None
         self.mlp = TTMLP(ctx, mirror.mlp)
-        if self.mlp.in_features != self.obs_dim:
-            raise NotImplementedError("only plain MLP models (mlp input == concatenated obs) are in the v1 scope")
+        self.recurrent = bool(getattr(mirror, "is_recurrent", False))
+        self.rnn = TTRNN(ctx, mirror.rnn) if self.recurrent else None  # GRU / LSTM between the normalised observations and the MLP head (`RNNModel`)
+        self.state: list = []  # the hidden state of a recurrent model: persistent [rows, H_p] tensors per layer (GRU) / (h, c) per layer (LSTM), see `allocate_state`
+        if self.mlp.in_features != (self.rnn.hidden if self.recurrent else self.obs_dim):
+            raise NotImplementedError("only plain MLP models (mlp input == concatenated obs) and RNN models (mlp input == rnn hidden) are supported")
         self.distribution = _make_distribution(ctx, mirror.distribution)
         self.output_dim = self.distribution.dim if self.distribution is not None else self.mlp.out_features
         self.output_dim_p = pad_up(self.output_dim)
@@ -545,9 +549,52 @@ class TTMLPModel:
     def latent(self, obs_dev: Any) -> Any:
         return self.normalizer.forward(obs_dev) if self.normalizer is not None else obs_dev
 
-    def forward(self, obs_dev: Any) -> Any:
-        """MLP output on device ([rows, out_p]): the distribution mean for an actor, the value (column 0) for a critic."""
-        return self.mlp.forward(self.latent(obs_dev))
+    def allocate_state(self, rows: int) -> None:
+        """The persistent hidden state of a recurrent model (zeros: upstream starts from `None`, which the RNN treats as zeros); allocated before any trace can be captured (T-15)."""
+        if self.recurrent:
+            self.state = self.rnn.zero_state(rows)
+
+    def snapshot_state(self) -> list:
+        ttnn = self.ctx.ttnn
+        return [ttnn.multiply(s, 1.0) for s in self.state]
+
+    def restore_state(self, saved: list) -> None:
+        self.state = [self.ctx.put(s, v) for s, v in zip(self.state, saved)]
+
+    def reset_state(self, keep: Any) -> None:
+        """Upstream `reset(dones)`: the hidden state of the environments that were done is zeroed (`keep` = 1 - done, [rows, 1]); in place."""
+        if self.recurrent:
+            ttnn = self.ctx.ttnn
+            self.state = [self.ctx.put(s, ttnn.multiply(s, keep)) for s in self.state]
+
+    def forward(self, obs_dev: Any, advance: bool = True) -> Any:
+        """MLP output on device ([rows, out_p]): the distribution mean for an actor, the value (column 0) for a critic. A recurrent model takes one step from its hidden state (`advance`: the state
+        is updated IN PLACE; without it the step is computed and the state is left alone, like upstream's critic call in `compute_returns` that restores the state)."""
+        if not self.recurrent:
+            return self.mlp.forward(self.latent(obs_dev))
+        h_top, new = self.rnn.step(self.latent(obs_dev), self.state)
+        if advance:
+            self.state = [self.ctx.put(s, v) for s, v in zip(self.state, new)]
+        return self.mlp.forward(h_top)
+
+    def sequence_forward_train(self, obs_steps: list, state0: list, keeps: list) -> tuple[Any, Any]:
+        """Training forward over a whole sequence: `obs_steps[t]` = raw observations of step t ([E, d_p]), `state0` the state at the start (a list like `state`), `keeps[t]` = 1 - done of step t.
+        Returns (MLP output of ALL steps stacked along the rows [T E, out_p], cache for `sequence_backward`)."""
+        ttnn = self.ctx.ttnn
+        outs, rnn_cache = self.rnn.forward_sequence([self.latent(o) for o in obs_steps], state0, keeps)
+        latent = outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=0)
+        out, mlp_cache = self.mlp.forward_train(latent)
+        return out, (mlp_cache, rnn_cache, len(outs))
+
+    def sequence_backward(self, cache: Any, d_out: Any, keeps: list) -> tuple[list, list]:
+        """(gradients of the MLP head [(dW, db)] per layer, gradients of the RNN parameters in `rnn.parameters()` order) for d loss / d output of all steps."""
+        ttnn = self.ctx.ttnn
+        mlp_cache, rnn_cache, steps = cache
+        mlp_grads, d_latent = self.mlp.backward(mlp_cache, d_out, input_grad=True)
+        rows = d_latent.shape[0] // steps
+        d_steps = [d_latent[t * rows : (t + 1) * rows, :] for t in range(steps)]
+        rnn_grads, _ = self.rnn.backward_sequence(rnn_cache, d_steps, keeps)
+        return mlp_grads, rnn_grads
 
     def forward_train(self, obs_dev: Any) -> tuple[Any, list]:
         return self.mlp.forward_train(self.latent(obs_dev))
@@ -580,6 +627,8 @@ class TTMLPModel:
         if self.normalizer is not None:
             self.normalizer.sync_from_torch()
         self.mlp.sync_from_torch()
+        if self.rnn is not None:
+            self.rnn.sync_from_torch()
         if self.distribution is not None:
             self.distribution.sync_from_torch()
 
@@ -587,5 +636,7 @@ class TTMLPModel:
         if self.normalizer is not None:
             self.normalizer.sync_to_torch()
         self.mlp.sync_to_torch()
+        if self.rnn is not None:
+            self.rnn.sync_to_torch()
         if self.distribution is not None:
             self.distribution.sync_to_torch()
