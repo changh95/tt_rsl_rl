@@ -3,6 +3,13 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-12 — Demo (not a phase, branch `tt/demo-humanoid`): MuJoCo humanoid walking, CPU simulation + TT training
+**Done**: `rsl_rl_tt/demos/` (`MujocoHumanoidVecEnv`: Gymnasium Humanoid-v5 task as an rsl_rl `VecEnv` with Isaac Lab conventions, thousands of environments stepped by MuJoCo's multithreaded `rollout`, 165 k env-steps/s on 64 threads;
+`humanoid_cfg.py`), `scripts/train_humanoid_demo.py` / `render_humanoid_demo.py` / `plot_humanoid_curves.py`, 8 host tests (`tests/tt/test_mujoco_humanoid.py`: conventions, determinism, reward formula, rollout == plain `mj_step` to 5e-8,
+fall / time-out / auto-reset, private RNG, a short upstream-PPO training), dependency `gymnasium[mujoco]==1.4.0` (ENV.md). Result (`docs/porting/demo_humanoid/README.md`): TT, one chip, 4096 envs, 600 iterations (59 M samples, 13.3 min):
+the humanoid stands up at iteration ~121 and then runs at 2.75 m/s (deterministic evaluation 2.9 m/s, 0 falls in 256 episodes); upstream PPO on the CPU learns the same way (same curve against the iteration) at 3.73 s per iteration against 1.33 s
+(training part 2.78 s vs 0.43 s). The CPU simulation is 68 % of the TT run. One seed; not merged to `main` (main only moves at phase completion, BRIEF 2-10).
+
 ## 2026-11-12 — Phase 7 DONE on the TT host: environment bridge, scripts and runbook; Isaac Lab itself NOT run (no GPU host / Isaac Lab available)
 **Done**
 - `rsl_rl_tt/bridge/` (ADR-0003 plan as accepted: ZeroMQ + raw float32 buffers): `protocol.py` (JSON header + raw buffers, numpy only), `server.py` (`serve(env, endpoint, agent_cfg=...)` for any rsl_rl-style env, e.g. Isaac Lab's
