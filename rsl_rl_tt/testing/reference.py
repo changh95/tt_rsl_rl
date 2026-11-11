@@ -13,7 +13,7 @@ import time
 import torch
 from dataclasses import dataclass
 
-from rsl_rl.runners import OnPolicyRunner
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 from rsl_rl_tt.testing.envs import ENV_CLASSES, make_env
 
 CSV_LOGGER = {"class_name": "rsl_rl_tt.testing.csv_writer:CsvLogWriter"}
@@ -85,6 +85,56 @@ def with_symmetry(env_name: str, spec: RefSpec, **kwargs) -> RefSpec:
     return dataclasses.replace(spec, algorithm={**spec.algorithm, "symmetry_cfg": symmetry_cfg(env_name, **kwargs)})
 
 
+# ---- distillation (Phase 8.4) -----------------------------------------------------------------------------------------------------------------
+# a student that sees the `policy` group imitates a teacher: the teacher of tracking12 also sees `privileged` (the usual asymmetric setting), the others see `policy`
+DISTILL_GROUPS = {
+    "cartpole": {"student": ["policy"], "teacher": ["policy"]},
+    "pendulum": {"student": ["policy"], "teacher": ["policy"]},
+    "tracking12": {"student": ["policy"], "teacher": ["policy", "privileged"]},
+}
+DISTILL_ITERATIONS = {"cartpole": 60, "pendulum": 100, "tracking12": 100}  # iterations of the end-to-end distillation runs (the student reaches the teacher's return well before the RL runs' counts)
+TEACHER_ITERATIONS = {"cartpole": 60, "pendulum": 100, "tracking12": 100}  # the upstream CPU PPO runs that make the teachers
+_DISTILLATION = {"class_name": "Distillation", "num_learning_epochs": 2, "gradient_length": 6, "learning_rate": 1.0e-3, "max_grad_norm": 1.0, "loss_type": "mse", "optimizer": "adam"}
+
+
+def teacher_train_cfg(env_name: str) -> dict:
+    """The RL configuration that trains the teacher of `env_name`: the standard spec with the teacher's observation groups as the ACTOR's (so its `actor_state_dict` loads into the teacher)."""
+    spec = dataclasses.replace(REF_SPECS[env_name], obs_groups={"actor": list(DISTILL_GROUPS[env_name]["teacher"]), "critic": list(ENV_CLASSES[env_name].obs_groups_cfg["critic"])})
+    return make_train_cfg(env_name, spec)
+
+
+def make_distill_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | None = CSV_LOGGER, algorithm: dict | None = None, hidden: tuple | None = None) -> dict:
+    """`DistillationRunner` configuration for `env_name`: the student and the teacher are MLP models of the spec's size (the teacher must match the RL actor it is loaded from)."""
+    spec = spec or REF_SPECS[env_name]
+    dist = {"class_name": spec.distribution, "init_std": spec.init_std, "std_type": spec.std_type}
+    model = {"class_name": "MLPModel", "hidden_dims": list(hidden or spec.hidden), "activation": "elu", "obs_normalization": spec.obs_normalization, "distribution_cfg": dist}
+    cfg = {
+        "num_steps_per_env": spec.num_steps,
+        "save_interval": 10_000,
+        "check_for_nan": True,
+        "obs_groups": copy.deepcopy(DISTILL_GROUPS[env_name]),
+        "student": copy.deepcopy(model),
+        "teacher": copy.deepcopy(model),
+        "algorithm": {**_DISTILLATION, **(algorithm or {})},
+    }
+    if logger is not None:
+        cfg["logger"] = dict(logger)
+    return cfg
+
+
+def make_teacher_checkpoint(env_name: str, path: str, seed: int = 0, iterations: int = 30, num_envs: int = 256) -> str:
+    """Train a teacher with the UNMODIFIED upstream PPO on the CPU for `iterations` iterations and save the checkpoint (`actor_state_dict` loads into a distillation teacher)."""
+    torch.manual_seed(seed)
+    spec = dataclasses.replace(REF_SPECS[env_name], num_envs=num_envs, iterations=iterations)
+    env = make_env(env_name, num_envs, seed=seed)
+    cfg = teacher_train_cfg(env_name)
+    cfg["num_steps_per_env"] = spec.num_steps
+    runner = OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
+    runner.learn(num_learning_iterations=iterations, init_at_random_ep_len=True)
+    runner.save(path)
+    return path
+
+
 def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | None = CSV_LOGGER) -> dict:
     spec = spec or REF_SPECS[env_name]
     dist = {"class_name": spec.distribution, "init_std": spec.init_std, "std_type": spec.std_type}
@@ -144,3 +194,37 @@ def train_reference(
             runner.alg.release_traces()  # the next run builds a new TTPPO on the same mesh (it refuses to while captured traces are alive, T-15)
     wall = time.time() - t0
     return {"env": env_name, "seed": seed, "backend": "tt" if tt else "upstream-cpu", "iterations": n_it, "wall_s": wall, "num_threads": torch.get_num_threads(), "num_envs": spec.num_envs, "num_steps": spec.num_steps}
+
+
+# ---- distillation runs ----------------------------------------------------------------------------------------------------------------------------
+def build_distillation_runner(env_name: str, seed: int, log_dir: str | None, teacher_ckpt: str, *, tt: bool = False, tt_cfg: dict | None = None, algorithm: dict | None = None,
+                              spec: RefSpec | None = None, num_envs: int | None = None):
+    """Seed torch and the env, build env + the UNMODIFIED upstream `DistillationRunner` (device cpu) and load the teacher from `teacher_ckpt` (an RL checkpoint: `actor_state_dict`).
+    tt=True swaps only the algorithm class (`rsl_rl_tt.distillation:TTDistillation`, `tt_cfg` e.g. {"trace": True}). Returns (runner, env, spec)."""
+    spec = spec or REF_SPECS[env_name]
+    torch.manual_seed(seed)
+    env = make_env(env_name, num_envs or spec.num_envs, seed=seed)
+    cfg = make_distill_cfg(env_name, spec, algorithm=algorithm)
+    if tt:
+        cfg["algorithm"]["class_name"] = "rsl_rl_tt.distillation:TTDistillation"
+        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": test_mesh_shape(), **(tt_cfg or {})}
+    runner = DistillationRunner(env, cfg, log_dir=log_dir, device="cpu")
+    runner.load(teacher_ckpt, map_location="cpu")  # an RL checkpoint: only the teacher is loaded (upstream's rule)
+    return runner, env, spec
+
+
+def train_distillation(env_name: str, seed: int, log_dir: str, teacher_ckpt: str, iterations: int | None = None, spec: RefSpec | None = None, num_threads: int | None = None,
+                       tt: bool = False, tt_cfg: dict | None = None, algorithm: dict | None = None) -> dict:
+    """Distil `teacher_ckpt` into a student with the unmodified upstream runner (algorithm = upstream `Distillation`, or `TTDistillation` with tt=True); metrics in `log_dir/metrics.csv`."""
+    if num_threads is not None:
+        torch.set_num_threads(num_threads)
+    os.makedirs(log_dir, exist_ok=True)
+    runner, _, spec = build_distillation_runner(env_name, seed, log_dir, teacher_ckpt, tt=tt, tt_cfg=tt_cfg, algorithm=algorithm, spec=spec)
+    n_it = iterations if iterations is not None else spec.iterations
+    t0 = time.time()
+    try:
+        runner.learn(num_learning_iterations=n_it, init_at_random_ep_len=True)
+    finally:
+        if tt and hasattr(runner.alg, "release_traces"):
+            runner.alg.release_traces()
+    return {"env": env_name, "seed": seed, "backend": "tt" if tt else "upstream-cpu", "iterations": n_it, "wall_s": time.time() - t0, "num_threads": torch.get_num_threads(), "num_envs": spec.num_envs, "num_steps": spec.num_steps}

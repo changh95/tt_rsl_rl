@@ -1,0 +1,98 @@
+{
+  "rsl_rl_tag": "v5.5.2",
+  "distribution": "GaussianDistribution",
+  "std_type": "scalar",
+  "rnd": false,
+  "symmetry": false,
+  "distillation": true,
+  "torch": "2.11.0+cpu",
+  "python": "3.10.12",
+  "machine": {
+    "cpu_count": 64,
+    "threads_per_run": 8,
+    "parallel_runs": 3,
+    "platform": "Linux-6.8.0-107-generic-x86_64-with-glibc2.35"
+  },
+  "final_window_iterations": 10,
+  "total_wall_s": 44.2,
+  "envs": {
+    "cartpole": {
+      "num_envs": 1024,
+      "num_steps_per_env": 24,
+      "seeds": {
+        "0": {
+          "iterations": 60,
+          "wall_s": 5.5,
+          "final_reward": 500.0,
+          "first_reward": 22.08
+        },
+        "1": {
+          "iterations": 60,
+          "wall_s": 5.2,
+          "final_reward": 500.0,
+          "first_reward": 22.06
+        },
+        "2": {
+          "iterations": 60,
+          "wall_s": 5.4,
+          "final_reward": 500.0,
+          "first_reward": 22.38
+        }
+      },
+      "final_reward_mean": 500.0,
+      "final_reward_std": 0.0
+    },
+    "pendulum": {
+      "num_envs": 1024,
+      "num_steps_per_env": 32,
+      "seeds": {
+        "0": {
+          "iterations": 100,
+          "wall_s": 11.5,
+          "final_reward": -235.90809635591506,
+          "first_reward": -131.13423543930054
+        },
+        "1": {
+          "iterations": 100,
+          "wall_s": 11.8,
+          "final_reward": -228.71758786690236,
+          "first_reward": -124.6281810182333
+        },
+        "2": {
+          "iterations": 100,
+          "wall_s": 11.7,
+          "final_reward": -234.40269011306762,
+          "first_reward": -154.15993552684785
+        }
+      },
+      "final_reward_mean": -233.0094581119617,
+      "final_reward_std": 3.0964145544290598
+    },
+    "tracking12": {
+      "num_envs": 2048,
+      "num_steps_per_env": 24,
+      "seeds": {
+        "0": {
+          "iterations": 100,
+          "wall_s": 24.4,
+          "final_reward": 153.95886656951905,
+          "first_reward": 3.571949196457863
+        },
+        "1": {
+          "iterations": 100,
+          "wall_s": 25.1,
+          "final_reward": 154.75514317321776,
+          "first_reward": 4.023099375963211
+        },
+        "2": {
+          "iterations": 100,
+          "wall_s": 24.8,
+          "final_reward": 154.14778671264648,
+          "first_reward": 3.171074794232845
+        }
+      },
+      "final_reward_mean": 154.28726548512776,
+      "final_reward_std": 0.33971051733218793
+    }
+  }
+}

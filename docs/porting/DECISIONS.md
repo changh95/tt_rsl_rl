@@ -256,6 +256,12 @@ KMD 2.10.0 and this hardware is verified by the first device job.
 * **A new tolerance row, `update_symmetry_loss` 5e-2** (measured <= 1.56e-2; root cause in `TOLERANCES.md`: the mirror loss is the mean squared difference of two actor outputs, so its relative error is the matmul floor over the small difference). The exactness of the gradient formulas is tested on the SMOOTH objective for one step (the mirrored copies' ratios spread far from 1, so the clipped objective sits on the
   gates, where forward noise flips them: the standard whole-update limit applies there), as in v1.
 
+### ADR-0007 amendment A-4 — 8.4 distillation (2026-11-11, assistant; the owner can veto)
+* **Design** (details in `POST_V1.md`): `TTDistillation` replaces upstream's `Distillation` the way `TTPPO` replaces `PPO` (the unmodified `DistillationRunner`, the torch student / teacher as mirrors, student and teacher on the device, the whole update on the device). No new allow-list entry: the transfers are the existing ones (the student's observations H-1, the noise H-4, the actions H-2, the loss H-5, the mirror syncs H-6, Adam's scalars H-8).
+* **Gradient accumulation is part of the contract**: upstream sums the LOSSES of a window before one backward pass, so the device sums the per-step GRADIENTS (verified against autograd, `test_the_gradient_is_the_sum_of_the_per_step_gradients_not_their_mean`), and it keeps upstream's step counter across epochs and its leftover steps.
+* **Two new tolerance rows with measured bases** (`TOLERANCES.md`): `update_behavior_loss` 2e-2 (measured <= 6.8e-3) and `distill_many_steps` 3e-2 (measured <= 1.6e-2). The second is NOT a loosening of the PPO rows: a smooth regression loss has a CONSISTENT gradient, so the noise-floor sign flips of the first Adam step are never averaged out (measured window by window: they appear in the first step and stay the same size);
+  updates of one or two Adam steps keep the strict noise-baseline limit. The noise baseline of these tests injects the matmul-sized noise at the output of every linear layer of upstream's student (the gradient of a regression shrinks as the student learns, the forward noise does not).
+
 ## Host-computation allow-list (BRIEF 2-8)
 *H-7 (temporary host rollout storage, Phase 2) was retired on 2026-11-11: storage, GAE and mini-batches are on the device since Phase 3.*
 Silent torch/host fallbacks on the TT path are forbidden. Only the items below may run on the host. Each is counted by a

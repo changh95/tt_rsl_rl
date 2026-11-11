@@ -31,14 +31,12 @@ from rsl_rl_tt.modules import TTMLPModel
 from rsl_rl_tt.optim import TTAdam, TTAdaptiveLR, clip_grad_norm
 from rsl_rl_tt.rnd import TTRND
 from rsl_rl_tt.symmetry import TTSymmetry
+from rsl_rl_tt.traced import CAPTURED_TRACES as _CAPTURED_TRACES, TraceMixin
 from rsl_rl_tt.storage import TTRolloutStorage
 from rsl_rl_tt.tt_common import SectionTimer, TTContext, pack_step_scalars, pad_matrix, pad_vector, unit_row
 
 
-_CAPTURED_TRACES: dict[int, int] = {}  # id(TrayMesh) -> number of live captured traces on that mesh (guard against the T-15 overwrite hazard)
-
-
-class TTPPO(PPO):
+class TTPPO(TraceMixin, PPO):
     """PPO on the tray mesh (a single chip until Phase 6)."""
 
     def __init__(self, actor, critic, storage, *, tt_cfg: dict | None = None, **kwargs) -> None:
@@ -274,38 +272,6 @@ class TTPPO(PPO):
             self.rnd_tt.set_training(False)
 
     # -- rollout ------------------------------------------------------------------------------------------------------------
-    def _capture(self, name: str, fn) -> None:
-        """Record `fn()` (device ops only, persistent tensors, every program already in the program cache) as a trace; the ops are recorded, not executed.
-
-        Whatever happens inside, the capture is ALWAYS ended (an exception that left it open made every later read fail with "Reads are not supported
-        during trace capture" and hung the process until the job timeout: docs/porting/incidents/2026-11-11_trace_capture_left_open.md)."""
-        ttnn = self.ctx.ttnn
-        trace_id = ttnn.begin_trace_capture(self.ctx.mesh, cq_id=0)
-        self.timer.paused = True  # the profiling timer synchronises the device, which is not allowed inside a capture
-        try:
-            fn()
-        except BaseException:
-            try:
-                ttnn.end_trace_capture(self.ctx.mesh, trace_id, cq_id=0)
-                ttnn.release_trace(self.ctx.mesh, trace_id)
-            except BaseException as exc:
-                print(f"rsl_rl_tt.ppo: could not end the failed trace capture cleanly: {exc!r}", file=__import__("sys").stderr)
-            raise
-        finally:
-            self.timer.paused = False
-        ttnn.end_trace_capture(self.ctx.mesh, trace_id, cq_id=0)
-        self._traces[name] = trace_id
-        _CAPTURED_TRACES[id(self.tray)] = _CAPTURED_TRACES.get(id(self.tray), 0) + 1
-
-    def _replay(self, name: str) -> None:
-        self.ctx.ttnn.execute_trace(self.ctx.mesh, self._traces[name], cq_id=0, blocking=False)
-
-    def release_traces(self) -> None:
-        for trace_id in self._traces.values():
-            self.ctx.ttnn.release_trace(self.ctx.mesh, trace_id)
-        _CAPTURED_TRACES[id(self.tray)] = _CAPTURED_TRACES.get(id(self.tray), 0) - len(self._traces)
-        self._traces.clear()
-
     def _act_graph(self, actor_in, critic_in, noise, persist: bool) -> dict:
         """The device ops of one act step (forward passes, sample, log-prob, value).
 

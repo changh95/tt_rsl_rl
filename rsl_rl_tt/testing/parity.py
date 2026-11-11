@@ -58,6 +58,7 @@ TOLERANCES: dict[str, Tol] = {
     "rnd_intrinsic_reward": Tol("RND intrinsic reward: length of the difference of two MLP embeddings (untrained predictor), scaled", rel_fro=8e-3, doc_tokens=("**8e-3**",)),
     "rnd_predictor_loss": Tol("RND predictor loss (MSE of the two embeddings) of one mini-batch / the mean over an update", rel_fro=1.6e-2, doc_tokens=("**1.6e-2**",)),
     "update_symmetry_loss": Tol("PPO.update mirror loss (MSE between the actor's mean on mirrored observations and the mirrored mean on the originals; mean over the update's mini-batches)", rel_fro=5e-2, doc_tokens=("**5e-2**",)),
+    "update_behavior_loss": Tol("Distillation.update behaviour-cloning loss (mean over the update's steps)", rel_fro=2e-2, doc_tokens=("**2e-2**",)),
     "rnd_reward_stats": Tol("RND reward normalizer: running mean / var / std of the discounted reward sum after a few steps", rel_fro=1.8e-2, doc_tokens=("**1.8e-2**",)),
 }
 
@@ -186,6 +187,7 @@ UPDATE_TOLERANCES = {
     "full_update_clipped": 8e-2,  # one full update (20 Adam steps) of the clipped objective: the discontinuous clip gates make a few samples take the other branch
     "drift20_smooth": 3e-2,  # 20 consecutive updates on identical data, smooth objective (clip_param = 1e3, unclipped value loss)
     "drift20_clipped": 2.5e-1,  # the same with the standard clipped objective
+    "distill_many_steps": 3e-2,  # Phase 8.4: a distillation update with >= 3 Adam steps on a smooth regression loss with consistent gradients (the noise-floor sign flips of the first step stay and compound)
 }
 
-UPDATE_TOLERANCE_DOC = {"full_update_clipped": "**8e-2**", "drift20_smooth": "**3e-2**", "drift20_clipped": "**2.5e-1**"}  # how TOLERANCES.md prints them
+UPDATE_TOLERANCE_DOC = {"full_update_clipped": "**8e-2**", "drift20_smooth": "**3e-2**", "drift20_clipped": "**2.5e-1**", "distill_many_steps": "**3e-2**"}  # how TOLERANCES.md prints them
