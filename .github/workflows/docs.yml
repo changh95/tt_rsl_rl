@@ -1,11 +1,8 @@
 name: Docs
 
+# CI is switched off in this fork (owner request, 2026-11-11: the upstream workflows only produced failure e-mails).
+# Run it by hand from the Actions tab if needed; to switch it back on restore the `push` / `pull_request` triggers of upstream.
 on:
-  push:
-    branches:
-      - main
-      - extras
-  pull_request:
   workflow_dispatch:
 
 permissions:
