@@ -73,6 +73,9 @@ scripts/tt_run.sh --chips 16 --timeout 900 --tag p7 -- python -m pytest -m tt te
 scripts/tt_run.sh --chips 16 --timeout 7200 --tag humanoid -- python scripts/train_humanoid_demo.py --backend tt --envs 4096 --iterations 600 --out docs/porting/demo_humanoid/tt_1chip
 MUJOCO_GL=egl python scripts/render_humanoid_demo.py --checkpoints random .run/humanoid/tt_1chip/model_150.pt .run/humanoid/tt_1chip/model_599.pt --out docs/porting/demo_humanoid/walk.gif
 MUJOCO_GL=egl python scripts/render_humanoid_demo.py --checkpoints random .run/humanoid/tt_1chip/model_150.pt .run/humanoid/tt_1chip/model_599.pt --seconds 15 --fps 33 --size 352 480 --no-eval --video docs/porting/demo_humanoid/walk.mp4
+# Demo 2 (branch tt/demo-g1): Unitree G1 walking on command, MuJoCo on the CPU, PPO on all eight chips (docs/porting/demo_g1/README.md)
+scripts/fetch_g1_model.sh && scripts/tt_run.sh --timeout 14400 --tag g1 -- python scripts/train_g1_demo.py --mesh 2x4 --envs 4096 --iterations 1500 --out docs/porting/demo_g1/tt_8chips
+MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_200.pt .run/g1/tt_8chips/model_1499.pt --video docs/porting/demo_g1/g1.mp4
 # MULTI-CHIP RULE (ADR-0004): chip-local loss / advantage normalisation / shuffle, gradients and KL averaged over the chips (gather + fp32 sum, never ttnn.all_reduce), global normalizer statistics.
 # TRACED-PATH RULE (TTNN_ISSUES T-15): everything that keeps a value across trace replays is allocated BEFORE the first capture; one TTPPO per process.
 

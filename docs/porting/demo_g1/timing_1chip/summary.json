@@ -1,0 +1,25 @@
+{
+  "backend": "tt 1x1 (traced, 1 chips)",
+  "num_envs": 4096,
+  "steps_per_iteration": 24,
+  "iterations": 60,
+  "samples": 5898240,
+  "hidden": [
+    512,
+    256,
+    128
+  ],
+  "seed": 0,
+  "wall_s": 80.8,
+  "seconds_per_iteration": 1.346,
+  "cpu_simulation_s": 50.0,
+  "algorithm_s": 30.8,
+  "final": {
+    "Train/mean_reward": 9.582,
+    "Train/mean_episode_length": 292.734,
+    "Metrics/forward_speed": 0.132,
+    "Metrics/command_vx": 0.559,
+    "Episode_Termination/fell": 1.0
+  },
+  "env_threads": 60
+}

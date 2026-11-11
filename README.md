@@ -33,6 +33,14 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 policy is trained by PPO on the chip through the unmodified upstream `OnPolicyRunner`: 600 iterations (59 M samples, 13 min) take it from falling after ~27 steps to running at 2.9 m/s without a fall.
 Upstream PPO on the CPU learns the same way but needs 3.7 s per iteration instead of 1.3 s (one seed per backend; a demonstration, not a benchmark).
 
+## Demo: a Unitree G1 learns to walk on command, trained on all eight chips
+
+[![untrained / iteration 201 / iteration 1500](docs/porting/demo_g1/g1.gif)](docs/porting/demo_g1/g1.mp4)
+
+**[Video (MP4, 20 s, real time)](docs/porting/demo_g1/g1.mp4)** · [details, numbers and how to reproduce](docs/porting/demo_g1/README.md). The G1 model of MuJoCo Menagerie, 4096 robots simulated on the CPU, PPO on the whole 2x4 tray: 1500
+iterations (147 M samples, 28 min) take it from falling after 1.6 s to following velocity commands (0.4 / 0.8 m/s, turning) without a fall (0.39 / 0.78 m/s achieved). The training part of an iteration takes 0.27 s on eight
+chips against 3.05 s for upstream PPO on the CPU; the CPU simulation (76 % of the time) is the bottleneck now. Simulation only, one seed.
+
 ---
 
 # Original rsl_rl README (upstream, unchanged)

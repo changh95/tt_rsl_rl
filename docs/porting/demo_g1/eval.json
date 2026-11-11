@@ -1,0 +1,101 @@
+[
+  {
+    "label": "untrained",
+    "checkpoint": "random",
+    "by_command": [
+      {
+        "command_vx": 0.4,
+        "command_wz": 0.0,
+        "mean_vx": 1.06096621004616,
+        "mean_yaw_rate": 0.10564373097764708,
+        "episodes_finished": 1977,
+        "fell_fraction": 1.0,
+        "steps": 600
+      },
+      {
+        "command_vx": 0.8,
+        "command_wz": 0.0,
+        "mean_vx": 1.047187738823417,
+        "mean_yaw_rate": 0.12369428946183957,
+        "episodes_finished": 1982,
+        "fell_fraction": 1.0,
+        "steps": 600
+      },
+      {
+        "command_vx": 0.5,
+        "command_wz": 0.4,
+        "mean_vx": 1.0378147848347954,
+        "mean_yaw_rate": 0.10994194908362293,
+        "episodes_finished": 1978,
+        "fell_fraction": 1.0,
+        "steps": 600
+      }
+    ]
+  },
+  {
+    "label": "iteration 201",
+    "checkpoint": ".run/g1/tt_8chips/model_200.pt",
+    "by_command": [
+      {
+        "command_vx": 0.4,
+        "command_wz": 0.0,
+        "mean_vx": 0.3685811354570459,
+        "mean_yaw_rate": -0.016007808650911705,
+        "episodes_finished": 0,
+        "fell_fraction": 0.0,
+        "steps": 600
+      },
+      {
+        "command_vx": 0.8,
+        "command_wz": 0.0,
+        "mean_vx": 0.7599933178390538,
+        "mean_yaw_rate": 0.012726837820194514,
+        "episodes_finished": 0,
+        "fell_fraction": 0.0,
+        "steps": 600
+      },
+      {
+        "command_vx": 0.5,
+        "command_wz": 0.4,
+        "mean_vx": 0.46100362651921317,
+        "mean_yaw_rate": 0.3243750937642843,
+        "episodes_finished": 0,
+        "fell_fraction": 0.0,
+        "steps": 600
+      }
+    ]
+  },
+  {
+    "label": "iteration 1500",
+    "checkpoint": ".run/g1/tt_8chips/model_1499.pt",
+    "by_command": [
+      {
+        "command_vx": 0.4,
+        "command_wz": 0.0,
+        "mean_vx": 0.39436378997922555,
+        "mean_yaw_rate": 0.006276321842177259,
+        "episodes_finished": 0,
+        "fell_fraction": 0.0,
+        "steps": 600
+      },
+      {
+        "command_vx": 0.8,
+        "command_wz": 0.0,
+        "mean_vx": 0.7817579662764672,
+        "mean_yaw_rate": 0.005681822777454702,
+        "episodes_finished": 0,
+        "fell_fraction": 0.0,
+        "steps": 600
+      },
+      {
+        "command_vx": 0.5,
+        "command_wz": 0.4,
+        "mean_vx": 0.5130367017094245,
+        "mean_yaw_rate": 0.37561518360019636,
+        "episodes_finished": 0,
+        "fell_fraction": 0.0,
+        "steps": 600
+      }
+    ]
+  }
+]
