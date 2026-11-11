@@ -18,6 +18,8 @@ H-5 per-iteration scalars for logging, H-8 tiny per-step scalar tensors (Adam bi
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from tensordict import TensorDict
 from torch.distributions import Normal
@@ -27,6 +29,7 @@ from rsl_rl_tt.device import acquire_tray_mesh
 from rsl_rl_tt.losses import PPOLosses
 from rsl_rl_tt.modules import TTMLPModel
 from rsl_rl_tt.optim import TTAdam, TTAdaptiveLR, clip_grad_norm
+from rsl_rl_tt.rnd import TTRND
 from rsl_rl_tt.storage import TTRolloutStorage
 from rsl_rl_tt.tt_common import SectionTimer, TTContext, pack_step_scalars, pad_matrix, pad_vector, unit_row
 
@@ -38,8 +41,8 @@ class TTPPO(PPO):
     """PPO on the tray mesh (a single chip until Phase 6)."""
 
     def __init__(self, actor, critic, storage, *, tt_cfg: dict | None = None, **kwargs) -> None:
-        if kwargs.get("rnd_cfg") or kwargs.get("symmetry_cfg"):
-            raise NotImplementedError("RND and symmetry extensions are outside the v1 scope of the TT port")
+        if kwargs.get("symmetry_cfg"):
+            raise NotImplementedError("the symmetry extension is not implemented in the TT port yet (post-v1 item 8.3)")
         if kwargs.get("multi_gpu_cfg") is not None:
             raise NotImplementedError("rsl_rl's torch.distributed multi-GPU mode is replaced by the mesh data-parallel design (Phase 6)")
         if getattr(actor, "is_recurrent", False) or getattr(critic, "is_recurrent", False):
@@ -83,9 +86,18 @@ class TTPPO(PPO):
             raise ValueError("the actor needs a distribution_cfg (GaussianDistribution or HeteroscedasticGaussianDistribution)")
         self.hetero = self.tt_actor.distribution.per_row  # state-dependent std: the std head is part of the actor MLP and every sample has its own std
         share = self.tt_actor.obs_groups == self.tt_critic.obs_groups
+        self.rnd_tt: TTRND | None = None  # Random Network Distillation (the mirror is `self.rnd`, built by upstream's PPO.__init__ from rnd_cfg)
+        self.intrinsic_rewards = None  # the runner reads the last step's intrinsic reward (a host tensor [num_envs]) after every process_env_step when RND is on
+        rnd_source, rnd_dim_p = None, 0
+        if self.rnd is not None:
+            self.rnd_tt = TTRND(self.ctx, self.rnd, storage.num_envs)
+            rnd_source = "actor" if self.rnd_tt.groups == self.tt_actor.obs_groups else "critic" if self.rnd_tt.groups == self.tt_critic.obs_groups else "own"
+            rnd_dim_p = self.rnd_tt.state_dim_p
+            if rnd_source == "own":
+                self.rnd_tt.allocate_act_buffers()
         self.storage = TTRolloutStorage(  # replaces the host RolloutStorage that upstream's construct_algorithm built
             self.ctx, storage.num_envs, storage.num_transitions_per_env, self.tt_actor.obs_dim_p, self.tt_critic.obs_dim_p, self.tt_actor.distribution.dim_p, share,
-            persistent=self.trace_enabled, store_std=self.hetero,
+            persistent=self.trace_enabled, store_std=self.hetero, rnd_dim_p=rnd_dim_p, rnd_source=rnd_source,
         )
         self.losses = PPOLosses(
             self.ctx, clip_param=self.clip_param, value_loss_coef=self.value_loss_coef, entropy_coef=self.entropy_coef, use_clipped_value_loss=self.use_clipped_value_loss
@@ -99,7 +111,7 @@ class TTPPO(PPO):
         # value across replays must be allocated BEFORE the first capture. Here: Adam moments, loss accumulators, the rollout storage slots (and the
         # constants of storage / losses / distribution created above). Buffers that are rewritten before every use (update.table, act inputs) are exempt.
         self.adam: TTAdam | None = TTAdam(self.ctx, self._params())
-        for name in ("value", "surrogate", "entropy"):
+        for name in ("value", "surrogate", "entropy") + (("rnd",) if self.rnd_tt else ()):
             self._acc("update.acc." + name)
         if self.hetero:  # the per-column mean std of the last mini-batch, for the runner's logging (allocated before any capture: T-15)
             self._buf["update.last_std"] = self.ctx.zeros(1, self.tt_actor.distribution.dim_p, batch_sharded=False)
@@ -150,6 +162,8 @@ class TTPPO(PPO):
         if optimizer and self._optimizer_stale:
             self._optimizer_state_to_torch()
             self._optimizer_stale = False
+        if optimizer and self.rnd_tt is not None:  # the RND state changes every step (reward statistics) and every update: a checkpoint always takes it fresh
+            self.rnd_tt.sync_to_torch()
 
     def sync_from_torch(self) -> None:
         """The upstream torch models / optimizer (e.g. after `load()`) -> the device copies, incl. Adam moments and the learning rate (H-6, H-8)."""
@@ -158,6 +172,8 @@ class TTPPO(PPO):
         self.tt_actor.distribution.refresh()
         self.lr_sched.set(self.learning_rate)
         self._optimizer_state_from_torch()
+        if self.rnd_tt is not None:
+            self.rnd_tt.sync_from_torch()
         self._refresh_std_mirror()
         self._weights_stale = self._optimizer_stale = False
 
@@ -240,11 +256,15 @@ class TTPPO(PPO):
         super().train_mode()
         self.tt_actor.set_training(True)
         self.tt_critic.set_training(True)
+        if self.rnd_tt is not None:
+            self.rnd_tt.set_training(True)
 
     def eval_mode(self) -> None:
         super().eval_mode()
         self.tt_actor.set_training(False)
         self.tt_critic.set_training(False)
+        if self.rnd_tt is not None:
+            self.rnd_tt.set_training(False)
 
     # -- rollout ------------------------------------------------------------------------------------------------------------
     def _capture(self, name: str, fn) -> None:
@@ -354,6 +374,9 @@ class TTPPO(PPO):
         self._pending = dict(actor_obs=actor_in, critic_obs=critic_in, action=out["action"], mean=out["mean"], value=out["value"], logp=out["logp"])
         if self.hetero:
             self._pending["std"] = out["std"]
+        if self.storage.rnd_own:  # the RND state is another set of observation groups: stage it for the storage (otherwise it IS the actor's / critic's observation)
+            with self.timer.section("act.rnd_obs"):
+                self._pending["rnd_obs"] = self.rnd_tt.stage_act_obs(obs, persistent=self.storage.persistent)
         with self.timer.section("act.download_actions"):
             return ctx.download(out["action"], op="H-2")[:, : actor.output_dim].contiguous()  # the one per-step sync point (H-2)
 
@@ -363,11 +386,35 @@ class TTPPO(PPO):
         pending, self._pending = self._pending, None
         assert pending is not None, "process_env_step() without a preceding act()"
         with self.timer.section("process_env_step"):
+            if self.rnd_tt is not None:
+                # upstream: intrinsic = rnd.get_intrinsic_reward(obs AFTER the step); rewards += intrinsic, before the time-out bootstrap. FIRST thing in this method: the traced reward graph is replayed here,
+                # and a tensor allocated before the replay and alive across it would be overwritten (T-15); the result is a persistent buffer
+                with self.timer.section("process_env_step.rnd"):
+                    intrinsic = self._rnd_reward(obs)
+                    self.intrinsic_rewards = self.ctx.download(intrinsic, op="H-9")[:, 0].contiguous()  # for the runner's logging only (H-9)
             packed = self.ctx.upload(pack_step_scalars(rewards, dones, extras.get("time_outs")), op="H-1", batch_sharded=True)
             reward, done, time_out = packed[:, 0:1], packed[:, 1:2], packed[:, 2:3]
+            if self.rnd_tt is not None:
+                reward = ttnn.add(reward, intrinsic)
             # upstream: rewards += gamma * values * time_outs  (the pre-step value V(s_t), see UPSTREAM_SEMANTICS)
             reward = ttnn.add(reward, ttnn.multiply(ttnn.multiply(pending["value"], time_out), self.gamma))
             self.storage.add_transition(reward=reward, done=done, **pending)
+
+    def _rnd_reward(self, obs: TensorDict) -> Any:
+        """The intrinsic reward of one environment step (`TTRND`): stage the new observation and the step's scalars, run the reward graph (replayed from a trace when tracing is on: the first call
+        warms the graph up on CLONES of its state, so that no step is applied twice, then captures it) and return the persistent result [num_envs, 1]."""
+        rnd = self.rnd_tt
+        rnd.stage(obs, self.storage.num_envs // self.ctx.n_chips)
+        if not self.trace_enabled or not rnd.traceable():
+            rnd.graph()  # eager; also the (never traced) evaluation mode, which must not advance any statistics
+        elif "rnd.reward" in self._traces:
+            self._replay("rnd.reward")
+        else:
+            for _ in range(2):  # compile the programs of the graph on clones (the second pass runs the in-place copies); the real state is untouched
+                rnd.graph(rnd.warm_up_buffers())
+            self._capture("rnd.reward", rnd.graph)
+            self._replay("rnd.reward")
+        return rnd.out
 
     def compute_returns(self, obs: TensorDict) -> None:
         """GAE on the device (storage.compute_returns); the last value comes from the device critic. Traced: the whole thing (critic forward on the last
@@ -461,6 +508,14 @@ class TTPPO(PPO):
             grads_c, _ = clip_grad_norm(ctx, grads_c, self.max_grad_norm)
         with self.timer.section("update.minibatch.adam"):
             self._set_params(self.adam.step(self._params(), grads_a + grads_c, lr))
+        if self.rnd_tt is not None:  # the predictor: MSE to the frozen target on the observations of this mini-batch, its own Adam, no clipping (upstream order: after the PPO step)
+            with self.timer.section("update.minibatch.rnd"):
+                rnd_loss, rnd_grads = self.rnd_tt.loss_and_grads(batch["rnd_obs"], rows)
+                acc = self._acc("update.acc.rnd")
+                ctx.put(acc, ttnn.add(acc, rnd_loss))
+                if ctx.n_chips > 1:
+                    rnd_grads = [ctx.mean_over_chips(g) for g in rnd_grads]
+                self.rnd_tt.apply(rnd_grads)
 
     def update(self) -> dict[str, float]:
         """PPO optimisation epochs over the stored rollout (upstream `PPO.update`), entirely on the device; with `trace` the mini-batch step is replayed."""
@@ -487,13 +542,15 @@ class TTPPO(PPO):
             permutations = torch.cat([torch.randperm(n) for _ in range(ctx.n_chips)])
             shuffled = st.shuffle(packed, ctx.upload_index(permutations, op="H-4"))
             self._buf["update.table"] = ctx.put(self._buf.get("update.table"), shuffled)
-        for name in ("value", "surrogate", "entropy"):
+        for name in ("value", "surrogate", "entropy") + (("rnd",) if self.rnd_tt else ()):
             acc = self._acc("update.acc." + name)
             ctx.put(acc, ttnn.multiply(acc, 0.0))
 
         for _epoch in range(self.num_learning_epochs):
             for i in range(mb):
                 self.adam.prepare_step()
+                if self.rnd_tt is not None:
+                    self.rnd_tt.adam.prepare_step()
                 key = f"update.step.{i}"
                 if self.trace_enabled and key in self._traces:
                     with self.timer.section("update.minibatch.replay"):
@@ -508,10 +565,12 @@ class TTPPO(PPO):
             # built HERE, not before the epochs: a tensor allocated before a replay and read after it can be overwritten by that replay (T-15)
             actor.update_normalization(st.all_actor_obs(), n)
             critic.update_normalization(st.all_critic_obs(), n)
+            if self.rnd_tt is not None:
+                self.rnd_tt.update_normalization(st.all_rnd_obs(), n)
 
         num_updates = self.num_learning_epochs * mb
         host = lambda t: float(ctx.download(t, op="H-5", batch_sharded=False)[0, 0])
-        loss_dict = {k: host(self._acc("update.acc." + k)) / num_updates for k in ("value", "surrogate", "entropy")}
+        loss_dict = {k: host(self._acc("update.acc." + k)) / num_updates for k in ("value", "surrogate", "entropy") + (("rnd",) if self.rnd_tt else ())}
         self.learning_rate = host(self.lr_sched.lr)
         for group in self.optimizer.param_groups:  # keep the (unused) torch optimizer's lr in line for logging / checkpoints
             group["lr"] = self.learning_rate
@@ -531,7 +590,7 @@ class TTPPO(PPO):
         ctx = self.ctx
         if ctx.n_chips == 1:
             return 0.0
-        tensors = self._params() + self.adam.m + self.adam.v + [self.lr_sched.lr]
+        tensors = self._params() + self.adam.m + self.adam.v + [self.lr_sched.lr] + (self.rnd_tt.tensors() if self.rnd_tt is not None else [])
         for model in (self.tt_actor, self.tt_critic):
             if model.normalizer is not None:
                 tensors += [model.normalizer._mean, model.normalizer._var]

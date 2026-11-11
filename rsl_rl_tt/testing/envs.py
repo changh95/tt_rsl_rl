@@ -32,6 +32,11 @@ class _BatchedEnv(VecEnv):
 
     obs_group_dims: dict[str, int]
     time_out_steps: int
+    step_dt: float = 0.02  # seconds per control step (Isaac Lab's `env.unwrapped.step_dt`: upstream scales the RND weight with it)
+
+    @property
+    def unwrapped(self):
+        return self
 
     def __init__(
         self,
@@ -146,6 +151,7 @@ class BatchedPendulum(_BatchedEnv):
     obs_groups_cfg = {"actor": ["policy"], "critic": ["policy"]}
 
     G, M, L, DT, MAX_SPEED, MAX_TORQUE = 10.0, 1.0, 1.0, 0.05, 8.0, 2.0
+    step_dt = 0.05
 
     def _reset(self, ids: torch.Tensor) -> None:
         if not hasattr(self, "_s"):

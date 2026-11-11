@@ -4,6 +4,7 @@
 
     scripts/tt_run.sh --chips 16 --timeout 300 --tag mcref -- python scripts/mc_step_reference.py
     scripts/tt_run.sh --chips 16 --timeout 300 --tag mcref -- python scripts/mc_step_reference.py --hetero     # heteroscedastic actor (Phase 8.1)
+    scripts/tt_run.sh --chips 16 --timeout 300 --tag mcref -- python scripts/mc_step_reference.py --rnd        # with RND (Phase 8.2)
 """
 
 from __future__ import annotations
@@ -24,17 +25,18 @@ from rsl_rl_tt.testing import mc_equiv  # noqa: E402
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hetero", action="store_true", help="a heteroscedastic Gaussian actor")
+    ap.add_argument("--rnd", action="store_true", help="Random Network Distillation (the predictor's embedding is part of the reference)")
     args = ap.parse_args()
-    out = REPO / "tests" / "tt" / "data" / (mc_equiv.REFERENCE_HETERO if args.hetero else mc_equiv.REFERENCE)
+    out = REPO / "tests" / "tt" / "data" / (mc_equiv.REFERENCE_RND if args.rnd else mc_equiv.REFERENCE_HETERO if args.hetero else mc_equiv.REFERENCE)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open_tray_mesh((1, 1)):
-        runner = mc_equiv.make_runner([1, 1], hetero=args.hetero)
+        runner = mc_equiv.make_runner([1, 1], hetero=args.hetero, rnd=args.rnd)
         alg = runner.alg
         pool, obs = mc_equiv.make_pool(alg)
         res = mc_equiv.run_steps(alg, pool, obs)
         mc_equiv.save_reference(out, res)  # only what the comparison uses (parameters / Adam moments are not compared one by one)
         print(f"saved {out} ({out.stat().st_size / 1e3:.0f} KB); learning rates after each step: {res['lrs']}")
-        moved = {t: float((res[f'{t}_after'] - res[f'{t}_before']).abs().max()) for t in ('actor', 'critic')}
+        moved = {t: float((res[f'{t}_after'] - res[f'{t}_before']).abs().max()) for t in ('actor', 'critic') + (('rnd',) if args.rnd else ())}
         print("outputs moved by the 3 steps (max abs):", moved)
         runner.alg.release_traces()
 

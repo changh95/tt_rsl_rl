@@ -160,6 +160,21 @@ time-outs up: 342 bytes per environment):
   7200 steps, mean round trip 2.1 ms (it includes the 2048-environment step of the CPU environment itself), 0.7 GB sent and 5.0 GB received. The recorded run reproduces the in-process run in every logged scalar
   (`docs/porting/isaac_loopback/`, `tests/tt/test_bridge.py`).
 
+## 7d. What RND costs (Phase 8.2, post-v1)
+
+`tracking12`, 2048 environments x 24 steps, hidden [128, 128, 64], RND predictor / target [64, 64] -> 16 outputs on the `policy` group (36 dimensions), with state and reward normalisation, one chip, traced, ms per iteration (20 iterations after
+5 warm-up iterations; the section timer adds a few % of device syncs; the two `iteration` rows are without it):
+
+| | without RND | with RND |
+|---|---:|---:|
+| iteration | **235** | **308** (+31 %) |
+| PPO update replay (20 traced mini-batch steps) | 121 | 152 (+31: the predictor's forward / backward / Adam is ~1.5 ms of ops per step) |
+| `process_env_step` (host staging, reward add, download) | 21 | 44 (of which the RND reward: 21: one trace replay + one observation upload + the download of the intrinsic reward) |
+| `act` (upload of the observations, replay, download of the actions) | 38 | 35 |
+
+The first version ran the reward path eagerly (about 30 ops per environment step): 114 ms per iteration for the reward alone, +67 % for the iteration. Tracing it (the warm-up on clones of the state, see `DECISIONS.md` ADR-0007 A-2) took it to 21 ms. Left on the table: the observation of the new
+state is uploaded twice (once for the reward, once by the next `act`), and the predictor's step could share the actor's tilized input when the RND state is the actor's observation. (Measured by a scratch script around `SectionTimer`; `scripts/train_tt.py --rnd` writes the wall times of the end-to-end runs: `docs/porting/tt_runs_rnd`.)
+
 ## 8. Reproduce
 
 ```bash
