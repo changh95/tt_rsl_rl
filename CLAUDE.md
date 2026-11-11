@@ -71,7 +71,8 @@ scripts/tt_run.sh --chips 16 --timeout 900 --tag p7 -- python -m pytest -m tt te
 # GPU-host procedure and scripts: docs/porting/ISAAC_RUNBOOK.md (isaac_env_server.py, train_isaac.py, bridge_smoke.py, tb_to_csv.py, compare_curves.py)
 # Demo (not a phase; on main since 2026-11-11; the earlier MuJoCo humanoid demo was removed at the owner's request): Unitree G1 walking on command, MuJoCo on the CPU, PPO on all eight chips (docs/porting/demo_g1/README.md)
 scripts/fetch_g1_model.sh && scripts/tt_run.sh --timeout 14400 --tag g1 -- python scripts/train_g1_demo.py --mesh 2x4 --envs 4096 --iterations 1500 --out docs/porting/demo_g1/tt_8chips
-MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_100.pt .run/g1/tt_8chips/model_1499.pt --video docs/porting/demo_g1/g1.mp4
+MUJOCO_GL=egl python scripts/eval_g1_tracking.py --dir .run/g1/tt_8chips --out docs/porting/demo_g1/tracking_error.json   # velocity tracking error of the checkpoints (host only)
+MUJOCO_GL=egl python scripts/render_g1_demo.py --checkpoints random .run/g1/tt_8chips/model_100.pt .run/g1/tt_8chips/model_1499.pt --no-eval --metrics docs/porting/demo_g1/tt_8chips/metrics.csv --tracking docs/porting/demo_g1/tracking_error.json --video docs/porting/demo_g1/g1.mp4
 # Examples (examples/README.md): the G1 demo as a short example; play.py needs no device
 scripts/tt_run.sh --timeout 14400 --tag g1 -- python examples/g1_walk/train.py --mesh 2x4 --envs 4096 --iterations 1500      # -> .run/examples/g1_walk
 MUJOCO_GL=egl python examples/g1_walk/play.py --checkpoint random .run/examples/g1_walk/model_100.pt .run/examples/g1_walk/model_1499.pt --video g1.mp4 --gif g1.gif

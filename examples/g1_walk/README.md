@@ -2,7 +2,7 @@
 
 ![untrained / iteration 101 / iteration 1500](../../docs/porting/demo_g1/g1.gif)
 
-**Video (20 s, real time, 1440x608): [`g1.mp4`](../../docs/porting/demo_g1/g1.mp4)** — the same robot, the same commands (0.4 m/s, 0.8 m/s, then 0.5 m/s while turning left and right, 5 s each), three stages of one training run. Under each robot its **reward** (the return of its current episode, live, one scale for all three, red ticks = falls) and at the bottom the **training curve** of the run (mean episode return and speed against the iteration, the three iterations marked in the colour of their panel):
+**Video (20 s, real time, 1440x752): [`g1.mp4`](../../docs/porting/demo_g1/g1.mp4)** — the same robot, the same commands (0.4 m/s, 0.8 m/s, then 0.5 m/s while turning left and right, 5 s each), three stages of one training run. Under each robot its **reward** (the return of its current episode, live, one scale for all three, red ticks = falls) and at the bottom three plots against the training iteration (the three iterations marked in the colour of their panel): the **velocity tracking error** of the saved checkpoints, the **value loss** of the critic (the only estimation loss of this model: no separate encoder) and the **reward terms** the actor-critic maximises, per second, rewards above zero and penalties below (details: [`docs/porting/demo_g1/README.md`](../../docs/porting/demo_g1/README.md)):
 
 | | what it does |
 |---|---|
