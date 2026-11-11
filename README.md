@@ -25,6 +25,14 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 
 > This is a work in progress on shared hardware; it only ever touches one dedicated 8-chip tray (see `CLAUDE.md`).
 
+## Demo: a MuJoCo humanoid learns to run, physics on the CPU, training on one Blackhole chip
+
+[![untrained / iteration 151 / iteration 600](docs/porting/demo_humanoid/walk.gif)](docs/porting/demo_humanoid/walk.mp4)
+
+**[Video (MP4, 15 s, real time)](docs/porting/demo_humanoid/walk.mp4)** · [details, numbers and how to reproduce](docs/porting/demo_humanoid/README.md). 4096 humanoids simulated by MuJoCo on the CPU; the
+policy is trained by PPO on the chip through the unmodified upstream `OnPolicyRunner`: 600 iterations (59 M samples, 13 min) take it from falling after ~27 steps to running at 2.9 m/s without a fall.
+Upstream PPO on the CPU learns the same way but needs 3.7 s per iteration instead of 1.3 s (one seed per backend; a demonstration, not a benchmark).
+
 ---
 
 # Original rsl_rl README (upstream, unchanged)

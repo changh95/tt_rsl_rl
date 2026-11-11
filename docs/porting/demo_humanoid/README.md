@@ -2,6 +2,8 @@
 
 ![untrained, iteration 151, iteration 600](walk.gif)
 
+**Video (15 s, real time, 1440x352 H.264, 1.3 MB): [`walk.mp4`](walk.mp4)** — the same three policies side by side, longer and larger than the GIF; the counters show the time, the distance run and the number of falls (untrained: 35 falls in 14 s; iteration 151: 11 m walked; iteration 600: 40 m run).
+
 *Left: untrained policy (falls after ~27 steps, again and again). Middle: after 151 iterations (stands, walks at 0.8 m/s). Right: after 600 iterations (runs at 2.9 m/s, no fall in 256 test episodes).*
 
 The environment is MuJoCo's humanoid on the **CPU** (4096 copies, stepped by MuJoCo's multithreaded `rollout`); the policy (actor + critic MLPs [512, 256, 128]) is trained by PPO on **one Blackhole chip**
@@ -42,6 +44,8 @@ source .venv/bin/activate                         # needs: pip install "gymnasiu
 scripts/tt_run.sh --chips 16 --timeout 7200 --tag humanoid -- python scripts/train_humanoid_demo.py --backend tt --envs 4096 --iterations 600 --out docs/porting/demo_humanoid/tt_1chip
 # the CPU comparison (12 min, host only)
 python scripts/train_humanoid_demo.py --backend cpu --envs 4096 --iterations 150 --threads 32 --out docs/porting/demo_humanoid/cpu_150it
+# the video (real time, 15 s; needs imageio-ffmpeg, see ENV.md)
+MUJOCO_GL=egl python scripts/render_humanoid_demo.py --checkpoints random .run/humanoid/tt_1chip/model_150.pt .run/humanoid/tt_1chip/model_599.pt --seconds 15 --fps 33 --size 352 480 --no-eval --video docs/porting/demo_humanoid/walk.mp4
 # the GIF and the evaluation, then the curves
 MUJOCO_GL=egl python scripts/render_humanoid_demo.py --checkpoints random .run/humanoid/tt_1chip/model_150.pt .run/humanoid/tt_1chip/model_599.pt --seconds 10 --fps 12 --size 180 240 --out docs/porting/demo_humanoid/walk.gif
 python scripts/plot_humanoid_curves.py --run "TT, 1 chip=docs/porting/demo_humanoid/tt_1chip" --run "upstream PPO, CPU=docs/porting/demo_humanoid/cpu_150it" --out docs/porting/demo_humanoid/curves.png

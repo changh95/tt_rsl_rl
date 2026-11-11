@@ -76,12 +76,13 @@ def evaluate(policy, hidden, checkpoint: str, steps: int, envs: int, seed: int) 
 def render_panel(policy, seconds: float, skip: int, size: tuple[int, int], seed: int, label: str) -> list[np.ndarray]:
     """Frames of ONE humanoid (a single-environment run; after a fall it starts again, like in training)."""
     import mujoco
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFont
 
     env = MujocoHumanoidVecEnv(1, seed=seed, num_threads=1)
     floor = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
     env.model.geom_size[floor, :2] = 400.0  # only the DRAWN size of the plane (a plane collides everywhere): the fast policy runs off the 20 m of the model's floor
     h, w = size
+    font = ImageFont.load_default(size=max(10, h // 20))  # the overlay text scales with the picture
     renderer = mujoco.Renderer(env.model, h, w)
     data = mujoco.MjData(env.model)
     cam = mujoco.MjvCamera()
@@ -99,7 +100,7 @@ def render_panel(policy, seconds: float, skip: int, size: tuple[int, int], seed:
                     mujoco.mj_forward(env.model, data)
                     renderer.update_scene(data, camera=cam)
                     img = Image.fromarray(renderer.render())
-                    ImageDraw.Draw(img).text((6, 4), f"{label}   t = {t * env.dt:4.1f} s   x = {env._state[0, 1]:5.1f} m   falls: {falls}", fill=(255, 255, 255))
+                    ImageDraw.Draw(img).text((6, 4), f"{label}   t = {t * env.dt:4.1f} s   x = {env._state[0, 1]:5.1f} m   falls: {falls}", fill=(255, 255, 255), font=font)
                     frames.append(np.asarray(img))
     finally:
         renderer.close()
@@ -117,8 +118,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--eval-envs", type=int, default=256)
     ap.add_argument("--eval-steps", type=int, default=1500)
-    ap.add_argument("--out", required=True, help="output GIF; the evaluation goes to <out>.json")
+    ap.add_argument("--out", default=None, help="output GIF; the evaluation goes to <out>.json")
+    ap.add_argument("--video", default=None, help="output MP4 (H.264, yuv420p, real-time speed; needs imageio-ffmpeg); sizes must be multiples of 16: e.g. --size 352 480")
+    ap.add_argument("--no-eval", action="store_true", help="skip the quantitative evaluation")
     args = ap.parse_args()
+    if not (args.out or args.video):
+        ap.error("give --out (GIF) and / or --video (MP4)")
 
     from PIL import Image
 
@@ -126,20 +131,32 @@ def main() -> None:
     probe = MujocoHumanoidVecEnv(1, seed=0, num_threads=1)
     skip = max(1, round(1.0 / (args.fps * probe.dt)))
     duration_ms = int(round(1000 * skip * probe.dt))
+    real_time_fps = 1.0 / (skip * probe.dt)  # one frame per `skip` steps of dt each: playing the video at this rate is real time
     probe.close()
     panels, report = [], []
     for ck in args.checkpoints:
-        env = MujocoHumanoidVecEnv(args.eval_envs, seed=args.seed, num_threads=8)
-        policy = load_policy(ck, env, hidden)
-        env.close()
-        report.append({"label": label_of(ck), **evaluate(policy, hidden, ck, args.eval_steps, args.eval_envs, args.seed)})
-        print(report[-1], flush=True)
+        if not args.no_eval:
+            env = MujocoHumanoidVecEnv(args.eval_envs, seed=args.seed, num_threads=8)
+            policy = load_policy(ck, env, hidden)
+            env.close()
+            report.append({"label": label_of(ck), **evaluate(policy, hidden, ck, args.eval_steps, args.eval_envs, args.seed)})
+            print(report[-1], flush=True)
         panels.append(render_panel(load_policy(ck, MujocoHumanoidVecEnv(1, seed=0, num_threads=1), hidden), args.seconds, skip, tuple(args.size), args.seed, label_of(ck)))
     n = min(len(p) for p in panels)
-    frames = [Image.fromarray(np.concatenate([p[i] for p in panels], axis=1)).convert("P", palette=Image.ADAPTIVE, colors=64) for i in range(n)]
-    frames[0].save(args.out, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0, optimize=True)
-    Path(f"{args.out}.json").write_text(json.dumps(report, indent=2))
-    print(f"wrote {args.out}: {n} frames, {Path(args.out).stat().st_size / 1e6:.1f} MB")
+    if args.out:
+        frames = [Image.fromarray(np.concatenate([p[i] for p in panels], axis=1)).convert("P", palette=Image.ADAPTIVE, colors=64) for i in range(n)]
+        frames[0].save(args.out, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0, optimize=True)
+        if report:
+            Path(f"{args.out}.json").write_text(json.dumps(report, indent=2))
+        print(f"wrote {args.out}: {n} frames, {Path(args.out).stat().st_size / 1e6:.1f} MB")
+    if args.video:
+        import imageio.v2 as imageio
+
+        writer = imageio.get_writer(args.video, fps=real_time_fps, codec="libx264", macro_block_size=16, ffmpeg_params=["-crf", "24", "-preset", "slow", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+        for i in range(n):
+            writer.append_data(np.concatenate([p[i] for p in panels], axis=1))
+        writer.close()
+        print(f"wrote {args.video}: {n} frames at {real_time_fps:.2f} fps = {n / real_time_fps:.1f} s, {Path(args.video).stat().st_size / 1e6:.1f} MB")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 `humanoid_cfg.py`), `scripts/train_humanoid_demo.py` / `render_humanoid_demo.py` / `plot_humanoid_curves.py`, 8 host tests (`tests/tt/test_mujoco_humanoid.py`: conventions, determinism, reward formula, rollout == plain `mj_step` to 5e-8,
 fall / time-out / auto-reset, private RNG, a short upstream-PPO training), dependency `gymnasium[mujoco]==1.4.0` (ENV.md). Result (`docs/porting/demo_humanoid/README.md`): TT, one chip, 4096 envs, 600 iterations (59 M samples, 13.3 min):
 the humanoid stands up at iteration ~121 and then runs at 2.75 m/s (deterministic evaluation 2.9 m/s, 0 falls in 256 episodes); upstream PPO on the CPU learns the same way (same curve against the iteration) at 3.73 s per iteration against 1.33 s
-(training part 2.78 s vs 0.43 s). The CPU simulation is 68 % of the TT run. One seed. Merged to `main` on 2026-11-12 at the owner's explicit request (not a phase, so no `phase-N-done` tag).
+(training part 2.78 s vs 0.43 s). The CPU simulation is 68 % of the TT run. One seed. Merged to `main` on 2026-11-12 at the owner's explicit request (not a phase, so no `phase-N-done` tag). Video: `docs/porting/demo_humanoid/walk.mp4` (15 s, real time, 1.3 MB, linked from both READMEs; `render_humanoid_demo.py --video`, dependency `imageio-ffmpeg==0.8.1`).
 
 ## 2026-11-12 — Phase 7 DONE on the TT host: environment bridge, scripts and runbook; Isaac Lab itself NOT run (no GPU host / Isaac Lab available)
 **Done**

@@ -45,6 +45,7 @@ tar -xf sfpi.txz -C .venv/lib/python3.10/site-packages/ttnn/runtime/
 .venv/bin/python -m pip install onnxruntime==1.23.2          # 2026-11-11, Phase 4: ONNX export round-trip tests (adds coloredlogs, flatbuffers, humanfriendly; torch/numpy untouched)
 .venv/bin/python -m pip install pyzmq==26.4.0                # 2026-11-11, Phase 7: env bridge (libzmq 4.3.5 is bundled in the wheel; nothing else changed)
 .venv/bin/python -m pip install "gymnasium[mujoco]==1.4.0"      # 2026-11-12, humanoid demo: mujoco 3.17.0 + the Humanoid model of gymnasium (adds Farama-Notifications, ImageIO, PyOpenGL, etils, glfw, websockets...; torch/numpy/ttnn untouched, checked with --dry-run first); headless rendering: MUJOCO_GL=egl (Mesa)
+.venv/bin/python -m pip install imageio-ffmpeg==0.8.1             # 2026-11-12, demo video: a static ffmpeg (libx264) inside the wheel; nothing else changed (dry-run first); no system ffmpeg on this host
 ```
 Transitive: GitPython, onnx, onnxscript, tensordict, tensorboard (all from upstream `pyproject.toml`); from the ttnn wheel: click, graphviz, loguru,
 matplotlib, pandas, pyyaml, seaborn (+ contourpy, cycler, fonttools, kiwisolver, pyparsing, python-dateutil, pytz, six, tzdata).
