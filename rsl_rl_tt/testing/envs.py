@@ -152,6 +152,24 @@ class BatchedCartPolePO(BatchedCartPole):
         return TensorDict({"policy": self._s[:, [0, 2]].clone()}, batch_size=[self.num_envs], device=self.device)
 
 
+class BatchedCartPoleImage(BatchedCartPole):
+    """The cart-pole with an IMAGE observation (Phase 8.6): the velocities as a 1D group `policy`, and the positions as a 2-channel 8 x 8 image `image` (channel 0: a vertical bar at the column of the cart
+    position, channel 1: a vertical bar at the column of the pole angle, both Gaussian across the columns) - a policy has to read the positions off the image. Dynamics, reward, termination as `BatchedCartPole`."""
+
+    obs_group_dims = {"policy": 2, "image": 128}  # 128 = 2 x 8 x 8 (flattened)
+    obs_groups_cfg = {"actor": ["policy", "image"], "critic": ["policy", "image"]}
+    IMAGE = 8
+
+    def _compute_obs(self) -> TensorDict:
+        n, w = self.num_envs, self.IMAGE
+        cols = torch.arange(w, dtype=torch.float32).reshape(1, 1, w)
+        centre_x = ((self._s[:, 0] / self.X_LIMIT + 1.0) * 0.5 * (w - 1)).reshape(n, 1, 1)
+        centre_t = ((self._s[:, 2] / self.THETA_LIMIT + 1.0) * 0.5 * (w - 1)).reshape(n, 1, 1)
+        bar = lambda c: torch.exp(-((cols - c) ** 2) / 2.0).expand(n, w, w)  # [n, H, W]: constant along the rows
+        image = torch.stack([bar(centre_x), bar(centre_t)], dim=1)  # [n, 2, H, W]
+        return TensorDict({"policy": self._s[:, [1, 3]].clone(), "image": image.to(self.device)}, batch_size=[n], device=self.device)
+
+
 class BatchedPendulum(_BatchedEnv):
     """Gym Pendulum-v1 dynamics, torque in [-1, 1] scaled by 2. Reward = -(angle^2 + 0.1 w^2 + 0.001 u^2); 200 steps, no termination."""
 
@@ -258,15 +276,15 @@ ENV_NAMES = tuple(ENV_CLASSES)
 RECURRENT_ENV_CLASSES = {"cartpole_po": BatchedCartPolePO}  # environments that need a memory (not part of ENV_NAMES: the golden curves and the v1 suites are defined on the three above)
 
 
+IMAGE_ENV_CLASSES = {"cartpole_img": BatchedCartPoleImage}  # an environment with an image observation group (Phase 8.6)
+
+
 def env_class(name: str):
-    if name in ENV_CLASSES:
-        return ENV_CLASSES[name]
-    if name in RECURRENT_ENV_CLASSES:
-        return RECURRENT_ENV_CLASSES[name]
-    raise ValueError(f"unknown test env {name!r}; choose one of {ENV_NAMES + tuple(RECURRENT_ENV_CLASSES)}")
+    for registry in (ENV_CLASSES, RECURRENT_ENV_CLASSES, IMAGE_ENV_CLASSES):
+        if name in registry:
+            return registry[name]
+    raise ValueError(f"unknown test env {name!r}; choose one of {ENV_NAMES + tuple(RECURRENT_ENV_CLASSES) + tuple(IMAGE_ENV_CLASSES)}")
 
 
 def make_env(name: str, num_envs: int, seed: int = 0, device: str = "cpu", **kwargs) -> VecEnv:
-    if name not in ENV_CLASSES and name not in RECURRENT_ENV_CLASSES:
-        raise ValueError(f"unknown test env {name!r}; choose one of {ENV_NAMES + tuple(RECURRENT_ENV_CLASSES)}")
     return env_class(name)(num_envs, seed=seed, device=device, **kwargs)

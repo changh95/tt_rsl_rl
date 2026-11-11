@@ -117,6 +117,8 @@ class TTDistillation(TraceMixin, Distillation):
                 raise ValueError(f"the {name} needs a distribution_cfg (GaussianDistribution)")
             if model.distribution.per_row:
                 raise NotImplementedError(f"the {name} uses a heteroscedastic distribution: not supported by the TT distillation")
+        if self.tt_student.cnn is not None or self.tt_teacher.cnn is not None:
+            raise NotImplementedError("image observations (CNNModel) are not supported by the TT distillation yet")
         self.share_obs = self.tt_student.obs_groups == self.tt_teacher.obs_groups
         self.storage = TTDistillationStorage(self.ctx, storage.num_envs, steps, self.tt_student.obs_dim_p, self.tt_teacher.output_dim_p, persistent=self.trace_enabled)
         self.loss_type = "huber" if self.loss_fn is torch.nn.functional.huber_loss else "mse"

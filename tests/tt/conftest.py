@@ -14,7 +14,7 @@ import pytest
 from rsl_rl_tt.testing.reference import test_mesh_shape
 
 
-SINGLE_CHIP_SEMANTICS = ("test_tt_backward.py", "test_tt_update.py", "test_tt_hetero_update.py", "test_tt_rnd_update.py", "test_tt_symmetry_update.py", "test_tt_rnn.py", "test_tt_rnn_update.py")
+SINGLE_CHIP_SEMANTICS = ("test_tt_backward.py", "test_tt_update.py", "test_tt_hetero_update.py", "test_tt_rnd_update.py", "test_tt_symmetry_update.py", "test_tt_rnn.py", "test_tt_rnn_update.py", "test_tt_cnn.py", "test_tt_cnn_update.py")
 
 
 def pytest_collection_modifyitems(config, items):

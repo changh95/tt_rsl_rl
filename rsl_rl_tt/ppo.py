@@ -80,8 +80,18 @@ class TTPPO(TraceMixin, PPO):
         if self.trace_enabled:
             self.tray.add_close_hook(self.release_traces)  # captured traces must be released before the device is closed
         self._validate_batch_alignment(storage)
-        self.tt_actor = TTMLPModel(self.ctx, self._raw_actor)
-        self.tt_critic = TTMLPModel(self.ctx, self._raw_critic)
+        # image observations (CNNModel): the encoders' gather indices are built for the batches they will see: the acting step (all environments of a chip) and the mini-batches
+        n_local = storage.num_envs // self.ctx.n_chips
+        cnn_batches = sorted({n_local, (storage.num_transitions_per_env * n_local) // self.num_mini_batches})
+        self.tt_actor = TTMLPModel(self.ctx, self._raw_actor, cnn_batches=cnn_batches)
+        self.tt_critic = TTMLPModel(self.ctx, self._raw_critic, cnn_batches=cnn_batches)
+        if self.tt_actor.cnn is not None or self.tt_critic.cnn is not None:
+            if kwargs.get("rnd_cfg") or kwargs.get("symmetry_cfg"):
+                raise NotImplementedError("image observations (CNNModel) are not supported together with RND or the symmetry extension")
+            if self._raw_actor is not None and self.tt_critic.cnn is not None and self.tt_actor.cnn is not None:
+                actor_params = {id(p) for p in self._raw_actor.cnns.parameters()}
+                if any(id(p) in actor_params for p in self._raw_critic.cnns.parameters()):
+                    raise NotImplementedError("share_cnn_encoders (one CNN used by the actor and the critic) is not supported: the shared parameters would need the sum of both models' gradients")
         if self.tt_actor.distribution is None:
             raise ValueError("the actor needs a distribution_cfg (GaussianDistribution or HeteroscedasticGaussianDistribution)")
         self.hetero = self.tt_actor.distribution.per_row  # state-dependent std: the std head is part of the actor MLP and every sample has its own std
@@ -234,10 +244,10 @@ class TTPPO(TraceMixin, PPO):
                 std_param = d.std_param if d.std_type == "scalar" else d.log_std_param
                 slots[id(std_param)] = (std_param, base, "std", a.distribution)
                 base += 1
-            if tt_model.recurrent:
-                for p, idx, layer, kind in tt_model.rnn.param_slots():
-                    slots[id(p)] = (p, base + idx, "rnn", (tt_model.rnn, layer, kind))
-                base += len(tt_model.rnn.parameters())
+            if tt_model.encoder is not None:
+                for p, idx, layer, kind in tt_model.encoder.param_slots():
+                    slots[id(p)] = (p, base + idx, "enc", (tt_model.encoder, layer, kind))
+                base += len(tt_model.encoder.parameters())
         return [slots[id(p)] for p in self.optimizer.param_groups[0]["params"] if id(p) in slots]
 
     def _optimizer_state_from_torch(self) -> None:
@@ -259,9 +269,9 @@ class TTPPO(TraceMixin, PPO):
                     store[idx] = ctx.upload(owner.weight_to_host(t), op="H-6", batch_sharded=False)
                 elif kind == "bias":
                     store[idx] = ctx.upload(owner.bias_to_host(t), op="H-6", batch_sharded=False)
-                elif kind == "rnn":
-                    rnn, layer, rnn_kind = owner
-                    store[idx] = ctx.upload(rnn.weight_to_host(layer, rnn_kind, t), op="H-6", batch_sharded=False)
+                elif kind == "enc":
+                    enc, layer, enc_kind = owner
+                    store[idx] = ctx.upload(enc.weight_to_host(layer, enc_kind, t), op="H-6", batch_sharded=False)
                 else:
                     store[idx] = ctx.upload(pad_vector(t, owner.dim_p), op="H-6", batch_sharded=False)
         self.adam.load_state(m, v, step)
@@ -278,9 +288,9 @@ class TTPPO(TraceMixin, PPO):
                     host.append(owner.weight_from_host(t))
                 elif kind == "bias":
                     host.append(owner.bias_from_host(t))
-                elif kind == "rnn":
-                    rnn, layer, rnn_kind = owner
-                    host.append(rnn.weight_from_host(layer, rnn_kind, t))
+                elif kind == "enc":
+                    enc, layer, enc_kind = owner
+                    host.append(enc.weight_from_host(layer, enc_kind, t))
                 else:
                     host.append(t[0, : owner.dim].contiguous())
             self.optimizer.state[p] = {"step": torch.tensor(float(self.adam.t)), "exp_avg": host[0].clone(), "exp_avg_sq": host[1].clone()}
@@ -467,8 +477,8 @@ class TTPPO(TraceMixin, PPO):
     def _params(self) -> list:
         """The device parameters in one flat list: actor MLP, actor std (if learned), actor RNN, critic MLP, critic RNN (a model without an RNN contributes none)."""
         a, c = self.tt_actor, self.tt_critic
-        return (a.mlp.parameters() + ([a.distribution.param] if a.distribution.learn_std else []) + (a.rnn.parameters() if a.recurrent else [])
-                + c.mlp.parameters() + (c.rnn.parameters() if c.recurrent else []))
+        return (a.mlp.parameters() + ([a.distribution.param] if a.distribution.learn_std else []) + (a.encoder.parameters() if a.encoder is not None else [])
+                + c.mlp.parameters() + (c.encoder.parameters() if c.encoder is not None else []))
 
     def _set_params(self, new: list) -> None:
         a, c = self.tt_actor, self.tt_critic
@@ -478,15 +488,15 @@ class TTPPO(TraceMixin, PPO):
             a.distribution.param = self.ctx.put(a.distribution.param, new[k])
             a.distribution.refresh()
             k += 1
-        if a.recurrent:
-            n = len(a.rnn.parameters())
-            a.rnn.set_parameters(new[k : k + n])
+        if a.encoder is not None:
+            n = len(a.encoder.parameters())
+            a.encoder.set_parameters(new[k : k + n])
             k += n
         n = len(c.mlp.parameters())
         c.mlp.set_parameters(new[k : k + n])
         k += n
-        if c.recurrent:
-            c.rnn.set_parameters(new[k:])
+        if c.encoder is not None:
+            c.encoder.set_parameters(new[k:])
 
     def _loss_names(self) -> tuple:
         """The losses the update logs (upstream's loss dict): value, surrogate, entropy, and RND's / the symmetry's when those extensions are on."""
@@ -580,7 +590,8 @@ class TTPPO(TraceMixin, PPO):
                 mlp_grads, rnn_grads = actor.sequence_backward(cache_a, d_out, keeps)
                 grads_a = [t for pair in mlp_grads for t in pair] + ([la["d_param"]] if dist.learn_std else []) + rnn_grads
             else:
-                grads_a = [t for pair in actor.mlp.backward(cache_a, d_out) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
+                mlp_grads, enc_grads = actor.backward(cache_a, d_out)  # (an image encoder's gradients; none for a plain MLP model)
+                grads_a = [t for pair in mlp_grads for t in pair] + ([la["d_param"]] if dist.learn_std else []) + enc_grads
             if sym_grads is not None:  # the mirror loss without augmentation went through its own forward: its gradient adds to the actor's MLP gradient
                 grads_a = [ttnn.add(g, h) for g, h in zip(grads_a[: len(sym_grads)], sym_grads)] + grads_a[len(sym_grads) :]
             if self.hetero:
@@ -590,7 +601,8 @@ class TTPPO(TraceMixin, PPO):
                 mlp_grads, rnn_grads = critic.sequence_backward(cache_c, d_value, keeps)
                 grads_c = [t for pair in mlp_grads for t in pair] + rnn_grads
             else:
-                grads_c = [t for pair in critic.mlp.backward(cache_c, d_value) for t in pair]
+                mlp_grads, enc_grads = critic.backward(cache_c, d_value)
+                grads_c = [t for pair in mlp_grads for t in pair] + enc_grads
         if ctx.n_chips > 1:
             # data parallel: every chip computed the gradient of ITS mini-batch; the exchange averages them BEFORE clipping (upstream reduce_parameters: all-reduce /
             # world_size, then clip_grad_norm_), so every chip clips and steps with the same gradient and the replicas stay identical (ADR-0004 A-1)

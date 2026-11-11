@@ -26,7 +26,8 @@ STEPS = 8
 def small_spec(name: str, **over) -> RefSpec:
     base = REF_SPECS[name]
     n_chips = test_mesh_shape()[0] * test_mesh_shape()[1]  # every chip needs a multiple of 32 environments
-    kw = dict(num_envs=max(128, 32 * n_chips), num_steps=STEPS, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1})
+    kw = dict(num_envs=max(128, 32 * n_chips), num_steps=STEPS, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1},
+              model=base.model, critic_model=base.critic_model, obs_groups=base.obs_groups)  # (the model config of the recurrent / image specs is part of the spec)
     kw.update(over)
     return RefSpec(**kw)
 

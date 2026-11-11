@@ -251,6 +251,35 @@ def mask_row(dim: int, dim_p: int) -> torch.Tensor:
     return m
 
 
+def place_rows(w_t: torch.Tensor, rows: list, in_p: int, out_p: int) -> torch.Tensor:
+    """[in, out] -> [in_p, out_p] with row i of the input at row `rows[i]` (every other row zero): the layout of a head that is fed by image encoders (rsl_rl_tt/cnn.py)."""
+    out = torch.zeros(in_p, out_p)
+    out[rows, : w_t.shape[1]] = w_t.detach().to(torch.float32)
+    return out
+
+
+def take_rows(w: torch.Tensor, rows: list, out_features: int) -> torch.Tensor:
+    """Inverse of `place_rows`: [in_p, out_p] -> [in, out]."""
+    return w[rows, :out_features]
+
+
+def stage_obs_mixed(obs: Any, groups_1d: list[str], dim1_p: int, groups_2d: list[str], widths_2d: list[int]) -> torch.Tensor:
+    """H-3 for a model with image observations: [rows, dim1_p + sum(widths)]: the 1D groups concatenated (zero padded to dim1_p), then every 2D group flattened in torch's (c, y, x) order (each zero padded to its width)."""
+    rows = obs[(groups_1d or groups_2d)[0]].shape[0]
+    buf = torch.zeros(rows, dim1_p + sum(widths_2d))
+    col = 0
+    for group in groups_1d:
+        part = obs[group]
+        buf[:, col : col + part.shape[1]] = part
+        col += part.shape[1]
+    col = dim1_p
+    for group, width in zip(groups_2d, widths_2d):
+        flat = obs[group].reshape(rows, -1)
+        buf[:, col : col + flat.shape[1]] = flat
+        col += width
+    return buf
+
+
 def stage_obs(obs: Any, groups: list[str], dim_p: int) -> torch.Tensor:
     """H-3: concatenate the selected observation groups into one zero-padded [rows, dim_p] float32 staging tensor."""
     rows = obs[groups[0]].shape[0]

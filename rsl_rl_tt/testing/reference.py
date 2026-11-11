@@ -142,6 +142,11 @@ def make_teacher_checkpoint(env_name: str, path: str, seed: int = 0, iterations:
 REF_SPECS["cartpole_po"] = RefSpec(num_envs=1024, num_steps=24, iterations=150, hidden=(64,), algorithm=_PPO, model={"class_name": "RNNModel", "rnn_type": "gru", "rnn_hidden_dim": 64, "rnn_num_layers": 1})
 
 
+# the cart-pole with an image observation (2 x 8 x 8, the positions) + the velocities as a 1D group: a CNN encoder (two convolutions, stride 1 and 2) in front of the MLP head
+CNN_MODEL = {"class_name": "CNNModel", "cnn_cfg": {"output_channels": [8, 8], "kernel_size": 3, "stride": [1, 2], "padding": "zeros", "activation": "elu", "flatten": True}}
+REF_SPECS["cartpole_img"] = RefSpec(num_envs=512, num_steps=24, iterations=100, hidden=(64,), algorithm=_PPO, model=CNN_MODEL)
+
+
 def with_rnn(spec: RefSpec, rnn_type: str = "gru", hidden_dim: int = 64, num_layers: int = 1, actor: bool = True, critic: bool = True) -> RefSpec:
     """`spec` with RNN models (`rnn_type` "gru" / "lstm"); `actor` / `critic` False keeps that model a plain MLP."""
     model = {"class_name": "RNNModel", "rnn_type": rnn_type, "rnn_hidden_dim": hidden_dim, "rnn_num_layers": num_layers}

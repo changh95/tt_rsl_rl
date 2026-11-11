@@ -16,8 +16,9 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from rsl_rl_tt.cnn import TTCNN, TTCNNStack
 from rsl_rl_tt.rnn import TTRNN
-from rsl_rl_tt.tt_common import TTContext, linear_from_host, linear_to_host, mask_row, pad_heads, pad_up, pad_vector, stage_obs, unpad_heads
+from rsl_rl_tt.tt_common import TTContext, linear_from_host, linear_to_host, mask_row, pad_heads, pad_up, pad_vector, place_rows, stage_obs, stage_obs_mixed, take_rows, unpad_heads
 
 HALF_LOG_2PI = 0.5 * math.log(2.0 * math.pi)
 ACTIVATIONS = ("elu", "relu", "tanh", "identity")  # v1 scope: what was measured in Phase 0 (BRIEF 1: everything else needs approval)
@@ -120,22 +121,31 @@ class TTLinear:
     `heads` > 1 (the output layer of a heteroscedastic actor: mean | std): the out_features are `heads` blocks of equal size and every block is padded on its own
     (out_p = heads * pad_up(out_features / heads)), so the blocks are tile-aligned column slices of the output."""
 
-    def __init__(self, ctx: TTContext, mirror: Any, heads: int = 1) -> None:
+    def __init__(self, ctx: TTContext, mirror: Any, heads: int = 1, row_map: tuple | None = None) -> None:
         self.ctx, self.mirror, self.heads = ctx, mirror, heads
         self.in_features, self.out_features = mirror.in_features, mirror.out_features
         assert self.out_features % heads == 0, "the output blocks of a multi-head layer have the same size"
         self.in_p, self.out_p = pad_up(self.in_features), heads * pad_up(self.out_features // heads)
+        # row_map = (device row of every input feature, padded input width): a head fed by image encoders, whose latent has another layout than torch's flatten (rsl_rl_tt/cnn.py)
+        self.row_map = None
+        if row_map is not None:
+            assert heads == 1
+            self.row_map, self.in_p = [int(r) for r in row_map[0]], row_map[1]
         self.sync_from_torch()
 
     # torch layout <-> padded device layout of this layer (also used for the Adam moments of a checkpoint)
     def weight_to_host(self, w: Any) -> Any:
         """torch weight layout [out, in] -> padded [in_p, out_p]."""
+        if self.row_map is not None:
+            return place_rows(w.t(), self.row_map, self.in_p, self.out_p)
         return pad_heads(w.t(), self.in_p, self.out_p, self.heads)
 
     def bias_to_host(self, b: Any) -> Any:
         return pad_heads(b.reshape(1, -1), 1, self.out_p, self.heads)
 
     def weight_from_host(self, w: Any) -> Any:
+        if self.row_map is not None:
+            return take_rows(w, self.row_map, self.out_features).t().contiguous()
         return unpad_heads(w, self.in_features, self.out_features, self.heads).t().contiguous()
 
     def bias_from_host(self, b: Any) -> Any:
@@ -143,13 +153,15 @@ class TTLinear:
 
     def sync_from_torch(self) -> None:
         w, b = linear_to_host(self.mirror.weight, self.mirror.bias, self.in_p, self.out_p, self.heads)
+        if self.row_map is not None:
+            w = self.weight_to_host(self.mirror.weight.detach())
         self.w = self.ctx.upload_into(getattr(self, "w", None), w, op="H-6")
         self.b = self.ctx.upload_into(getattr(self, "b", None), b, op="H-6")
 
     def sync_to_torch(self) -> None:
         w = self.ctx.download(self.w, op="H-6", batch_sharded=False)
         b = self.ctx.download(self.b, op="H-6", batch_sharded=False)
-        w_t, b_t = linear_from_host(w, b, self.out_features, self.in_features, self.heads)
+        w_t, b_t = linear_from_host(w, b, self.out_features, self.in_features, self.heads) if self.row_map is None else (self.weight_from_host(w), self.bias_from_host(b))
         self.mirror.weight.data.copy_(w_t)
         self.mirror.bias.data.copy_(b_t)
 
@@ -160,7 +172,7 @@ class TTLinear:
 class TTMLP:
     """Linear + activation stack of an upstream `rsl_rl.modules.MLP` (last layer linear)."""
 
-    def __init__(self, ctx: TTContext, mirror: Any) -> None:
+    def __init__(self, ctx: TTContext, mirror: Any, first_row_map: tuple | None = None) -> None:
         self.ctx = ctx
         self.layers: list[TTLinear] = []
         self.acts: list[str | None] = []  # activation after each linear (None for the last one)
@@ -177,7 +189,7 @@ class TTMLP:
         for i, mod in enumerate(mods):
             if type(mod).__name__ == "Linear":
                 last = i == len(mods) - 1
-                self.layers.append(TTLinear(ctx, mod, heads=self.heads if last else 1))
+                self.layers.append(TTLinear(ctx, mod, heads=self.heads if last else 1, row_map=first_row_map if not self.layers else None))
                 nxt = mods[i + 1] if i + 1 < len(mods) else None
                 self.acts.append(_activation_name(nxt))
             elif i == 0 or not _is_activation(mod):
@@ -512,28 +524,62 @@ def _make_distribution(ctx: TTContext, mirror: Any) -> Any:
 class TTMLPModel:
     """Upstream `MLPModel` on device: obs groups -> (optional) empirical normalization -> MLP [-> Gaussian head]."""
 
-    def __init__(self, ctx: TTContext, mirror: Any) -> None:
+    def __init__(self, ctx: TTContext, mirror: Any, cnn_batches: list[int] | None = None) -> None:
+        """`cnn_batches`: the numbers of images per chip of the batches a model with image encoders will see (act step, mini-batch): the gather indices of the encoders are built for them."""
         self.ctx, self.mirror = ctx, mirror
-        self.obs_groups = list(mirror.obs_groups)
-        self.obs_dim = mirror.obs_dim
-        self.obs_dim_p = pad_up(self.obs_dim)
-        self.normalizer = TTEmpiricalNormalization(ctx, mirror.obs_normalizer, self.obs_dim) if mirror.obs_normalization else None
-        self.mlp = TTMLP(ctx, mirror.mlp)
+        self.obs_groups_1d = list(mirror.obs_groups)
+        self.obs_groups_2d = list(getattr(mirror, "obs_groups_2d", []))  # image groups of a `CNNModel`
+        self.obs_groups = self.obs_groups_1d + self.obs_groups_2d  # (the identity of the observation set: models with the same groups share the stored observations)
+        self.obs_dim = mirror.obs_dim  # the 1D features
+        self.cnn: TTCNNStack | None = None
+        self.cnn_cols: list[tuple[int, int]] = []  # (first column, width) of every image group in the staged observations
+        first_row_map = None
+        d1_p = pad_up(self.obs_dim) if self.obs_dim else 0
+        self.obs_dim_p = d1_p
+        if self.obs_groups_2d:
+            if getattr(mirror, "is_recurrent", False):
+                raise NotImplementedError("image encoders in a recurrent model are not supported")
+            if cnn_batches is None:
+                raise ValueError("a model with image observations needs the batch sizes its encoders will see (cnn_batches)")
+            cnns, rows_map, latent_p, torch_off = [], [], d1_p, self.obs_dim
+            rows_map += list(range(self.obs_dim))  # the 1D latent keeps its column
+            for g, name in enumerate(self.obs_groups_2d):
+                mod = mirror.cnns[name]
+                enc = TTCNN(ctx, mod, tuple(mirror.obs_dims_2d[g]), int(mirror.obs_channels_2d[g]), cnn_batches)
+                width = pad_up(enc.in_channels * enc.in_hw[0] * enc.in_hw[1])
+                self.cnn_cols.append((self.obs_dim_p, width))
+                self.obs_dim_p += width
+                rows_map += [latent_p + r for r in enc.latent_rows()]  # torch's flatten feature i of this encoder -> its column in the device latent
+                latent_p += enc.latent_p
+                torch_off += int(mod.output_dim)
+                cnns.append(enc)
+            self.cnn = TTCNNStack(ctx, cnns)
+            first_row_map = (rows_map, latent_p)
+        else:
+            self.obs_dim_p = pad_up(self.obs_dim)
+        self.normalizer = TTEmpiricalNormalization(ctx, mirror.obs_normalizer, self.obs_dim) if mirror.obs_normalization and self.obs_dim else None
+        self.mlp = TTMLP(ctx, mirror.mlp, first_row_map=first_row_map)
         self.recurrent = bool(getattr(mirror, "is_recurrent", False))
         self.rnn = TTRNN(ctx, mirror.rnn) if self.recurrent else None  # GRU / LSTM between the normalised observations and the MLP head (`RNNModel`)
+        self.encoder = self.rnn if self.recurrent else self.cnn  # what holds the parameters beyond the MLP head's (RNN weights / convolution kernels): same interface
         self.state: list = []  # the hidden state of a recurrent model: persistent [rows, H_p] tensors per layer (GRU) / (h, c) per layer (LSTM), see `allocate_state`
-        if self.mlp.in_features != (self.rnn.hidden if self.recurrent else self.obs_dim):
-            raise NotImplementedError("only plain MLP models (mlp input == concatenated obs) and RNN models (mlp input == rnn hidden) are supported")
+        if self.cnn is None and self.mlp.in_features != (self.rnn.hidden if self.recurrent else self.obs_dim):
+            raise NotImplementedError("only plain MLP models (mlp input == concatenated obs), RNN models (mlp input == rnn hidden) and CNN models are supported")
         self.distribution = _make_distribution(ctx, mirror.distribution)
         self.output_dim = self.distribution.dim if self.distribution is not None else self.mlp.out_features
         self.output_dim_p = pad_up(self.output_dim)
+
+    def _stage(self, obs: Any) -> Any:
+        if self.cnn is None:
+            return stage_obs(obs, self.obs_groups, self.obs_dim_p)
+        return stage_obs_mixed(obs, self.obs_groups_1d, pad_up(self.obs_dim) if self.obs_dim else 0, self.obs_groups_2d, [w for _, w in self.cnn_cols])
 
     # -- host staging (H-3 concat + H-1 upload) ---------------------------------------------------------------------------
     def obs_to_device(self, obs: Any, into: Any = None) -> Any:
         """H-3 concat + H-1 upload; with `into` the data is written in place into that persistent device tensor (a traced step reads it)."""
         ctx = self.ctx
         ctx.check_batch(obs[self.obs_groups[0]].shape[0], "number of environments / samples")
-        buf = stage_obs(obs, self.obs_groups, self.obs_dim_p)
+        buf = self._stage(obs)
         ctx.host_ops.count("H-3", buf.numel() * 4)
         return ctx.upload_into(into, buf, op="H-1", batch_sharded=True)
 
@@ -541,13 +587,30 @@ class TTMLPModel:
         """Like `obs_to_device`, but into a ROW_MAJOR persistent tensor (cheap upload); the traced act step tilizes it on the device."""
         ctx = self.ctx
         ctx.check_batch(obs[self.obs_groups[0]].shape[0], "number of environments / samples")
-        buf = stage_obs(obs, self.obs_groups, self.obs_dim_p)
+        buf = self._stage(obs)
         ctx.host_ops.count("H-3", buf.numel() * 4)
         return ctx.upload_rm_into(into, buf, op="H-1", batch_sharded=True)
 
     # -- compute ----------------------------------------------------------------------------------------------------------
     def latent(self, obs_dev: Any) -> Any:
+        if self.cnn is not None:
+            return self._cnn_latent(obs_dev, train=False)[0]
         return self.normalizer.forward(obs_dev) if self.normalizer is not None else obs_dev
+
+    def _cnn_latent(self, obs_dev: Any, train: bool) -> tuple[Any, list]:
+        """The model's latent for observations with images: [normalised 1D features | the encoders' latents], and the encoders' caches (`train`)."""
+        ttnn = self.ctx.ttnn
+        d1_p = pad_up(self.obs_dim) if self.obs_dim else 0
+        parts, caches = [], []
+        if self.obs_dim:
+            x1 = obs_dev[:, :d1_p]
+            parts.append(self.normalizer.forward(x1) if self.normalizer is not None else x1)
+        batch = obs_dev.shape[0]
+        for enc, (off, width) in zip(self.cnn.stack, self.cnn_cols):
+            latent, cache = enc.forward(obs_dev[:, off : off + width], batch, train)
+            parts.append(latent)
+            caches.append(cache)
+        return (parts[0] if len(parts) == 1 else ttnn.concat(parts, dim=1)), caches
 
     def allocate_state(self, rows: int) -> None:
         """The persistent hidden state of a recurrent model (zeros: upstream starts from `None`, which the RNN treats as zeros); allocated before any trace can be captured (T-15)."""
@@ -596,8 +659,24 @@ class TTMLPModel:
         rnn_grads, _ = self.rnn.backward_sequence(rnn_cache, d_steps, keeps)
         return mlp_grads, rnn_grads
 
-    def forward_train(self, obs_dev: Any) -> tuple[Any, list]:
+    def forward_train(self, obs_dev: Any) -> tuple[Any, Any]:
+        if self.cnn is not None:
+            latent, caches = self._cnn_latent(obs_dev, train=True)
+            out, mlp_cache = self.mlp.forward_train(latent)
+            return out, ("cnn", mlp_cache, caches, obs_dev.shape[0])
         return self.mlp.forward_train(self.latent(obs_dev))
+
+    def backward(self, cache: Any, d_out: Any) -> tuple[list, list]:
+        """(gradients of the MLP head [(dW, db)] per layer, gradients of the encoder parameters in `encoder.parameters()` order: empty for a plain MLP model) for d loss / d output."""
+        if not (isinstance(cache, tuple) and cache and cache[0] == "cnn"):
+            return self.mlp.backward(cache, d_out), []
+        _, mlp_cache, caches, batch = cache
+        mlp_grads, d_latent = self.mlp.backward(mlp_cache, d_out, input_grad=True)
+        grads, col = [], pad_up(self.obs_dim) if self.obs_dim else 0
+        for enc, cache_g in zip(self.cnn.stack, caches):
+            grads += enc.backward(cache_g, d_latent[:, col : col + enc.latent_p], batch)
+            col += enc.latent_p
+        return mlp_grads, grads
 
     def policy_forward(self, obs_dev: Any) -> tuple[Any, Any]:
         """Actor forward pass: (mean [rows, A_p], distribution state). The state is the (state-independent) distribution itself or, for a heteroscedastic
@@ -616,7 +695,7 @@ class TTMLPModel:
 
     def update_normalization(self, obs_dev: Any, rows: int) -> None:
         if self.normalizer is not None:
-            self.normalizer.update(obs_dev, rows)
+            self.normalizer.update(obs_dev[:, : pad_up(self.obs_dim)] if self.cnn is not None else obs_dev, rows)
 
     def set_training(self, training: bool) -> None:
         if self.normalizer is not None:
@@ -627,8 +706,8 @@ class TTMLPModel:
         if self.normalizer is not None:
             self.normalizer.sync_from_torch()
         self.mlp.sync_from_torch()
-        if self.rnn is not None:
-            self.rnn.sync_from_torch()
+        if self.encoder is not None:
+            self.encoder.sync_from_torch()
         if self.distribution is not None:
             self.distribution.sync_from_torch()
 
@@ -636,7 +715,7 @@ class TTMLPModel:
         if self.normalizer is not None:
             self.normalizer.sync_to_torch()
         self.mlp.sync_to_torch()
-        if self.rnn is not None:
-            self.rnn.sync_to_torch()
+        if self.encoder is not None:
+            self.encoder.sync_to_torch()
         if self.distribution is not None:
             self.distribution.sync_to_torch()
