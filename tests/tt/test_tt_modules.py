@@ -100,6 +100,7 @@ def test_model_forward_parity(tt_ctx, groups, used, out_dim, hidden, act, norm, 
     if norm:
         feed_normalizer(model, groups)
     tt = TTMLPModel(tt_ctx, model)
+    rows *= tt_ctx.n_chips  # several chips: `rows` rows PER CHIP (the rows are independent, so the result must not depend on how many chips share them)
     obs = make_obs(rows, groups, seed=7, scale=2.0, offset=0.5)
     with torch.no_grad():
         ref = model(obs)  # deterministic output = distribution mean
@@ -115,12 +116,13 @@ def test_model_without_distribution_is_a_critic(tt_ctx):
     model = make_model({"policy": 36, "privileged": 48}, ["policy", "privileged"], 1, [128, 64], dist=False, norm=True)
     feed_normalizer(model, {"policy": 36, "privileged": 48})
     tt = TTMLPModel(tt_ctx, model)
-    obs = make_obs(128, {"policy": 36, "privileged": 48}, seed=3)
+    rows = max(128, 32 * tt_ctx.n_chips)
+    obs = make_obs(rows, {"policy": 36, "privileged": 48}, seed=3)
     with torch.no_grad():
         ref = model(obs)
     out = tt_ctx.download(tt.forward(tt.obs_to_device(obs))[:, 0:1], op="H-2")
-    assert tt.distribution is None and out.shape == (128, 1)
-    rep = _record("critic[128,64,norm] rows=128", compare(out, ref, TOLERANCES["mlp_forward"]))
+    assert tt.distribution is None and out.shape == (rows, 1)
+    rep = _record(f"critic[128,64,norm] rows={rows}", compare(out, ref, TOLERANCES["mlp_forward"]))
     assert rep.passed, str(rep)
 
 
@@ -146,10 +148,12 @@ def test_normalizer_update_matches_upstream_over_many_batches(tt_ctx, dim):
 
     ref, mirror = EmpiricalNormalization(dim), EmpiricalNormalization(dim)
     tt = TTEmpiricalNormalization(tt_ctx, mirror, dim)
-    for i, rows in enumerate([512, 96, 4096, 32, 1024, 2048]):
+    n = tt_ctx.n_chips  # several chips: every chip holds `local` rows, the statistics are those of the UNION (upstream torch.distributed semantics, ADR-0004)
+    for i, local in enumerate([512, 96, 4096, 32, 1024, 2048]):
+        rows = local * n
         x = torch.randn(rows, dim, generator=torch.Generator().manual_seed(100 + i)) * (0.5 + i) + 3.0 * (i % 2)
         ref.update(x)
-        tt.update(tt_ctx.upload(pad_matrix(x, rows, pad_up(dim)), op="H-1", batch_sharded=True), rows)
+        tt.update(tt_ctx.upload(pad_matrix(x, rows, pad_up(dim)), op="H-1", batch_sharded=True), local)
         s = tt.host_stats()
         assert s["count"] == int(ref.count)
         r_mean = _record(f"normalizer.update mean dim={dim} step={i}", compare(s["mean"], ref.mean, TOLERANCES["normalizer_update"]))
@@ -160,20 +164,21 @@ def test_normalizer_update_matches_upstream_over_many_batches(tt_ctx, dim):
 def test_normalizer_respects_until_and_eval_mode(tt_ctx):
     from rsl_rl_tt.modules import TTEmpiricalNormalization
 
-    norm = EmpiricalNormalization(8, until=100)
+    n = tt_ctx.n_chips  # the count is global: every update adds 64 rows per chip
+    norm = EmpiricalNormalization(8, until=100 * n)
     tt = TTEmpiricalNormalization(tt_ctx, norm, 8)
-    x = pad_matrix(torch.randn(64, 8), 64, 32)
+    x = pad_matrix(torch.randn(64 * n, 8), 64 * n, 32)
     dev = tt_ctx.upload(x, op="H-1", batch_sharded=True)
     tt.update(dev, 64)
-    assert tt.count == 64
-    tt.update(dev, 64)  # 64 < until=100 -> still learns, count 128
-    assert tt.count == 128
+    assert tt.count == 64 * n
+    tt.update(dev, 64)  # 64 n < until = 100 n -> still learns, count 128 n
+    assert tt.count == 128 * n
     tt.update(dev, 64)  # count >= until -> frozen
-    assert tt.count == 128
+    assert tt.count == 128 * n
     tt.until = None
     tt.training = False
     tt.update(dev, 64)  # eval mode never learns
-    assert tt.count == 128
+    assert tt.count == 128 * n
 
 
 # ---- GaussianDistribution -------------------------------------------------------------------------------------------------------
@@ -249,11 +254,11 @@ def test_host_op_accounting_for_one_model_upload(tt_ctx):
     groups = {"policy": 36, "privileged": 48}
     tt = TTMLPModel(tt_ctx, make_model(groups, ["policy", "privileged"], 1, [64], dist=False))
     tt_ctx.host_ops.reset()
-    tt.obs_to_device(make_obs(64, groups))
+    tt.obs_to_device(make_obs(32 * tt_ctx.n_chips, groups))
     assert dict(tt_ctx.host_ops.calls) == {"H-3": 1, "H-1": 1}
     with pytest.raises(RuntimeError, match="not on the allow-list"):
         tt_ctx.host_ops.count("H-99")
-    with pytest.raises(ValueError, match="not a multiple of 32"):
+    with pytest.raises(ValueError, match="not a multiple of"):
         tt.obs_to_device(make_obs(40, groups))
 
 
@@ -269,6 +274,7 @@ def test_random_shape_sweep(tt_ctx, seed):
     used = g.sample(list(groups), k=g.randint(1, len(groups)))
     hidden = [g.randint(1, 140) for _ in range(g.randint(1, 3))]
     out_dim, act, norm, rows = g.randint(1, 40), g.choice(["elu", "tanh", "relu"]), g.choice([True, False]), g.choice([32, 64, 288])
+    rows *= tt_ctx.n_chips  # rows per chip (see test_model_forward_parity)
     model = make_model(groups, used, out_dim, hidden, act, norm, seed=seed)
     if norm:
         feed_normalizer(model, groups)
@@ -292,7 +298,7 @@ def test_loading_a_checkpoint_into_the_mirror_then_syncing_updates_the_device_co
     with torch.no_grad():
         b.distribution.std_param.mul_(0.5)
     tt = TTMLPModel(tt_ctx, a)
-    obs = make_obs(64, groups, seed=3)
+    obs = make_obs(max(64, 32 * tt_ctx.n_chips), groups, seed=3)
     a.load_state_dict(b.state_dict())  # e.g. OnPolicyRunner.load()
     stale = tt_ctx.download(tt.forward(tt.obs_to_device(obs)), op="H-2")[:, :12]
     tt.sync_from_torch()

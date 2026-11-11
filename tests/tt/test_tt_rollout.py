@@ -16,7 +16,7 @@ import pytest
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl_tt.testing.envs import ENV_NAMES, make_env
 from rsl_rl_tt.testing.parity import TOLERANCES, compare
-from rsl_rl_tt.testing.reference import REF_SPECS, RefSpec, make_train_cfg
+from rsl_rl_tt.testing.reference import REF_SPECS, RefSpec, make_train_cfg, test_mesh_shape
 
 pytestmark = pytest.mark.tt
 
@@ -25,7 +25,8 @@ STEPS = 8
 
 def small_spec(name: str, **over) -> RefSpec:
     base = REF_SPECS[name]
-    kw = dict(num_envs=128, num_steps=STEPS, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1})
+    n_chips = test_mesh_shape()[0] * test_mesh_shape()[1]  # every chip needs a multiple of 32 environments
+    kw = dict(num_envs=max(128, 32 * n_chips), num_steps=STEPS, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1})
     kw.update(over)
     return RefSpec(**kw)
 
@@ -36,7 +37,7 @@ def build_tt_runner(name: str, tmp_path, spec: RefSpec | None = None, tt_cfg: di
     env = make_env(name, spec.num_envs, seed=seed)
     cfg = make_train_cfg(name, spec)
     cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"
-    cfg["algorithm"]["tt_cfg"] = tt_cfg if tt_cfg is not None else {"mesh_shape": [1, 1]}
+    cfg["algorithm"]["tt_cfg"] = tt_cfg if tt_cfg is not None else {"mesh_shape": test_mesh_shape()}
     return OnPolicyRunner(env, cfg, log_dir=str(tmp_path), device="cpu"), env, cfg
 
 
@@ -123,7 +124,7 @@ def test_std_mirror_and_policy_export_path_work_without_an_update(tt_mesh, tmp_p
     "spec_kwargs, match",
     [
         ({"num_envs": 100}, "num_envs of 100"),
-        ({"num_envs": 64, "num_steps": 2, "algorithm": {"num_mini_batches": 8}}, "mini-batch"),  # 128 / 8 = 16 rows per mini-batch
+        ({"num_envs": 32 * test_mesh_shape()[0] * test_mesh_shape()[1], "num_steps": 2, "algorithm": {"num_mini_batches": 8}}, "mini-batch"),  # 8 rows per chip and mini-batch
     ],
 )
 def test_alignment_rules_refuse_bad_configurations(tt_mesh, tmp_path, spec_kwargs, match):

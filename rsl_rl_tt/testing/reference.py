@@ -73,6 +73,15 @@ def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | No
     return cfg
 
 
+def test_mesh_shape() -> list[int]:
+    """Mesh shape of the device tests: `TT_TEST_MESH` ("1x1" default, "1x2", "2x4"), which must match the chips selected with `scripts/tt_run.sh --chips`."""
+    rows, cols = (int(v) for v in os.environ.get("TT_TEST_MESH", "1x1").split("x"))
+    return [rows, cols]
+
+
+test_mesh_shape.__test__ = False  # not a pytest test (the name starts with "test_")
+
+
 def build_reference_runner(env_name: str, seed: int, log_dir: str | None, spec: RefSpec | None = None, num_envs: int | None = None, tt: bool = False, tt_cfg: dict | None = None):
     """Seed torch and the env, build env + the UNMODIFIED upstream OnPolicyRunner (device cpu). Returns (runner, env, spec).
 
@@ -84,7 +93,7 @@ def build_reference_runner(env_name: str, seed: int, log_dir: str | None, spec: 
     cfg = make_train_cfg(env_name, spec)
     if tt:
         cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"
-        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [1, 1], **(tt_cfg or {})}
+        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": test_mesh_shape(), **(tt_cfg or {})}
     runner = OnPolicyRunner(env, cfg, log_dir=log_dir, device="cpu")
     return runner, env, spec
 

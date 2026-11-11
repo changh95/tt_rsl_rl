@@ -1,0 +1,42 @@
+{
+ "mesh": "1x2",
+ "seeds": {
+  "3": {
+   "first_499": 67,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "4": {
+   "first_499": 66,
+   "final": 287.2,
+   "min_after": 287.2,
+   "collapsed": true
+  },
+  "5": {
+   "first_499": 79,
+   "final": 100.36,
+   "min_after": 97.85,
+   "collapsed": true
+  },
+  "6": {
+   "first_499": 71,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "7": {
+   "first_499": 66,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "8": {
+   "first_499": 72,
+   "final": 189.05,
+   "min_after": 189.05,
+   "collapsed": true
+  }
+ },
+ "collapsed": 3
+}

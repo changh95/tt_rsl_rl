@@ -71,15 +71,38 @@ class TTContext:
     n_chips: int
     compute_cfg: Any
     host_ops: HostOpCounter = field(default_factory=HostOpCounter)
+    mesh_shape: tuple[int, int] = (1, 1)  # (rows, cols) of the mesh: the cross-chip sums gather along each axis of size > 1
 
     @classmethod
-    def create(cls, mesh: Any, math_fidelity: str = "HiFi4") -> TTContext:
-        """`math_fidelity` ("HiFi4" = the fp32 policy of BRIEF 3.4 / TOLERANCES.md; "HiFi3", "HiFi2", "LoFi" only for the Phase 5 precision experiments)."""
+    def create(cls, mesh: Any, math_fidelity: str = "HiFi4", mesh_shape: tuple[int, int] | None = None) -> TTContext:
+        """`math_fidelity` ("HiFi4" = the fp32 policy of BRIEF 3.4 / TOLERANCES.md; "HiFi3", "HiFi2", "LoFi" only for the Phase 5 precision experiments).
+        `mesh_shape` defaults to a single row of all chips."""
         import ttnn
 
         fidelity = getattr(ttnn.MathFidelity, math_fidelity)
         cfg = ttnn.WormholeComputeKernelConfig(math_fidelity=fidelity, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True)
-        return cls(ttnn=ttnn, mesh=mesh, n_chips=mesh.get_num_devices(), compute_cfg=cfg)
+        n = mesh.get_num_devices()
+        return cls(ttnn=ttnn, mesh=mesh, n_chips=n, compute_cfg=cfg, mesh_shape=tuple(mesh_shape) if mesh_shape else (1, n))
+
+    # -- cross-chip arithmetic (ADR-0004 amendment A-1) --------------------------------------------------------------------------
+    def sum_over_chips(self, t: Any, scale: float | None = None) -> Any:
+        """Sum over all chips of a tensor whose logical shape is the same on every chip but whose VALUES differ (e.g. a locally computed gradient), times `scale`
+        (1/N for a mean). `ttnn.all_reduce` is not fp32-accurate (rel 5.5e-4, T-4), so every chip gathers all shards along each mesh axis (a pure copy) and sums
+        them in fp32 with `ttnn.sum` (5.1e-8, bit-identical on every chip): the replicas of parameters and optimizer state cannot drift apart."""
+        ttnn = self.ttnn
+        if self.n_chips == 1:
+            return t if scale is None else ttnn.multiply(t, scale)
+        shape = tuple(t.shape)
+        x = ttnn.reshape(t, (1, *shape))  # [1, R, C]: all_gather along dim 0 stacks the chips' shards
+        for axis, size in enumerate(self.mesh_shape):
+            if size > 1:
+                x = ttnn.all_gather(x, dim=0, cluster_axis=axis)
+        s = ttnn.reshape(ttnn.sum(x, dim=0, keepdim=True, compute_kernel_config=self.compute_cfg), shape)
+        return s if scale is None else ttnn.multiply(s, scale)
+
+    def mean_over_chips(self, t: Any) -> Any:
+        """Mean over the chips of a per-chip value (identity on one chip: no op is added to the single-chip path)."""
+        return t if self.n_chips == 1 else self.sum_over_chips(t, 1.0 / self.n_chips)
 
     # -- checks ------------------------------------------------------------------------------------------------------------
     def check_batch(self, rows: int, what: str = "batch") -> int:
@@ -156,11 +179,21 @@ class TTContext:
         return ttnn.from_torch(torch.full((1, 1), float(value)), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
 
     def upload_index(self, host_idx: torch.Tensor, *, op: str) -> Any:
-        """A UINT32 ROW_MAJOR [1, N] index row for `ttnn.embedding` (the row gather of the shuffle); the permutation itself is drawn on the host (allow-list H-4)."""
+        """A UINT32 ROW_MAJOR [1, N] index row for `ttnn.embedding` (the row gather of the shuffle); the permutation itself is drawn on the host (allow-list H-4).
+
+        On several chips `host_idx` holds the chips' LOCAL permutations one after the other (chip c's slice = `host_idx[c * n_local:(c + 1) * n_local]`, indices
+        into that chip's own rows) and is sharded along the index axis: every chip shuffles its own shard of the batch (upstream: an independent randperm per rank)."""
         ttnn = self.ttnn
-        assert host_idx.dim() == 1 and host_idx.numel() % TILE == 0, host_idx.shape
+        assert host_idx.dim() == 1 and host_idx.numel() % (self.n_chips * TILE) == 0, host_idx.shape
         self.host_ops.count(op, host_idx.numel() * 4)
-        return ttnn.from_torch(host_idx.to(torch.int64).reshape(1, -1), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
+        mapper = ttnn.ShardTensorToMesh(self.mesh, dim=1) if self.n_chips > 1 else ttnn.ReplicateTensorToMesh(self.mesh)
+        return ttnn.from_torch(host_idx.to(torch.int64).reshape(1, -1), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh, mesh_mapper=mapper)
+
+    def per_chip(self, dev: Any, *, op: str = "H-6") -> torch.Tensor:
+        """Download EVERY chip's copy of a (replicated or sharded) tensor as [n_chips, ...] float32 (tests and the replica consistency check, H-6)."""
+        host = self.ttnn.to_torch(dev, mesh_composer=self.ttnn.ConcatMeshToTensor(self.mesh, dim=0))
+        self.host_ops.count(op, host.numel() * 4)
+        return host.to(torch.float32).reshape(self.n_chips, host.shape[0] // self.n_chips, *host.shape[1:])
 
     def zeros(self, rows: int, cols: int, *, batch_sharded: bool, op: str = "H-6") -> Any:
         return self.upload(torch.zeros(rows, cols), op=op, batch_sharded=batch_sharded)

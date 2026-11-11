@@ -1,0 +1,78 @@
+{
+ "mesh": "1x2",
+ "seeds": {
+  "9": {
+   "first_499": 82,
+   "final": 500.0,
+   "min_after": 499.21,
+   "collapsed": false
+  },
+  "10": {
+   "first_499": 77,
+   "final": 88.76,
+   "min_after": 86.17,
+   "collapsed": true
+  },
+  "11": {
+   "first_499": 83,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "12": {
+   "first_499": 68,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "13": {
+   "first_499": 77,
+   "final": 144.18,
+   "min_after": 142.48,
+   "collapsed": true
+  },
+  "14": {
+   "first_499": 71,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "15": {
+   "first_499": null,
+   "final": 395.69,
+   "min_after": null,
+   "collapsed": false
+  },
+  "16": {
+   "first_499": 69,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "17": {
+   "first_499": 75,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "18": {
+   "first_499": 64,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "19": {
+   "first_499": 42,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  },
+  "20": {
+   "first_499": 77,
+   "final": 500.0,
+   "min_after": 500.0,
+   "collapsed": false
+  }
+ },
+ "collapsed": 2
+}

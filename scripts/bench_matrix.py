@@ -66,7 +66,7 @@ def env_step_cost_ms(num_envs: int, steps: int = 24, repeats: int = 3) -> float:
     return statistics.median(times[1:]) * 1e3
 
 
-def build(backend: str, num_envs: int, hidden: list[int], steps: int = 24, trace: bool = False, mini_batches: int | None = None, fidelity: str = "HiFi4"):
+def build(backend: str, num_envs: int, hidden: list[int], steps: int = 24, trace: bool = False, mini_batches: int | None = None, fidelity: str = "HiFi4", mesh: tuple[int, int] = (1, 1)):
     algorithm = {**REF_SPECS["tracking12"].algorithm, **({"num_mini_batches": mini_batches} if mini_batches else {})}
     spec = RefSpec(num_envs=num_envs, num_steps=steps, iterations=1, hidden=tuple(hidden), algorithm=algorithm)
     torch.manual_seed(0)
@@ -75,7 +75,7 @@ def build(backend: str, num_envs: int, hidden: list[int], steps: int = 24, trace
     cfg["check_for_nan"] = False  # the real runner checks env tensors on the host; not part of the algorithm cost
     if backend == "tt":
         cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"
-        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [1, 1], "math_fidelity": fidelity, **({"trace": True} if trace else {})}
+        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": list(mesh), "math_fidelity": fidelity, **({"trace": True} if trace else {})}
     return OnPolicyRunner(env, cfg, log_dir=None, device="cpu"), env, spec
 
 
@@ -128,6 +128,7 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=16, help="torch threads (CPU backend and host-side work)")
     ap.add_argument("--mini-batches", type=int, default=None, help="override num_mini_batches (upstream default 4); the matrix at 65536 envs may need more to fit the device memory")
     ap.add_argument("--fidelity", default="HiFi4", help="TT only: math fidelity of matmuls/reductions (precision experiment when not HiFi4)")
+    ap.add_argument("--mesh", default="1x1", help="TT only: mesh shape RxC of the chips of this job (Phase 6: 1x1, 1x2 with --chips 16,17, 2x4 with all eight); num_envs is the TOTAL over the chips")
     ap.add_argument("--env-cost", action="store_true", help="host only: time the real CPU tracking12 environment at this size instead of the algorithm")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -138,12 +139,13 @@ def main() -> None:
         if args.out:
             Path(args.out).write_text(json.dumps(res, indent=2))
         return
-    runner, env, spec = build(args.backend, args.envs, args.hidden, args.steps, args.trace, args.mini_batches, args.fidelity)
+    mesh = tuple(int(v) for v in args.mesh.split("x"))
+    runner, env, spec = build(args.backend, args.envs, args.hidden, args.steps, args.trace, args.mini_batches, args.fidelity, mesh)
     if args.backend == "tt" and args.profile:
         runner.alg.timer.enabled = True
     print(f"backend={args.backend} envs={args.envs} hidden={args.hidden} steps={args.steps} trace={args.trace} profile={args.profile} mini_batches={args.mini_batches or 4}", flush=True)
     res = run_iterations(runner.alg, env, spec, args.iters, args.warmup)
-    res.update({"backend": args.backend, "num_envs": args.envs, "hidden": args.hidden, "num_steps": args.steps, "trace": args.trace, "profile": args.profile, "mini_batches": args.mini_batches or 4, "fidelity": args.fidelity})
+    res.update({"backend": args.backend, "num_envs": args.envs, "hidden": args.hidden, "num_steps": args.steps, "trace": args.trace, "profile": args.profile, "mini_batches": args.mini_batches or 4, "fidelity": args.fidelity, "mesh": args.mesh, "chips": mesh[0] * mesh[1]})
     if args.backend == "tt":
         res["host_ops"] = runner.alg.ctx.host_ops.snapshot()
     print(json.dumps({k: v for k, v in res.items() if k != "sections"}, indent=1))

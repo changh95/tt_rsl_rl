@@ -3,6 +3,28 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-11 — Phase 6 DONE: tray multi-chip data parallel, 1x2 and 2x4 (tag `phase-6-done`)
+**Done**
+- `TTPPO` runs on a mesh (`tt_cfg["mesh_shape"]` = [1, 2] or [2, 4], fabric FABRIC_1D set automatically): the batch is sharded over the chips; parameters, Adam state and the learning rate are replicated; every chip computes the
+  loss / gradient of ITS mini-batch, the gradients are averaged over the chips BEFORE the per-model clip (`TTContext.mean_over_chips` = `all_gather` along every mesh axis + fp32 `ttnn.sum`, ADR-0004 A-1; inside the traces),
+  the KL of the adaptive schedule is the mean over the chips, observation-normalizer statistics are GLOBAL (upstream torch.distributed formula), advantage normalisation and shuffling are chip-LOCAL (an independent
+  permutation of every chip's own rows), `replica_check_interval` verifies that all chips hold bit-identical parameters / Adam moments / normalizer statistics / learning rate. Single-chip path unchanged (Phase 2-5 suites pass).
+- Tests (`tests/tt/test_tt_multichip.py`, 12 per mesh; `scripts/run_phase6_final.sh`): exactly the selected nodes open (all eight on 2x4); cross-chip sum/mean 1.1e-7 vs float64 and bit-identical on every chip; global normalizer
+  statistics vs upstream on the union; per-chip shuffle bit-exact; per-chip advantage statistics; **N chips vs 1 chip**: three mini-batch steps on the union mini-batches (loss -> gradient exchange -> clip -> Adam -> mean-KL
+  adaptive LR) deviate by 1.3e-3 (actor) / 6.2e-4 (critic) of the update size on BOTH meshes (limit 2e-2 fixed beforehand), learning-rate sequence identical; replicas bit-identical after training, traced and eager, and a deliberately
+  corrupted replica is detected; traced == eager bit for bit on 2 and 8 chips (also after `load()`). The chip-count independent suites (forward, rollout, checkpoint, normalizer: 84 tests) and `test_tt_trace.py` (5) pass on
+  1x2 and 2x4; single chip 157 + 5; host tests 399.
+- Learning on the meshes (`docs/porting/tt_runs_mesh_1x2/`, `tt_runs_mesh_2x4/`, traced, 3 envs x 3 seeds, replicas checked every 10 updates): Phase 4 criterion met on both: cartpole 476.8 (1x2) / 499.9 (2x4) [golden 500.0, threshold
+  475.0], pendulum -151.8 / -151.8 [-152.1], tracking12 191.1 / 193.4 [190.7]. The cartpole 1x2 mean is close to the threshold because seed 0 lost the policy late (value-loss blow-up at the learning-rate cap); this happens on ONE
+  chip as well: over seeds 3-20, 2/18 (1 chip), 5/18 (1x2), 1/18 (2x4) collapsed after reaching 500, no trend with the chip count (Fisher p 0.40 / 1.0).
+- Scaling (`docs/porting/PERF.md` 7b): 8 chips are 2.0-2.2x faster than one at 4096 envs and 5.2-5.3x at 65536 envs (1.47 M env-steps/s for [512,256,128]; 1.07 s / 2.38 s per iteration against 73 s / 238 s for upstream CPU = 69x / 100x).
+  What limits small batches is the host loop (one act + process_env_step per environment step) and the gradient exchange.
+- Findings: **T-14 corrected** (the bit-identical-rows property holds for the same chip count only: with different rows PER CHIP the matmul accumulation order changes, max 1.2e-4 vs 1.7e-3 noise floor; a first version of the
+  N-vs-1 test asserted bit equality and was corrected by this measurement, not by loosening a tolerance); **T-17** (CCL inside a trace works). The 1-chip equivalence reference is a fixture (`tests/tt/data/mc_step_reference.npz`;
+  `.npz` because `*.pt` is git-ignored on purpose).
+**Next**: Phase 7 (Isaac Lab integration): ISAAC_HOST is unknown, so the env bridge (ZeroMQ + float32 raw buffers, ADR-0003) is built and validated on the same host with a loopback server wrapping the CPU test env first;
+runbook and scripts for the GPU host (Isaac-Cartpole -> one locomotion task), TT checkpoint replay in Isaac Lab play.
+
 ## 2026-11-11 — Phase 5 DONE: 1-chip performance, traced path (tag `phase-5-done`)
 **Done**
 - act step, mini-batch update step and GAE are captured once as Metal traces and replayed, with persistent in-place device state. Traced == eager BIT FOR BIT (cartpole, tracking12, 4 iterations, all

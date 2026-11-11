@@ -108,6 +108,36 @@ Optimisations found by these measurements (all keep results bit-identical to the
   (eager TT 68 / 143 / 322 s, upstream CPU 20 / 50 / 230 s).
 * Iteration breakdown, op profile, the benchmark matrix with the unfavourable regimes and the precision experiments: sections 2-6.
 
+## 7b. Multi-chip scaling (Phase 6, data parallel on the tray)
+
+Same benchmark (null env, algorithm cost per iteration, traced path), `--mesh 1x2` (chips 16, 17) and `--mesh 2x4` (all eight chips of tray 3); `num_envs` is the TOTAL over the chips, the batch is sharded
+over them (every chip needs a multiple of 32 environments). The gradients are averaged over the chips with `all_gather` along every mesh axis + fp32 `ttnn.sum` (ADR-0004 A-1), ~40 collective ops per mini-batch step
+inside the trace. The 1-chip column is the Phase 5 matrix (a repeat of 4096 x [512, 256, 128] gave 446 ms against 447 ms: the single-chip path did not change).
+
+| num_envs | hidden | chips | TT ms | act | process | update | env-steps/s | speed-up vs 1 chip | efficiency |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | [512, 256, 128] | 1 / 2 / 8 | 447 / 318 / 224 | 79 / 65 / 63 | 36 / 36 / 40 | 332 / 216 / 121 | 220 k / 309 k / 439 k | 1.0 / 1.40 / 2.00 | 100 / 70 / 25 % |
+| 4096 | [1024, 1024, 512] | 1 / 2 / 8 | 913 / 675 / 408 | 100 / 91 / 51 | 36 / 37 / 22 | 777 / 546 / 335 | 108 k / 146 k / 241 k | 1.0 / 1.35 / 2.24 | 100 / 68 / 28 % |
+| 16384 | [512, 256, 128] | 1 / 2 / 8 | 1469 / 883 / 409 | 252 / 199 / 141 | 45 / 45 / 41 | 1172 / 637 / 228 | 268 k / 446 k / 962 k | 1.0 / 1.66 / 3.59 | 100 / 83 / 45 % |
+| 16384 | [1024, 1024, 512] | 1 / 2 / 8 | 3743 / 2152 / 757 | 339 / 252 / 125 | 24 / 46 / 28 | 3380 / 1854 / 604 | 105 k / 183 k / 519 k | 1.0 / 1.74 / 4.94 | 100 / 87 / 62 % |
+| 65536 | [512, 256, 128] | 1 / 2 / 8 | 5522 / 3010 / 1068 | 894 / 650 / 351 | 57 / 48 / 53 | 4567 / 2309 / 663 | 285 k / 523 k / **1.47 M** | 1.0 / 1.83 / 5.17 | 100 / 92 / 65 % |
+| 65536 | [1024, 1024, 512] | 1 / 2 / 8 | 12530 / 7893 / 2376 | 1358 / 986 / 395 | 72 / 73 / 57 | 11096 / 6809 / 1923 | 126 k / 199 k / 662 k | 1.0 / 1.59 / **5.27** | 100 / 79 / 66 % |
+
+* The update scales with the chips where there is work to share (65536 envs [512, 256, 128]: 4567 -> 2309 -> 663 ms, 6.9x on 8 chips); what limits the whole iteration is the part that is NOT sharded: the host loop of one `act` + one
+  `process_env_step` per environment step (tens of ms per iteration, independent of the chip count; ~63 + 40 ms at 4096 envs on 8 chips), the per-mini-batch gradient exchange (a 512 x 256 gradient costs 0.26 ms on 2 chips and 0.37 ms on
+  8, a 1024 x 1024 one 1.7 / 2.6 ms, T-17; estimated from these probe times: ~9 ms per mini-batch step for the [1024, 1024, 512] networks on 8 chips, ~10 % of a 96 ms step; not measured in place) and the smaller per-chip matmuls.
+* So a small batch does not benefit from many chips (4096 envs: 2.0-2.2x on 8 chips), a large one does (65536 envs: 5.2-5.3x, 1.47 M environment steps per second at [512, 256, 128]). Use as many chips as the
+  batch can keep busy: roughly >= 8k environments per chip.
+* Upstream's CPU at 65536 envs needs 73 s ([512, 256, 128]) / 238 s ([1024, 1024, 512]) per iteration: the full tray is **69x / 100x** faster than the CPU baseline at that size (1.07 s / 2.38 s).
+
+Learning on several chips (`docs/porting/tt_runs_mesh_1x2/`, `tt_runs_mesh_2x4/`, traced path, 3 envs x 3 seeds each, replicas checked every 10 updates): the Phase 4 criterion is met on both meshes, no NaN/Inf: cartpole 476.8
+(1x2; seed 0 collapsed late, see below) / 499.9 (2x4) [golden 500.0, threshold 475.0], pendulum -151.8 / -151.8 [-152.1, -159.7], tracking12 191.1 / 193.4 [190.7, 181.2]. Wall time per run on 8 chips 12-23 s / 30-36 s /
+64-72 s (1 chip, traced: 14 / 36 / 77 s: the host environment and noise dominate these small tasks).
+
+Late collapse on cartpole. With a maximum reward of 500 reached, PPO with the adaptive learning rate at its cap (0.01) can lose the policy again (critic divergence: value loss 1 -> 450). It also happens on ONE chip and is
+not specific to the mesh: seeds 3-20 collapsed 2 of 18 (1 chip), 5 of 18 (1x2), 1 of 18 (2x4) (`measurements/stability_cartpole_*.json`; Fisher exact p = 0.40 for 1x2 vs 1 chip, 1.0 for 2x4 vs 1 chip: no trend with the chip count). The
+criterion of Phase 4 averages three seeds and was met; the CPU golden runs (3 seeds) did not collapse.
+
 ## 8. Reproduce
 
 ```bash
@@ -115,6 +145,7 @@ scripts/run_phase5_final.sh                      # everything below, fail-fast, 
 scripts/run_bench_matrix.sh                      # TT traced matrix: num_envs {4096, 16384, 65536} x hidden {[512,256,128], [1024,1024,512]}
 scripts/run_bench_cpu.sh                         # upstream CPU matrix + real env cost (host only)
 scripts/run_bench_small.sh                       # small regimes (TT + CPU) and eager TT at 4096 envs
+scripts/run_bench_scaling.sh                     # Phase 6: chips {1, 2, 8} x num_envs x hidden (traced, null env)
 scripts/tt_run.sh --chips 16 --timeout 900 -- python scripts/profile_ops.py --envs 65536 --hidden 512 256 128      # op profile
 scripts/tt_run.sh --chips 16 --timeout 900 -- python scripts/bench_matrix.py --backend tt --trace --profile --envs 4096 --hidden 512 256 128   # section profile
 scripts/tt_run.sh --chips 16 --timeout 3600 -- python scripts/train_tt.py --trace --out docs/porting/tt_runs_trace  # end-to-end on the traced path
@@ -124,5 +155,7 @@ scripts/tt_run.sh --chips 16 --timeout 3600 -- python scripts/train_tt.py --trac
 
 * `process_env_step` (about 8 % at 4096 envs) is eager (~10 ops per step); it could join the act trace of the next step.
 * The critic's observations contain the actor's observations (36 of 84 columns): uploading the critic's observations once and slicing the actor's on the device saves ~35 % of the upload.
-* Real overlap of the host work (noise draw, staging) with the device (the loop is synchronous at the action download, one sync per environment step by design, H-2).
+* Real overlap of the host work (noise draw, staging) with the device (the loop is synchronous at the action download, one sync per environment step by design, H-2): with 8 chips this host loop is what
+  limits small batches (section 7b).
+* Packing all gradients of a step into one tensor before the exchange (one gather per mesh axis instead of ~20 per model).
 * bf16 activations (section 6). Multi-chip data parallel: Phase 6.

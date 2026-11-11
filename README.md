@@ -20,7 +20,7 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 | 3 | 1-chip backward, optimizer, PPO update | done (tag `phase-3-done`) |
 | 4 | 1-chip end-to-end training + checkpoint compatibility | done (tag `phase-4-done`) |
 | 5 | 1-chip performance (trace, pre-allocation) | done (tag `phase-5-done`): 7-19x faster than upstream CPU per iteration, [`PERF.md`](docs/porting/PERF.md) |
-| 6 | Tray multi-chip data parallel (8 chips) | pending |
+| 6 | Tray multi-chip data parallel (8 chips) | done (tag `phase-6-done`): 1x2 and 2x4, 5.3x at 65536 envs on 8 chips, [`PERF.md`](docs/porting/PERF.md) 7b |
 | 7 | Isaac Lab integration | pending |
 
 > This is a work in progress on shared hardware; it only ever touches one dedicated 8-chip tray (see `CLAUDE.md`).

@@ -65,7 +65,13 @@ class TTRolloutStorage:
 
     @property
     def batch_size(self) -> int:
+        """Samples of one rollout over ALL chips."""
         return self.num_envs * self.num_transitions_per_env
+
+    @property
+    def local_batch_size(self) -> int:
+        """Samples of one rollout on ONE chip (the environments are sharded over the chips): the denominator of every chip-local statistic."""
+        return self.batch_size // self.ctx.n_chips
 
     # -- rollout ----------------------------------------------------------------------------------------------------------
     def add_transition(self, *, actor_obs: Any, critic_obs: Any, action: Any, mean: Any, value: Any, logp: Any, reward: Any, done: Any) -> None:
@@ -110,8 +116,8 @@ class TTRolloutStorage:
             returns[step] = ttnn.add(advantage, s["value"])
         self.returns = returns[0] if n == 1 else ttnn.concat(returns, dim=0)
         self.advantages = ttnn.subtract(self.returns, self._cat("value"))
-        if normalize_advantages and self.batch_size > 1:
-            self.advantages = self.normalize(self.advantages, self.batch_size)
+        if normalize_advantages and self.local_batch_size > 1:  # chip-LOCAL statistics, like a rank of upstream multi-GPU (ADR-0004)
+            self.advantages = self.normalize(self.advantages, self.local_batch_size)
         if self.persistent:  # a (traced) GAE writes its results in place into persistent buffers (adopted on the first pass)
             for key in ("returns", "advantages"):
                 self._out[key] = self.ctx.put(self._out.get(key), getattr(self, key))
@@ -163,7 +169,7 @@ class TTRolloutStorage:
         exact in fp32), the 3 x width bf16 columns are gathered with `embedding` (a page copy, ~1 ms per 100k rows) and added back: bit-exact for
         every finite value with |x| >= 1e-30 (below that the tiny remainders hit the fp32 flush-to-zero threshold: absolute error <= 2e-38) and 40-50x faster than the fp32 gather (Phase 5 probe, TTNN_ISSUES T-12)."""
         ttnn = self.ctx.ttnn
-        n, w = self.batch_size, self.width
+        n, w = self.local_batch_size, self.width  # per chip: every chip gathers from its own shard with its own (local) indices
         h1 = ttnn.typecast(table, ttnn.bfloat16)
         r1 = ttnn.subtract(table, ttnn.typecast(h1, ttnn.float32))
         h2 = ttnn.typecast(r1, ttnn.bfloat16)

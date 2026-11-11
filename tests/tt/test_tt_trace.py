@@ -17,31 +17,33 @@ import pytest
 
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl_tt.testing.envs import make_env
-from rsl_rl_tt.testing.reference import make_train_cfg
+from rsl_rl_tt.testing.reference import make_train_cfg, test_mesh_shape
 from tests.tt.test_tt_rollout import small_spec
 from tests.tt.test_tt_update import tt_params
 
 pytestmark = pytest.mark.tt
 
 STEP_FIELDS = ("actor_obs", "critic_obs", "action", "mean", "value", "logp", "reward", "done")
+_ROWS, _COLS = test_mesh_shape()  # TT_TEST_MESH: the same tests also run on 1x2 / 2x4 (Phase 6: traces with the gradient exchange inside)
+N_CHIPS = _ROWS * _COLS
 
 
 @pytest.fixture(scope="module")
 def traced_mesh():
     from rsl_rl_tt.device import open_tray_mesh
 
-    tm = open_tray_mesh((1, 1), trace_region_size=128 * 1024 * 1024)
+    tm = open_tray_mesh((_ROWS, _COLS), fabric_config="FABRIC_1D" if N_CHIPS > 1 else None, trace_region_size=256 * 1024 * 1024)
     yield tm
     tm.close()
 
 
 def build(name, tmp_path, trace, seed=0, spec=None):
-    spec = spec or small_spec(name)
+    spec = spec or small_spec(name, num_envs=max(128, 32 * N_CHIPS))  # every chip needs a multiple of 32 environments
     torch.manual_seed(seed)
     env = make_env(name, spec.num_envs, seed=seed)
     cfg = make_train_cfg(name, spec)
     cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"
-    cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [1, 1], "trace": trace}
+    cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [_ROWS, _COLS], "trace": trace}
     return OnPolicyRunner(env, cfg, log_dir=str(tmp_path), device="cpu"), env
 
 

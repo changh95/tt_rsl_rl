@@ -28,6 +28,9 @@ from rsl_rl_tt.testing.golden import GOLDEN_DIR, final_reward, load_curve, tt_vs
 from rsl_rl_tt.testing.reference import REF_SPECS, train_reference  # noqa: E402
 
 
+TT_LABEL = "1 chip"
+
+
 def plot(env_name: str, seeds, tt_dir: Path, out_png: Path) -> None:
     import matplotlib
 
@@ -39,10 +42,10 @@ def plot(env_name: str, seeds, tt_dir: Path, out_png: Path) -> None:
         g = load_curve(env_name, seed, GOLDEN_DIR)
         ax.plot([r["iteration"] for r in g if r.get("Train/mean_reward") is not None], [r["Train/mean_reward"] for r in g if r.get("Train/mean_reward") is not None], color="0.65", linewidth=1.0, label="upstream CPU (golden)" if seed == seeds[0] else None)
         t = load_curve(env_name, seed, tt_dir)
-        ax.plot([r["iteration"] for r in t if r.get("Train/mean_reward") is not None], [r["Train/mean_reward"] for r in t if r.get("Train/mean_reward") is not None], linewidth=1.2, label=f"TT 1 chip, seed {seed}")
+        ax.plot([r["iteration"] for r in t if r.get("Train/mean_reward") is not None], [r["Train/mean_reward"] for r in t if r.get("Train/mean_reward") is not None], linewidth=1.2, label=f"TT {TT_LABEL}, seed {seed}")
     ax.set_xlabel("iteration")
     ax.set_ylabel("Train/mean_reward")
-    ax.set_title(f"{env_name}: TT (1 chip) vs upstream CPU golden curves")
+    ax.set_title(f"{env_name}: TT ({TT_LABEL}) vs upstream CPU golden curves")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=7)
     fig.tight_layout()
@@ -58,15 +61,20 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=4, help="torch threads for the host-side work (env, noise, permutation)")
     ap.add_argument("--trace", action="store_true", help="use the traced path (Phase 5: act step and mini-batch step captured once and replayed)")
     ap.add_argument("--fidelity", default="HiFi4", help="matmul/reduction math fidelity; anything but HiFi4 is a Phase 5 precision experiment")
+    ap.add_argument("--mesh", default="1x1", help="mesh shape RxC of the chips of this job (Phase 6 data parallel): 1x1, 1x2 (--chips 16,17), 2x4 (all eight)")
     ap.add_argument("--out", default=str(REPO / "docs" / "porting" / "tt_runs"))
     ap.add_argument("--runs-dir", default=str(REPO / ".run" / "tt_runs"))
     args = ap.parse_args()
-    tt_cfg = {"trace": args.trace, "math_fidelity": args.fidelity}
+    rows, cols = (int(v) for v in args.mesh.split("x"))
+    chips = rows * cols
+    tt_cfg = {"trace": args.trace, "math_fidelity": args.fidelity, "mesh_shape": [rows, cols], **({"replica_check_interval": 10} if chips > 1 else {})}
 
+    global TT_LABEL
+    TT_LABEL = "1 chip" if chips == 1 else f"{chips} chips ({args.mesh})"
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     summary: dict = {
-        "backend": f"TTPPO on one Blackhole chip (tray 3, node 16), fp32 policy, math fidelity {args.fidelity}, {'traced' if args.trace else 'eager'}, unmodified OnPolicyRunner",
+        "backend": f"TTPPO on {'one Blackhole chip (tray 3, node 16)' if chips == 1 else f'a {args.mesh} mesh of {chips} Blackhole chips (tray 3), data parallel'}, fp32 policy, math fidelity {args.fidelity}, {'traced' if args.trace else 'eager'}, unmodified OnPolicyRunner",
         "envs": {},
     }
     t_all = time.time()

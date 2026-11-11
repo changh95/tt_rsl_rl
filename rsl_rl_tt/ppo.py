@@ -53,13 +53,18 @@ class TTPPO(PPO):
         mesh_shape = tuple(tt_cfg.pop("mesh_shape", (1, 1)))
         self.trace_enabled = bool(tt_cfg.pop("trace", False))  # capture/replay the act step and the mini-batch step (Phase 5); results are bit-identical to eager
         self.math_fidelity = str(tt_cfg.pop("math_fidelity", "HiFi4"))  # anything but HiFi4 is a Phase 5 precision EXPERIMENT (docs/porting/PERF.md)
+        self.replica_check_interval = int(tt_cfg.pop("replica_check_interval", 0))  # multi-chip: every k-th update() verifies that all chips hold identical state (0 = off)
+        self._updates = 0
         self._mesh_kwargs = {k: tt_cfg.pop(k) for k in ("fabric_config", "trace_region_size", "l1_small_size") if k in tt_cfg}
         if tt_cfg:
             raise ValueError(f"unknown tt_cfg keys: {sorted(tt_cfg)}")
         if self.trace_enabled:
             # one trace per mini-batch step plus the act step; a trace of this graph takes ~8.3 MB regardless of the tensor sizes (it records commands, not data;
             # measured at 16 mini-batches, hidden [1024, 1024, 512]), so the region grows with num_mini_batches (default 12 MiB per trace, at least 128 MiB)
-            self._mesh_kwargs.setdefault("trace_region_size", max(128, 12 * (self.num_mini_batches + 2)) * 1024 * 1024)
+            # (x2 on several chips: the gradient exchange adds ~40 collective ops to every mini-batch trace)
+            self._mesh_kwargs.setdefault("trace_region_size", max(128, 12 * (self.num_mini_batches + 2)) * (2 if mesh_shape[0] * mesh_shape[1] > 1 else 1) * 1024 * 1024)
+        if mesh_shape[0] * mesh_shape[1] > 1:
+            self._mesh_kwargs.setdefault("fabric_config", "FABRIC_1D")  # the cross-chip gather / sum needs the fabric (ADR-0004 A-1; measured on the tray subset)
         self.tray = acquire_tray_mesh(mesh_shape, **self._mesh_kwargs)
         if _CAPTURED_TRACES.get(id(self.tray), 0):
             # T-15: the intermediates of a captured trace are freed after the capture, and every replay rewrites them. Device state that this algorithm
@@ -68,7 +73,7 @@ class TTPPO(PPO):
                 "a captured trace is alive on this mesh: construct every TTPPO BEFORE the first trace is captured, or call release_traces() on the "
                 "algorithm that owns them (TTNN_ISSUES T-15)"
             )
-        self.ctx = TTContext.create(self.tray.mesh_device, math_fidelity=self.math_fidelity)
+        self.ctx = TTContext.create(self.tray.mesh_device, math_fidelity=self.math_fidelity, mesh_shape=self.tray.mesh_shape)
         if self.trace_enabled:
             self.tray.add_close_hook(self.release_traces)  # captured traces must be released before the device is closed
         self._validate_batch_alignment(storage)
@@ -411,7 +416,8 @@ class TTPPO(PPO):
             value_out, cache_c = critic.forward_train(batch["critic_obs"])
             entropy = dist.entropy_dev
         with self.timer.section("update.minibatch.kl_lr"):
-            lr = self.lr_sched.update(self.losses.kl_mean(dist, batch["old_mean"], self._buf["update.old_var"], self._buf["update.old_log_std"], mean))
+            kl = self.losses.kl_mean(dist, batch["old_mean"], self._buf["update.old_var"], self._buf["update.old_log_std"], mean)
+            lr = self.lr_sched.update(ctx.mean_over_chips(kl))  # the KL of the adaptive schedule is the mean over the chips; one global learning rate
         with self.timer.section("update.minibatch.loss"):
             la = self.losses.actor(dist, mean, batch["actions"], batch["old_logp"], adv, rows)
             lc = self.losses.critic(value_out[:, 0:1], batch["old_values"], batch["returns"], rows)
@@ -421,6 +427,11 @@ class TTPPO(PPO):
         with self.timer.section("update.minibatch.backward"):
             grads_a = [t for pair in actor.mlp.backward(cache_a, la["d_mean"]) for t in pair] + ([la["d_param"]] if dist.learn_std else [])
             grads_c = [t for pair in critic.mlp.backward(cache_c, ttnn.multiply(lc["d_value"], self._col0)) for t in pair]
+        if ctx.n_chips > 1:
+            # data parallel: every chip computed the gradient of ITS mini-batch; the exchange averages them BEFORE clipping (upstream reduce_parameters: all-reduce /
+            # world_size, then clip_grad_norm_), so every chip clips and steps with the same gradient and the replicas stay identical (ADR-0004 A-1)
+            with self.timer.section("update.minibatch.grad_exchange"):
+                grads_a, grads_c = [ctx.mean_over_chips(g) for g in grads_a], [ctx.mean_over_chips(g) for g in grads_c]
         with self.timer.section("update.minibatch.clip"):
             # upstream clips the actor group (incl. std) and the critic group SEPARATELY (DECISIONS C-1)
             grads_a, _ = clip_grad_norm(ctx, grads_a, self.max_grad_norm)
@@ -434,7 +445,7 @@ class TTPPO(PPO):
         ttnn = ctx.ttnn
         st, actor, critic = self.storage, self.tt_actor, self.tt_critic
         dist = actor.distribution
-        n = st.batch_size
+        n = st.local_batch_size  # samples on ONE chip: shuffling, mini-batches and every statistic below are chip-local (a rank of upstream multi-GPU)
         mb = self.num_mini_batches
         if not 1 <= mb <= n:
             raise ValueError("num_mini_batches must be between 1 and the rollout batch size.")
@@ -446,9 +457,11 @@ class TTPPO(PPO):
             self._buf[key] = ctx.put(self._buf.get(key), value)
         with self.timer.section("update.pack_table"):
             packed = st.packed_table()
-        # one permutation per update, reused by every epoch (upstream mini_batch_generator); drawn on the host (parity mode, H-4)
+        # one permutation per update, reused by every epoch (upstream mini_batch_generator); drawn on the host (parity mode, H-4); one independent permutation of
+        # each chip's own rows (a randperm per rank), the chips' permutations one after the other
         with self.timer.section("update.shuffle_gather"):
-            shuffled = st.shuffle(packed, ctx.upload_index(torch.randperm(n), op="H-4"))
+            permutations = torch.cat([torch.randperm(n) for _ in range(ctx.n_chips)])
+            shuffled = st.shuffle(packed, ctx.upload_index(permutations, op="H-4"))
             self._buf["update.table"] = ctx.put(self._buf.get("update.table"), shuffled)
         for name in ("value", "surrogate", "entropy"):
             acc = self._acc("update.acc." + name)
@@ -481,4 +494,25 @@ class TTPPO(PPO):
         self._weights_stale = self._optimizer_stale = True
         self._refresh_std_mirror()
         st.clear()
+        self._updates += 1
+        if ctx.n_chips > 1 and self.replica_check_interval and self._updates % self.replica_check_interval == 0:
+            diff = self.replica_max_diff()
+            if diff != 0.0:
+                raise RuntimeError(f"the chips' replicas of the parameters / optimizer state / normalizer statistics differ (max abs diff {diff:.3e}) after update {self._updates}")
         return loss_dict
+
+    def replica_max_diff(self) -> float:
+        """Largest absolute difference between any chip's copy and chip 0's copy of everything that is replicated: parameters, Adam moments, normalizer
+        statistics, learning rate (0.0 = bit-identical replicas; 0.0 trivially on one chip). Downloads every chip's copy (H-6): a periodic check, not per step."""
+        ctx = self.ctx
+        if ctx.n_chips == 1:
+            return 0.0
+        tensors = self._params() + self.adam.m + self.adam.v + [self.lr_sched.lr]
+        for model in (self.tt_actor, self.tt_critic):
+            if model.normalizer is not None:
+                tensors += [model.normalizer._mean, model.normalizer._var]
+        worst = 0.0
+        for t in tensors:
+            copies = ctx.per_chip(t)
+            worst = max(worst, float((copies - copies[:1]).abs().max()))
+        return worst

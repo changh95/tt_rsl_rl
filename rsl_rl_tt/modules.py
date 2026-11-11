@@ -73,19 +73,27 @@ class TTEmpiricalNormalization:
         return ttnn.divide(ttnn.subtract(x, self._mean, **_acc(ttnn)), self._std_eps, **_acc(ttnn))
 
     def update(self, x: Any, rows: int) -> None:
-        """Learn the statistics of the batch `x` ([rows, dim_p], batch-sharded); same recurrence as upstream `EmpiricalNormalization.update`."""
+        """Learn the statistics of the batch `x` ([rows, dim_p], batch-sharded); same recurrence as upstream `EmpiricalNormalization.update`.
+
+        `rows` is the number of rows on ONE chip. On several chips the statistics are GLOBAL, like upstream under torch.distributed (normalization.py: the global
+        mean first, then the local variances combined around it): the count is `rows * n_chips`, the chips' means are averaged and the variance is the average of
+        `var_c + (mean_c - mean)^2` (all chips hold the same number of rows); the averages are the fp32 gather + sum of ADR-0004 A-1, so every chip ends with the
+        same statistics bit for bit."""
         ctx = self.ctx
         ttnn = ctx.ttnn
         if not self.training or (self.until is not None and self.count >= self.until):
             return
-        if ctx.n_chips != 1:
-            raise NotImplementedError("global normalizer statistics over several chips arrive in Phase 6 (ADR-0004: gather + sum)")
-        self.count += rows
-        rate = ctx.upload_scalar(rows / self.count, op="H-8")  # a device tensor, so a trace does not freeze it
+        total = rows * ctx.n_chips
+        self.count += total
+        rate = ctx.upload_scalar(total / self.count, op="H-8")  # a device tensor, so a trace does not freeze it
         cfg = ctx.compute_cfg
         mean_x = ttnn.mean(x, dim=0, keepdim=True, compute_kernel_config=cfg)
         centered = ttnn.subtract(x, mean_x, **_acc(ttnn))
         var_x = ttnn.mean(ttnn.square(centered), dim=0, keepdim=True, compute_kernel_config=cfg)  # two-pass variance (ttnn.var is 2e-4 off)
+        if ctx.n_chips > 1:
+            global_mean = ctx.mean_over_chips(mean_x)
+            var_x = ctx.mean_over_chips(ttnn.add(var_x, ttnn.square(ttnn.subtract(mean_x, global_mean))))
+            mean_x = global_mean
         delta_mean = ttnn.subtract(mean_x, self._mean, **_acc(ttnn))
         new_mean = ttnn.add(self._mean, ttnn.multiply(delta_mean, rate), **_acc(ttnn))
         # var += rate * (var_x - var + delta_mean * (mean_x - new_mean))
