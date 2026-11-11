@@ -236,6 +236,20 @@ KMD 2.10.0 and this hardware is verified by the first device job.
 * **A new tolerance row, `update_entropy_hetero` (rel_fro 1.5e-3), with its root cause** (`TOLERANCES.md`): with a state-dependent std the update's entropy is a function of the actor's matmul output, so it carries the matmul noise (measured <= 3.7e-4); with a state-independent std
   (v1) it depends on a parameter only and keeps its 2e-5 row. The formula itself is verified to 7e-6 on identical network outputs.
 
+### ADR-0007 amendment A-2 — 8.2 RND (2026-11-11, assistant; the owner can veto)
+* **Design** (details in `POST_V1.md`): `rsl_rl_tt/rnd.py` (`TTRND`, `TTRewardNormalization`) is built from the upstream module `PPO.rnd` (initial weights bit-identical for the same torch seed, `sync_to_torch` for checkpoints). The predictor's
+  loss / gradients / Adam step are part of the traced mini-batch step (own Adam, constant learning rate, no clipping, gradients averaged over the chips like the PPO ones). The intrinsic reward of an environment step is one more TRACE (`rnd.reward`): the observation,
+  the step's weight and the normalizer's update rate go into persistent buffers (H-1, H-8), the graph updates the discounted-reward accumulator and its global statistics in place (allocated before any capture, T-15) and writes the result into a persistent buffer that
+  the reward add and the logging read. Its warm-up before the capture runs on CLONES of the state, so that no step is applied twice. The rollout storage keeps the RND state of every step only when it is not the actor's or the critic's observation (block `rnd_obs`).
+* **Two traps found on the way** (both fixed, both have tests): (1) a tensor that is alive across the replay of another trace is overwritten by it (T-15): the RND reward is therefore the FIRST thing `process_env_step` does, and the RND observation of the acted-on step is
+  staged into a persistent buffer; (2) the eager storage keeps REFERENCES to the tensors of every step, so a persistent staging buffer must not be handed to it (every step then pointed at the last step's observation): eager gets a fresh tensor per step. Trap (2) was not
+  caught by the parity tests against upstream, because the `privileged` group of the test env hardly changes between steps; `test_the_rollout_stores_the_rnd_state_of_every_step` uses a group that does, and the eager-vs-traced test found it.
+* **New allow-list entry H-9**: the per-step download of the intrinsic reward (`[num_envs]` floats): the upstream runner reads `alg.intrinsic_rewards` after every `process_env_step` for its episode statistics. Logging only; the value that
+  enters the rewards never leaves the device.
+* **Two new tolerance rows with measured bases** (`TOLERANCES.md`; not loosenings of an existing row): `rnd_intrinsic_reward` 8e-3 (measured <= 2.6e-3) and `rnd_reward_stats` 1.8e-2 (<= 5.8e-3), `rnd_predictor_loss` 1.6e-2 (<= 5.4e-3, and the device loss
+  is systematically 0.5 % lower than upstream's: the two embeddings share the rounding of the matmul inputs, which cancels in their difference).
+* **Not in this item**: the observation upload of the RND state is repeated (the next `act` uploads the same observation again); performance work, measured in `PERF.md` (8.2: +31 % per iteration with RND on tracking12, traced).
+
 ## Host-computation allow-list (BRIEF 2-8)
 *H-7 (temporary host rollout storage, Phase 2) was retired on 2026-11-11: storage, GAE and mini-batches are on the device since Phase 3.*
 Silent torch/host fallbacks on the TT path are forbidden. Only the items below may run on the host. Each is counted by a
@@ -250,3 +264,4 @@ runtime counter that is logged; any other host fallback must fail the tests.
 | H-5 | per-iteration scalars for logging (losses, KL, LR, std) | all phases | log lines |
 | H-6 | weight / statistics transfers between the torch mirrors and the device: initial upload, download for `get_policy()`, `save()`, export, and one-time constants | on demand | upstream checkpoint/JIT/ONNX formats |
 | H-8 | upload per-iteration scalars as device tensors (normalizer update rate, learning rate, Adam bias corrections, adaptive-LR value) | all phases | a trace freezes Python scalars, so every value that changes per iteration travels as a tiny device tensor (ADR-0001); added 2026-11-11 in Phase 2 |
+| H-9 | download of the per-step intrinsic reward of RND (`[num_envs]` floats): the upstream runner reads `alg.intrinsic_rewards` after every `process_env_step` for its episode statistics | RND runs only | logging only: the value that is added to the reward never leaves the device; added 2026-11-11 in Phase 8.2 |

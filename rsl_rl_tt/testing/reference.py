@@ -7,6 +7,7 @@ Used for the golden baselines (`scripts/train_reference.py`) and later as the or
 from __future__ import annotations
 
 import copy
+import dataclasses
 import os
 import time
 import torch
@@ -29,6 +30,7 @@ class RefSpec:
     obs_normalization: bool = True
     distribution: str = "GaussianDistribution"  # or "HeteroscedasticGaussianDistribution" (the std is an output of the actor MLP)
     std_type: str = "scalar"
+    obs_groups: dict | None = None  # overrides the env's default observation sets (e.g. adds "rnd_state")
 
 
 _PPO = {
@@ -58,6 +60,18 @@ REF_SPECS: dict[str, RefSpec] = {
 }
 
 
+# RND configuration of the end-to-end runs (Phase 8.2, `--rnd` of the scripts): small predictor / target MLPs on the policy observations, state and reward normalisation on. The weight is
+# scaled by the env's step_dt (upstream does that), so the intrinsic reward is ~0.1 per step for every env.
+RND_E2E_WEIGHT = {"cartpole": 5.0, "pendulum": 2.0, "tracking12": 5.0}
+
+
+def with_rnd(env_name: str, spec: RefSpec) -> RefSpec:
+    """`spec` with Random Network Distillation (`rnd_cfg`) added to its algorithm."""
+    rnd = {"predictor_hidden_dims": [64, 64], "target_hidden_dims": [64, 64], "num_outputs": 16, "activation": "elu", "state_normalization": True, "reward_normalization": True,
+           "weight": RND_E2E_WEIGHT[env_name], "learning_rate": 1.0e-3}
+    return dataclasses.replace(spec, algorithm={**spec.algorithm, "rnd_cfg": rnd})
+
+
 def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | None = CSV_LOGGER) -> dict:
     spec = spec or REF_SPECS[env_name]
     dist = {"class_name": spec.distribution, "init_std": spec.init_std, "std_type": spec.std_type}
@@ -65,7 +79,7 @@ def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | No
         "num_steps_per_env": spec.num_steps,
         "save_interval": 10_000,
         "check_for_nan": True,
-        "obs_groups": copy.deepcopy(ENV_CLASSES[env_name].obs_groups_cfg),
+        "obs_groups": copy.deepcopy(spec.obs_groups if spec.obs_groups is not None else ENV_CLASSES[env_name].obs_groups_cfg),
         "actor": {"class_name": "MLPModel", "hidden_dims": list(spec.hidden), "activation": "elu", "obs_normalization": spec.obs_normalization, "distribution_cfg": dist},
         "critic": {"class_name": "MLPModel", "hidden_dims": list(spec.hidden), "activation": "elu", "obs_normalization": spec.obs_normalization},
         "algorithm": copy.deepcopy(spec.algorithm),

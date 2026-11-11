@@ -196,6 +196,10 @@ def clone_upstream_alg(ref_alg):
     new.learning_rate = ref_alg.learning_rate
     for group in new.optimizer.param_groups:
         group["lr"] = ref_alg.learning_rate
+    if ref_alg.rnd is not None:  # RND: networks, normalizers, its own Adam, the step counter
+        new.rnd.load_state_dict(ref_alg.rnd.state_dict())
+        new.rnd.optimizer.load_state_dict(copy.deepcopy(ref_alg.rnd.optimizer.state_dict()))
+        new.rnd.update_counter = ref_alg.rnd.update_counter
     copy_storage(ref_alg, new)
     return new
 
@@ -229,11 +233,16 @@ def rollout_into_both(alg, ref_alg, env, obs, steps):
             tr.distribution_params = (mean, std)
             tr.hidden_states = (None, None)
             obs, rewards, dones, extras = env.step(actions)
-            tr.rewards = rewards.clone() + ref_alg.gamma * (tr.values * extras["time_outs"].unsqueeze(1).float()).squeeze(1)
+            ref_rewards = rewards
+            if alg.rnd_tt is not None:  # the TT algorithm adds the intrinsic reward (its own RND state); the reference storage gets the SAME numbers
+                alg.process_env_step(obs, rewards, dones, extras)
+                ref_rewards = rewards + alg.intrinsic_rewards
+            tr.rewards = ref_rewards.clone() + ref_alg.gamma * (tr.values * extras["time_outs"].unsqueeze(1).float()).squeeze(1)
             tr.dones = dones
             ref_alg.storage.add_transition(tr)
             tr.clear()
-            alg.process_env_step(obs, rewards, dones, extras)
+            if alg.rnd_tt is None:
+                alg.process_env_step(obs, rewards, dones, extras)
         alg.compute_returns(obs)
     n = steps * env.num_envs
     ref_alg.storage.returns[:] = dl(ctx, alg.storage.returns).reshape(steps, env.num_envs, 1)
@@ -256,7 +265,7 @@ def add_grad_noise(alg, rel=4e-3, seed=0):
     A TT gradient is the torch gradient plus matmul noise that is ABSOLUTE per tensor (about 3.4e-3..4.9e-3 of its rms, test_tt_backward), so
     near-zero gradient components can change sign, which Adam turns into full-size steps; a multiplicative baseline would hide exactly that."""
     g = torch.Generator().manual_seed(seed)
-    for model in (alg._raw_actor, alg._raw_critic):
+    for model in (alg._raw_actor, alg._raw_critic) + ((alg.rnd.predictor,) if alg.rnd is not None else ()):
         for p in model.parameters():
             p.register_hook(lambda grad: grad + rel * grad.pow(2).mean().sqrt() * torch.randn(grad.shape, generator=g))
 
@@ -286,7 +295,51 @@ def resync_tt_from_ref(alg, ref_alg):
     alg._raw_critic.load_state_dict(ref_alg._raw_critic.state_dict())
     alg.optimizer.load_state_dict(copy.deepcopy(ref_alg.optimizer.state_dict()))
     alg.learning_rate = ref_alg.learning_rate
+    if alg.rnd is not None:
+        # the reference never ran the rollout's intrinsic-reward path, so its reward-normalizer statistics are stale: keep the device's (refresh the mirror from the device
+        # first), and take the predictor, its normalizer and its Adam state from the reference
+        alg.rnd_tt.sync_to_torch()
+        alg.rnd.predictor.load_state_dict(ref_alg.rnd.predictor.state_dict())
+        if ref_alg.rnd.state_normalization:
+            alg.rnd.state_normalizer.load_state_dict(ref_alg.rnd.state_normalizer.state_dict())
+        alg.rnd.optimizer.load_state_dict(copy.deepcopy(ref_alg.rnd.optimizer.state_dict()))
     alg.sync_from_torch()
+
+
+def tt_rnd_params(alg):
+    """Device parameters of the RND predictor as host tensors in torch layout (`rnd.<layer>.weight|bias`)."""
+    ctx = alg.ctx
+    out = {}
+    for i, layer in enumerate(alg.rnd_tt.predictor.layers):
+        out[f"rnd.{i}.weight"] = layer.weight_from_host(ctx.download(layer.w, op="H-6", batch_sharded=False))
+        out[f"rnd.{i}.bias"] = layer.bias_from_host(ctx.download(layer.b, op="H-6", batch_sharded=False))
+    return out
+
+
+def ref_rnd_params(ref_alg):
+    lins = [m for m in ref_alg.rnd.predictor if type(m).__name__ == "Linear"]
+    out = {}
+    for i, lin in enumerate(lins):
+        out[f"rnd.{i}.weight"], out[f"rnd.{i}.bias"] = lin.weight.detach().clone(), lin.bias.detach().clone()
+    return out
+
+
+def rnd_function(params, ref_alg, obs):
+    """The RND predictor's embedding of `obs` for an arbitrary parameter set (the reference's state normalizer, torch fp32)."""
+    pred = ref_alg.rnd.predictor
+    lin_idx = [i for i, m in enumerate(pred) if type(m).__name__ == "Linear"]
+    mapping = {}
+    for k, mod_i in enumerate(lin_idx):
+        mapping[f"{mod_i}.weight"], mapping[f"{mod_i}.bias"] = params[f"rnd.{k}.weight"], params[f"rnd.{k}.bias"]
+    with torch.no_grad():
+        x = ref_alg.rnd.state_normalizer(ref_alg.rnd.get_rnd_state(obs))
+        return torch.func.functional_call(pred, mapping, (x,))
+
+
+def rnd_function_deviation(p_a, p_b, p_0, ref_alg, obs_eval):
+    """||f(p_a) - f(p_b)|| / ||f(p_b) - f(p_0)|| of the predictor's embedding on `obs_eval`: the fraction of the predictor's update that differs."""
+    fa, fb, f0 = (rnd_function(p, ref_alg, obs_eval) for p in (p_a, p_b, p_0))
+    return float((fa - fb).double().norm() / (fb - f0).double().norm().clamp(min=1e-30))
 
 
 def function_deviation(p_a, p_b, p_0, ref_alg, obs_eval):
@@ -316,6 +369,7 @@ def run_update_pair(name, tmp_path, algorithm_over, warm_iterations=2, noise=4e-
     noisy = clone_upstream_alg(ref_alg)  # same weights, same Adam moments, same storage: only its gradients get noise
     add_grad_noise(noisy, noise)
     init = ref_params(ref_alg)
+    init_rnd = ref_rnd_params(ref_alg) if ref_alg.rnd is not None else None
     obs_eval = ref_alg.storage.observations.flatten(0, 1)
     lr_before = alg.learning_rate
     torch.manual_seed(2000)
@@ -328,6 +382,9 @@ def run_update_pair(name, tmp_path, algorithm_over, warm_iterations=2, noise=4e-
     out = {"ref_loss": ref_loss, "noisy_loss": noisy_loss, "tt_loss": tt_loss, "lr": {"before": lr_before, "ref": ref_alg.learning_rate, "noisy": noisy.learning_rate, "tt": alg.learning_rate}}
     out["function"] = {"tt": function_deviation(p_tt, p_ref, init, ref_alg, obs_eval), "noisy_ref": function_deviation(p_noisy, p_ref, init, ref_alg, obs_eval)}
     out["params"] = {"tt": param_report(p_tt, p_ref, init, "tt"), "noisy_ref": param_report(p_noisy, p_ref, init, "noisy")}
+    if init_rnd is not None:
+        r_ref, r_tt, r_noisy = ref_rnd_params(ref_alg), tt_rnd_params(alg), ref_rnd_params(noisy)
+        out["rnd_function"] = {"tt": rnd_function_deviation(r_tt, r_ref, init_rnd, ref_alg, obs_eval), "noisy_ref": rnd_function_deviation(r_noisy, r_ref, init_rnd, ref_alg, obs_eval)}
     out["alg"], out["ref_alg"], out["noisy_alg"], out["env"] = alg, ref_alg, noisy, env
     return out
 

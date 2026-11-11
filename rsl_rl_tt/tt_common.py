@@ -31,6 +31,7 @@ HOST_OPS = {
     "H-5": "per-iteration scalars for logging",
     "H-6": "weight / statistics download for get_policy(), save(), export",
     "H-8": "upload per-iteration scalars as device tensors (normalizer update rate, learning rate, Adam bias corrections)",
+    "H-9": "download of the per-step intrinsic reward of RND (the runner logs it every step; logging only, never fed back)",
 }
 
 
@@ -47,7 +48,7 @@ class HostOpCounter:
 
     def count(self, op_id: str, nbytes: int = 0) -> None:
         if op_id not in HOST_OPS:
-            raise RuntimeError(f"host operation {op_id!r} is not on the allow-list (DECISIONS.md H-1..H-6, H-8); add it there first or remove the fallback")
+            raise RuntimeError(f"host operation {op_id!r} is not on the allow-list (DECISIONS.md H-1..H-6, H-8, H-9); add it there first or remove the fallback")
         self.calls[op_id] += 1
         self.bytes[op_id] += nbytes
 

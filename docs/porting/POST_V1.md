@@ -7,7 +7,7 @@ parity test, traced == eager bit for bit, 1x2 / 2x4 mesh equivalence in function
 | # | Feature (upstream `rsl_rl` v5.5.2) | What it needs beyond v1 | Effort | Status |
 |---|---|---|---|---|
 | 8.1 | `HeteroscedasticGaussianDistribution` (state-dependent std from the MLP) | per-row std in log-prob / entropy / KL, an output layer with two heads, the rollout storing the std, gradient through the std head | small-medium | **done** (branch `tt/phase-8-1-heteroscedastic`, results in `PROGRESS.md`) |
-| 8.2 | RND (`rsl_rl/extensions/rnd.py`) | a second pair of MLPs (predictor + frozen target) with its own Adam, an intrinsic reward added before GAE, its own normalizers | medium | not started |
+| 8.2 | RND (`rsl_rl/extensions/rnd.py`) | a second pair of MLPs (predictor + frozen target) with its own Adam, an intrinsic reward added before GAE, its own normalizers | medium | **done** (branch `tt/phase-8-2-rnd`, results in `PROGRESS.md`) |
 | 8.3 | Symmetry augmentation / mirror loss | user callbacks (`data_augmentation_func`) that act on observations and actions: either a host callback (a new allow-list entry) or a fixed mirror matrix on the device | medium | not started |
 | 8.4 | Distillation (`algorithms/distillation.py`, teacher / student, behaviour cloning) | a second algorithm class, a loss without a critic, the teacher's forward on the device | medium | not started |
 | 8.5 | `RNNModel` (GRU, LSTM) | storage of hidden states, trajectory splitting / padding with masks (shapes that vary per update: needs a fixed maximum length for the traces), GRU / LSTM forward and backward on the device | large | not started |
@@ -31,3 +31,23 @@ clamped to `std_range`) or the log std ("log": clamped to `log_std_range`, std =
 * **Logging.** `get_policy().output_std` is the std of the last forward pass in upstream; here the mirror gets the per-column mean of the last mini-batch's std (a persistent `[1, A_p]` tensor written by every
   step, downloaded once per iteration, allow-list H-5).
 * **Not in this item:** `BetaDistribution` (not on the owner's list).
+
+## 8.2 RND: design
+
+Upstream (`rsl_rl/extensions/rnd.py`, `PPO.process_env_step` / `update`): predictor and target MLPs on the RND state (`obs_groups["rnd_state"]`, default: the policy group); the intrinsic reward of an environment step is
+`||target(s') - predictor(s')||_2` on the observation AFTER the step (`s'`), normalised by the running std of its discounted sum (`EmpiricalDiscountedVariationNormalization`, optional) and multiplied by a weight (scaled with the env's `step_dt`; constant / step /
+linear schedule over the number of environment steps); it is added to the extrinsic reward BEFORE the time-out bootstrap. In `update()` the predictor minimises `mse(predictor(s), target(s))` on the observations of every PPO mini-batch with its OWN Adam (constant
+learning rate, no clipping, one step per mini-batch); the state normalizer learns from the whole rollout after the epochs.
+
+* **Module.** `TTRND` holds two `TTMLP`s (the target is only ever run forward), the optional state normalizer (`TTEmpiricalNormalization`), the optional reward normalizer (`TTRewardNormalization`: a per-environment accumulator `avg = gamma avg + r` that is never reset, scalar running
+  mean / var / std with the Welford recurrence over the `num_envs` values of `avg`, global over the chips; `r / std`, the reward unchanged while the std is not positive), a `TTAdam` and the learning rate as a device scalar. The weight schedule is evaluated on the host from the
+  mirror's `update_counter` (a Python number per step, like the learning rate of v1; the counter lives on the upstream module so that `save()` / `load()` handle it).
+* **Rollout.** `act()` additionally stages the RND observation when it is not the actor's or the critic's (`obs_to_device`, ROW_MAJOR upload tilized on the device); `process_env_step()` uploads the RND state of the NEW observation, computes the intrinsic reward on the device, adds it to the reward and
+  downloads it for the runner's logging (H-9). Traced as its own capture (`rnd.reward`): the warm-up runs on clones of the state, so that no step is applied twice; first thing in `process_env_step` (T-15). Evaluation mode runs the graph eagerly and never advances any statistics.
+* **Storage.** `rnd_source` is `"actor"` / `"critic"` when the groups of `rnd_state` equal those of the actor / critic (then the stored observation IS the RND state, nothing extra) and `"own"` otherwise (a block of `pad_up(num_states)` columns in the packed table, before the scalars).
+* **Update.** The mini-batch step (eager and traced) ends with the predictor: forward, `d loss / d prediction = 2 (prediction - target) / (rows x num_outputs)`, the ordinary MLP backward, the gradient mean over the chips, `TTAdam.step` with the predictor's own bias corrections
+  (`prepare_step()` once per step). The mean loss is logged as `Loss/rnd` (H-5). After the epochs the state normalizer learns from the stored RND states.
+* **Checkpoints.** `sync_to_torch` writes the predictor, the normalizers' buffers and the Adam moments into the upstream module / its optimizer; upstream's `save()` then produces `rnd_state_dict`, `rnd_optimizer_state_dict` and `rnd_update_counter`; `load()` goes the other way (the
+  discounted-reward accumulator is not part of a checkpoint upstream either).
+* **Multi-chip.** The predictor's gradients are averaged over the chips, the state and reward statistics are global, the accumulator is chip-local (it is per environment); `replica_max_diff` covers all replicated RND state.
+* **Not in this item:** sharing the observation upload with the next `act()` (performance only), RND with recurrent / CNN models (not available yet).

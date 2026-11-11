@@ -38,13 +38,18 @@ ENV = "tracking12"  # separate actor / critic observation groups (36 / 84), 12 a
 SEED = 0
 REFERENCE = "mc_step_reference.npz"  # .npz, not .pt: checkpoints (*.pt) are git-ignored on purpose (BRIEF 2-10); this is a small test fixture
 REFERENCE_HETERO = "mc_step_reference_hetero.npz"  # the same with a heteroscedastic actor (Phase 8.1)
+REFERENCE_RND = "mc_step_reference_rnd.npz"  # the same with RND (Phase 8.2): the predictor's embedding is compared as well
+RND_CFG = {"predictor_hidden_dims": [48, 48], "target_hidden_dims": [48, 48], "num_outputs": 24, "activation": "elu", "state_normalization": True, "reward_normalization": True, "weight": 1.0, "learning_rate": 1e-3}
+RND_GROUPS = {"actor": ["policy"], "critic": ["policy", "privileged"], "rnd_state": ["privileged"]}  # the RND state is a set of groups of its own: the storage keeps a block for it
+KEYS = ("actor_before", "critic_before", "actor_after", "critic_after")
+RND_KEYS = ("rnd_before", "rnd_after")
 
 
-def make_runner(mesh_shape: list[int], hetero: bool = False):
-    """The TTPPO runner of the test (eager, no rollout is ever run on it); `hetero`: a heteroscedastic Gaussian actor (state-dependent std)."""
+def make_runner(mesh_shape: list[int], hetero: bool = False, rnd: bool = False):
+    """The TTPPO runner of the test (eager, no rollout is ever run on it); `hetero`: a heteroscedastic Gaussian actor (state-dependent std); `rnd`: Random Network Distillation."""
     base = REF_SPECS[ENV]
-    spec = RefSpec(num_envs=256, num_steps=8, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1},
-                   **({"distribution": "HeteroscedasticGaussianDistribution"} if hetero else {}))
+    spec = RefSpec(num_envs=256, num_steps=8, iterations=1, hidden=base.hidden, algorithm={**base.algorithm, "num_mini_batches": 4, "num_learning_epochs": 1, **({"rnd_cfg": dict(RND_CFG)} if rnd else {})},
+                   **({"distribution": "HeteroscedasticGaussianDistribution"} if hetero else {}), **({"obs_groups": RND_GROUPS} if rnd else {}))
     runner, _, _ = build_reference_runner(ENV, SEED, None, spec, tt=True, tt_cfg={"mesh_shape": list(mesh_shape)})
     return runner
 
@@ -87,6 +92,8 @@ def make_pool(alg: Any, seed: int = 1) -> tuple[torch.Tensor, TensorDict]:
     table[:, st.col_mean : st.col_mean + st.act_dim_p] = pad_matrix(old_mean, rows, st.act_dim_p)
     if alg.hetero:
         table[:, st.col_std : st.col_std + st.act_dim_p] = pad_matrix(std, rows, st.act_dim_p, fill=1.0)  # a stored std is 1 in the padded columns
+    if st.rnd_own:
+        table[:, st.col_rnd : st.col_rnd + st.rnd_dim_p] = stage_obs(obs, alg.rnd_tt.groups, st.rnd_dim_p)
     for name, col in (("value", old_value), ("returns", returns), ("advantages", adv), ("old_logp", old_logp)):
         table[:, st.col_scalars + {"value": 0, "returns": 1, "advantages": 2, "old_logp": 3}[name]] = col
     return table, obs
@@ -113,7 +120,12 @@ def run_steps(alg: Any, pool: torch.Tensor, eval_obs: TensorDict) -> dict:
         a = ctx.download(alg.tt_actor.forward(alg.tt_actor.obs_to_device(eval_obs)), op="H-2")
         a = torch.cat([a[:, : dist.dim], a[:, dist.dim_p : dist.dim_p + dist.dim]], dim=1) if alg.hetero else a[:, : alg.tt_actor.output_dim]  # hetero: mean and std head
         c = ctx.download(alg.tt_critic.forward(alg.tt_critic.obs_to_device(eval_obs)), op="H-2")[:, :1]
-        return a, c
+        if alg.rnd_tt is None:
+            return a, c
+        r = alg.rnd_tt  # the predictor's embedding of the evaluation states
+        state = r.obs_to_device(eval_obs)
+        e = ctx.download(r.predictor.forward(r.state_norm.forward(state) if r.state_norm is not None else state), op="H-2")[:, : r.out_dim]
+        return a, c, e
 
     before = outputs()
     alg._buf["update.table"] = ctx.upload(chip_layout(pool, n), op="H-6", batch_sharded=True)
@@ -123,10 +135,14 @@ def run_steps(alg: Any, pool: torch.Tensor, eval_obs: TensorDict) -> dict:
     lrs = []
     for k in range(STEPS):
         alg.adam.prepare_step()
+        if alg.rnd_tt is not None:
+            alg.rnd_tt.adam.prepare_step()
         alg._minibatch_step(k, UNION_ROWS // n)
         lrs.append(float(ctx.download(alg.lr_sched.lr, op="H-5", batch_sharded=False)[0, 0]))
     after = outputs()
+    extra = {"rnd_before": before[2], "rnd_after": after[2]} if alg.rnd_tt is not None else {}
     return {
+        **extra,
         "params": tt_params(alg),
         "adam_m": [ctx.download(t, op="H-6", batch_sharded=False) for t in alg.adam.m],
         "adam_v": [ctx.download(t, op="H-6", batch_sharded=False) for t in alg.adam.v],
@@ -139,11 +155,11 @@ def save_reference(path, res: dict) -> None:
     """The 1-chip reference: the learning-rate sequence and the policy / value outputs on the evaluation observations before and after the steps."""
     import numpy as np
 
-    np.savez_compressed(path, lrs=np.array(res["lrs"], dtype=np.float64), **{k: res[k].numpy() for k in ("actor_before", "critic_before", "actor_after", "critic_after")})
+    np.savez_compressed(path, lrs=np.array(res["lrs"], dtype=np.float64), **{k: res[k].numpy() for k in KEYS + RND_KEYS if k in res})
 
 
 def load_reference(path) -> dict:
     import numpy as np
 
     z = np.load(path)
-    return {"lrs": [float(v) for v in z["lrs"]], **{k: torch.from_numpy(z[k]) for k in ("actor_before", "critic_before", "actor_after", "critic_after")}}
+    return {"lrs": [float(v) for v in z["lrs"]], **{k: torch.from_numpy(z[k]) for k in KEYS + RND_KEYS if k in z.files}}
