@@ -175,3 +175,21 @@ Ordered by expected impact.
     assumed to be a subset of `dones` by the caller (nothing in upstream enforces it).
 18. Multi-process mode is hard-wired to NCCL/CUDA (`on_policy_runner.py:215-257`); a single-process multi-chip TT design keeps `WORLD_SIZE`
     unset, so `cfg["multi_gpu"] = None` and the logger's fps counts only one process's `N`.
+
+## Test map for the TT implementation (Phases 2-3)
+
+| Upstream semantics | Where it is exercised on the TT side |
+|---|---|
+| noise stream: `Normal.sample()` == `mean + std * randn([rows, A])` of the global generator | `test_tt_modules.py::test_upstream_sample_equals_mean_plus_std_times_randn`, teacher-forced rollouts in `test_tt_rollout.py` |
+| `act`: actor sample, critic value, log-prob of the sampled action, old distribution params | `test_tt_rollout.py::test_runner_builds_ttppo_and_rollout_matches_the_upstream_models_step_by_step` |
+| time-out bootstrap uses the pre-step value V(s_t) | `TTPPO.process_env_step`; end to end in `test_tt_update.py::test_update_matches_upstream_from_identical_state` (the reference storage is built with the upstream formula) |
+| GAE with the `dones` mask, `advantages = returns - values`, global unbiased-std normalisation (or per mini-batch) | `test_tt_update.py::test_gae_matches_upstream_compute_returns`, `...per-minibatch-adv` variant |
+| one `randperm` per update, reused by every epoch; mini-batch slices `i*B..(i+1)*B` | `test_tt_update.py::test_packed_table_shuffle_and_minibatches_equal_upstream_mini_batch_generator` (bit exact) |
+| clipped surrogate and clipped value loss incl. `torch.max` tie rule and inclusive `clamp` gradients | `test_tt_backward.py::test_ppo_loss_formulas_match_autograd_given_the_same_network_outputs` |
+| entropy bonus reaches only the std parameter; std clamp gives zero gradient outside the range | same test (scalar and log std, clamped range 0.05..4) |
+| per-model grad-norm clipping after the gradient step (C-1: actor incl. std, critic separately) | `test_tt_backward.py::test_clip_grad_norm_matches_torch`; `TTPPO.update` clips the two groups separately |
+| Adam hyper-parameters (betas 0.9/0.999, eps 1e-8, no weight decay), bias correction, lr as a device tensor | `test_tt_backward.py::test_adam_matches_torch_over_many_steps_with_changing_lr` |
+| KL-adaptive LR (per mini-batch, bounds 1e-5 / 1e-2, factors 1.5, `0 < kl`) | `test_tt_backward.py::test_adaptive_lr_rule_matches_upstream_for_every_branch_and_the_clamps`, `test_tt_update.py::test_kl_matches_upstream_kl_divergence` |
+| normalizer updated AFTER the epochs from the whole rollout (Welford-style recurrence, count as long) | `test_tt_modules.py::test_normalizer_update_matches_upstream_over_many_batches`, `test_tt_update.py` (statistics compared after the update) |
+| parameter order of the optimizer state (std first, then actor MLP, then critic) | `TTPPO._param_slots` maps by parameter identity; checkpoint round trip is Phase 4 |
+| padded action dims masked in log_prob / entropy / KL | `test_tt_modules.py::test_gaussian_log_prob_entropy_sample` (dims 1, 12, 29), `test_tt_backward.py` (padded gradient rows/columns exactly 0) |

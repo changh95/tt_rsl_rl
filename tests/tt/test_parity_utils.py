@@ -102,3 +102,8 @@ def test_registry_numbers_appear_in_tolerances_md():
     nums = {key: re.findall(r"\*\*([0-9.e-]+)\*\*", " ".join(t for t in tol.doc_tokens)) for key, tol in TOLERANCES.items()}
     assert nums["matmul_fp32"] == ["4e-3"] and TOLERANCES["matmul_fp32"].rel_fro == 4e-3
     assert TOLERANCES["eltwise_fp32"].max_rel == 5e-7 and TOLERANCES["cross_chip_sum_gather"].rel_fro == 2e-7
+    from rsl_rl_tt.testing.parity import UPDATE_TOLERANCE_DOC, UPDATE_TOLERANCES
+
+    for key, token in UPDATE_TOLERANCE_DOC.items():
+        assert token in text and float(token.strip("*")) == UPDATE_TOLERANCES[key], f"UPDATE_TOLERANCES[{key!r}] = {UPDATE_TOLERANCES[key]} does not match TOLERANCES.md"
+    assert "10x the noise baseline + 1e-3" in text and UPDATE_TOLERANCES["noise_factor"] == 10.0 and UPDATE_TOLERANCES["noise_abs"] == 1e-3

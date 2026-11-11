@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Full-size rollouts with TT inference (TTPPO) vs the upstream CPU PPO on the Phase 1 test envs: per-step time breakdown and host-op counts.
+"""Full-size training iterations (rollout + update) with TTPPO vs the upstream CPU PPO on the Phase 1 test envs: time breakdown and host-op counts.
 
 Device job: run ONLY through the wrapper.
 
     scripts/tt_run.sh --chips 16 --timeout 900 --tag bench -- python scripts/bench_rollout.py [--envs cartpole ...] [--iters 5] [--out FILE.json]
 
-The rollout is the inner loop of `OnPolicyRunner.learn` (act -> env.step -> process_env_step, then compute_returns); the update is Phase 3.
-In Phase 2 the TT numbers are dominated by the temporary host storage downloads (H-7) and untraced per-op dispatch; they are the baseline for Phase 5.
+One iteration is the body of `OnPolicyRunner.learn`: the rollout (act -> env.step -> process_env_step, then compute_returns) and `update()`.
+The TT numbers are untraced, per-op dispatched and use a (slow) device row gather for the shuffle: this is the Phase 3 baseline for Phase 5, not a result.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ def timed_rollouts(alg, env, spec, iters: int, warmup: int = 2) -> dict:
     rows = []
     for it in range(warmup + iters):
         t_act = t_env = t_proc = 0.0
+        t_start = time.perf_counter()
         with torch.inference_mode():
             for _ in range(spec.num_steps):
                 t0 = time.perf_counter()
@@ -58,9 +59,11 @@ def timed_rollouts(alg, env, spec, iters: int, warmup: int = 2) -> dict:
             t4 = time.perf_counter()
             alg.compute_returns(obs)
             t_ret = time.perf_counter() - t4
-        alg.storage.clear()  # the update (Phase 3) would do this
+        t5 = time.perf_counter()
+        alg.update()
+        t_upd = time.perf_counter() - t5
         if it >= warmup:
-            rows.append((t_act, t_env, t_proc, t_ret))
+            rows.append((t_act, t_env, t_proc, t_ret, t_upd))
     med = [statistics.median(c) for c in zip(*rows)]
     n = spec.num_steps
     return {
@@ -68,7 +71,9 @@ def timed_rollouts(alg, env, spec, iters: int, warmup: int = 2) -> dict:
         "env_ms_per_step": med[1] / n * 1e3,
         "process_ms_per_step": med[2] / n * 1e3,
         "compute_returns_ms": med[3] * 1e3,
-        "rollout_ms": sum(med) * 1e3,
+        "update_ms": med[4] * 1e3,
+        "rollout_ms": sum(med[:4]) * 1e3,
+        "iteration_ms": sum(med) * 1e3,
         "env_steps_per_s": spec.num_envs * n / sum(med),
     }
 
@@ -76,7 +81,7 @@ def timed_rollouts(alg, env, spec, iters: int, warmup: int = 2) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--envs", nargs="+", default=list(ENV_NAMES), choices=ENV_NAMES)
-    ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     torch.set_num_threads(8)
@@ -92,8 +97,8 @@ def main() -> None:
         results[name] = res
         c, t = res["cpu_upstream"], res["tt_1chip"]
         print(
-            f"{name:11s} envs={spec.num_envs:5d} steps={spec.num_steps:3d} | CPU act {c['act_ms_per_step']:7.2f} ms/step, rollout {c['rollout_ms']:8.1f} ms | "
-            f"TT act {t['act_ms_per_step']:7.2f} ms/step, rollout {t['rollout_ms']:8.1f} ms ({t['env_steps_per_s']:.0f} env-steps/s)",
+            f"{name:11s} envs={spec.num_envs:5d} steps={spec.num_steps:3d} | CPU: act {c['act_ms_per_step']:6.2f} ms/step, rollout {c['rollout_ms']:7.1f} ms, update {c['update_ms']:8.1f} ms, iteration {c['iteration_ms']:8.1f} ms | "
+            f"TT: act {t['act_ms_per_step']:6.2f} ms/step, rollout {t['rollout_ms']:7.1f} ms, update {t['update_ms']:8.1f} ms, iteration {t['iteration_ms']:8.1f} ms",
             flush=True,
         )
     if args.out:

@@ -1,0 +1,74 @@
+{
+  "N=24576 M=6144 C=96": {
+    "TILE": {
+      "mismatched_elements": 0,
+      "kernel_ms": 8.165,
+      "out_shape": [
+        6144,
+        96
+      ]
+    },
+    "ROW_MAJOR": {
+      "mismatched_elements": 445824,
+      "kernel_ms": 6.82,
+      "out_shape": [
+        6144,
+        96
+      ]
+    }
+  },
+  "N=98304 M=24576 C=192": {
+    "TILE": {
+      "mismatched_elements": 0,
+      "kernel_ms": 236.403,
+      "out_shape": [
+        24576,
+        192
+      ]
+    },
+    "ROW_MAJOR": {
+      "mismatched_elements": 3545856,
+      "kernel_ms": 49.328,
+      "out_shape": [
+        24576,
+        192
+      ]
+    }
+  },
+  "N=98304 M=24576 C=32": {
+    "TILE": {
+      "mismatched_elements": 0,
+      "kernel_ms": 39.569,
+      "out_shape": [
+        24576,
+        32
+      ]
+    },
+    "ROW_MAJOR": {
+      "mismatched_elements": 590976,
+      "kernel_ms": 11.649,
+      "out_shape": [
+        24576,
+        32
+      ]
+    }
+  },
+  "N=98304 M=24576 C=256": {
+    "TILE": {
+      "mismatched_elements": 0,
+      "kernel_ms": 315.271,
+      "out_shape": [
+        24576,
+        256
+      ]
+    },
+    "ROW_MAJOR": {
+      "mismatched_elements": 4727808,
+      "kernel_ms": 64.923,
+      "out_shape": [
+        24576,
+        256
+      ]
+    }
+  }
+}

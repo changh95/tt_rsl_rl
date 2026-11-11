@@ -1,0 +1,39 @@
+{
+  "N=24576 M=6144 C=96": {
+    "tosa_gather/uint32": {
+      "bit_exact": true,
+      "ms_incl_index_upload": 8.287
+    },
+    "gather/uint32": {
+      "bit_exact": true,
+      "ms_incl_index_upload": 8.759
+    },
+    "tosa_gather_RM/uint32": {
+      "bit_exact": false,
+      "ms_incl_index_upload": 9.624
+    },
+    "embedding_RM_fp32/uint32": "FAILED RuntimeError: TT_FATAL @ /project/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp:36: weights.dtype() == DataType::BFLOAT16",
+    "tosa_gather/uint16": "FAILED RuntimeError: TT_FATAL @ /project/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp:28: input_tensor_a.dtype() == DataType::BFLOAT16 or input_tensor_a.dtype() == DataType::UINT",
+    "gather/uint16": {
+      "bit_exact": true,
+      "ms_incl_index_upload": 8.212
+    }
+  },
+  "N=98304 M=24576 C=192": {
+    "tosa_gather/uint32": {
+      "bit_exact": true,
+      "ms_incl_index_upload": 237.323
+    },
+    "gather/uint32": {
+      "bit_exact": true,
+      "ms_incl_index_upload": 243.199
+    },
+    "tosa_gather_RM/uint32": {
+      "bit_exact": false,
+      "ms_incl_index_upload": 72.617
+    },
+    "embedding_RM_fp32/uint32": "FAILED RuntimeError: TT_FATAL @ /project/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp:36: weights.dtype() == DataType::BFLOAT16",
+    "tosa_gather/uint16": "skipped (N > 65535)",
+    "gather/uint16": "skipped (N > 65535)"
+  }
+}

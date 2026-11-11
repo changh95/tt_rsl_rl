@@ -54,8 +54,8 @@ scripts/tt_run.sh --chips 16 --timeout 600 -- python -m pytest -m tt tests/tt/<f
 scripts/tt_run.sh --timeout 600 -- python scripts/<script>.py
 # device code opens the mesh ONLY via:  from rsl_rl_tt.device import open_tray_mesh   (the single guarded entry point)
 
-# Phase 2 device tests share one mesh fixture, so run the files that use it in ONE process:
-scripts/tt_run.sh --chips 16 --timeout 900 --tag p2 -- python -m pytest -m tt tests/tt/test_tt_modules.py tests/tt/test_tt_rollout.py -q -p no:cacheprovider
+# Phase 2/3 device tests share one mesh fixture, so run the files that use it in ONE process (about 30 s warm):
+scripts/tt_run.sh --chips 16 --timeout 900 --tag p3 -- python -m pytest -m tt tests/tt/test_tt_modules.py tests/tt/test_tt_rollout.py tests/tt/test_tt_backward.py tests/tt/test_tt_update.py -q -p no:cacheprovider
 
 # stop only jobs started by this repo (reads .run/pids)
 scripts/kill_my_jobs.sh

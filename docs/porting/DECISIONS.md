@@ -63,6 +63,16 @@ phase boundary if the owner asks for `main`: replace `rsl_rl/` with that ref (BR
   clipping tolerates; this is a property to document, not to tune away.
 **Decision.** Option A. Evidence now exists; recommended **Accepted** (owner approval requested at the Phase 0 stop).
 
+**Implementation note (Phase 3, 2026-11-11).** The training step is hand-written as designed: `TTMLP.backward` (per-layer VJP with `matmul(transpose_a/b)`, `elu_bw`, bias row sums),
+`PPOLosses` (clipped surrogate/value losses with torch's tie and clamp rules, entropy through the std only, masked padded action dims), `clip_grad_norm` per model (C-1),
+`TTAdam` (functional, fp32 moments, lr and bias corrections as device tensors), `TTAdaptiveLR` (device-evaluated KL rule), `TTRolloutStorage` (per-step device tensors, GAE loop on the
+device, ONE packed table gathered by the host-drawn permutation, contiguous mini-batch slices). `update()` downloads only the three logged losses, the learning rate and the std (H-5)
+and uploads the permutation (H-4) and two Adam scalars per step (H-8); the H-7 allow-list entry (host storage) is retired. Per iteration cost is dominated by per-op dispatch (about 20
+optimizer steps x ~170 ops) and the fp32 row gather (T-12): measured 590 ms update (1024 envs x 24 steps, cartpole) vs 145 ms for upstream on the CPU, the Phase 5 baseline.
+Numerical findings: (1) a parameter-by-parameter comparison against upstream after Adam is meaningless (near-zero gradient components flip sign and take full-size steps), parity is judged in
+function space against a noise baseline (TOLERANCES.md); (2) the clipped objectives are discontinuous at the clip boundaries, so a whole update deviates ~2 % (20 steps) from upstream unless the
+objective is smooth (then 0.1 %); (3) with identical state the first mini-batch's KL is exactly 0 on the device, so the adaptive LR rule is compared separately.
+
 ## ADR-0002 — Plugin injection point and runner subclass  — *Accepted (owner, 2026-11-10)*
 **Context.** Upstream resolves the algorithm from `cfg["algorithm"]["class_name"]` via `resolve_callable`
 (`utils.py:167-176`) and calls the static `construct_algorithm(obs, env, cfg, device)` (`on_policy_runner.py:39-40`).
@@ -212,6 +222,7 @@ github.com/tenstorrent/sfpi, its sha256 (`de16ebb1...b610b954`, from the wheel's
 KMD 2.10.0 and this hardware is verified by the first device job.
 
 ## Host-computation allow-list (BRIEF 2-8)
+*H-7 (temporary host rollout storage, Phase 2) was retired on 2026-11-11: storage, GAE and mini-batches are on the device since Phase 3.*
 Silent torch/host fallbacks on the TT path are forbidden. Only the items below may run on the host. Each is counted by a
 runtime counter that is logged; any other host fallback must fail the tests.
 
@@ -222,6 +233,5 @@ runtime counter that is logged; any other host fallback must fail the tests.
 | H-3 | obs-group concatenation | all phases | data shaping at the boundary (BRIEF 3.3) |
 | H-4 | parity mode: action noise from the host torch generator; `torch.randperm` for mini-batches, only indices uploaded | parity mode | same RNG streams as upstream (BRIEF 3.5) |
 | H-5 | per-iteration scalars for logging (losses, KL, LR, std) | all phases | log lines |
-| H-6 | weight download for `get_policy()` mirror, `save()`, export | on demand | upstream checkpoint/JIT/ONNX formats |
-| H-7 | **temporary (Phase 2 only):** rollout storage on the host | Phase 2 | moves to the device in Phase 3 (BRIEF Phase 2) |
+| H-6 | weight / statistics transfers between the torch mirrors and the device: initial upload, download for `get_policy()`, `save()`, export, and one-time constants | on demand | upstream checkpoint/JIT/ONNX formats |
 | H-8 | upload per-iteration scalars as device tensors (normalizer update rate, learning rate, Adam bias corrections, adaptive-LR value) | all phases | a trace freezes Python scalars, so every value that changes per iteration travels as a tiny device tensor (ADR-0001); added 2026-11-11 in Phase 2 |

@@ -3,6 +3,23 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-11 — Phase 3 DONE: 1-chip backward, Adam, PPO update, device storage/GAE (tag `phase-3-done`)
+**Done**
+- `rsl_rl_tt/losses.py` (clipped surrogate/value losses and their gradients with torch's `max`-tie and inclusive-`clamp` rules, entropy bonus through the std, masked padded dims, KL),
+  `optim.py` (`TTAdam`, per-model `clip_grad_norm` = C-1, device-evaluated `TTAdaptiveLR`), `storage.py` (device rollout storage, GAE, packed table + ONE permutation gather,
+  mini-batch slices), `modules.py` (`forward_train` / `backward` of the MLP, Gaussian backward rows), `ppo.py` (`TTPPO.act/process_env_step/compute_returns/update`, `load()` and
+  device<->torch Adam-state sync for checkpoints). The unmodified `OnPolicyRunner.learn()` now trains end to end with TT inference and TT updates on all three envs.
+- Parity (149 device tests in one process, 347 host tests): per-parameter gradients vs autograd, loss formulas given identical outputs (<= 6e-6), MLP VJP for ELU/tanh/ReLU (<= 4.9e-3, ReLU 3.7e-2),
+  Adam vs `torch.optim.Adam` (1.9e-8), clip_grad_norm (6.8e-8), GAE (bit exact), shuffled mini-batches vs upstream's generator (bit exact), whole `update()` from identical state, 20-update drift.
+- Allow-list: H-7 retired; the update path moves only the permutation (H-4), logged scalars + std (H-5) and Adam/normalizer scalars (H-8): asserted exactly in `test_update_host_traffic_*`.
+**Key numbers** (TOLERANCES.md has the table): whole update from identical state deviates 4e-4..1.1e-3 of its size with a smooth objective (noise baseline 8e-5..4e-4), <= 2.5e-2 with the clipped
+objective (discontinuous clip gates); 20 consecutive updates drift <= 1.0e-2 (smooth) / <= 6.9e-2 (clipped) of the cumulative update. Iteration time (untraced): cartpole 1024x24: TT 675 ms (update 587) vs CPU 177 ms
+(update 145); tracking12 2048x24: TT 1094 ms vs CPU 734 ms.
+**Findings**: Adam makes parameter-wise comparison meaningless (function-space metric + gradient-noise baseline instead); the device KL of the first mini-batch is exactly 0 (upstream ~1e-9), so adaptive-LR
+parity is tested separately; fp32 row gather is ~50 ns/element (T-12) and its row-major variant returns wrong data; `ttnn.sum` without dim is rank-0 (T-13).
+**Next**: Phase 4 (1-chip end-to-end learning + compatibility): train TT on the three envs x 3 seeds against the golden curves, checkpoint round trips (TT save -> upstream load -> same outputs; upstream save -> TT resume;
+optimizer state; JIT/ONNX export), NaN/Inf checks, plots.
+
 ## 2026-11-11 — Phase 2 DONE: 1-chip forward on Blackhole (tag `phase-2-done`)
 **Done**
 - `rsl_rl_tt/tt_common.py` (tile padding, compute config, the ONLY host<->device transfer helpers with per-allow-list-id counters; unknown ids raise),

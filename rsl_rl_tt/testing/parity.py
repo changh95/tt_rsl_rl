@@ -42,6 +42,16 @@ TOLERANCES: dict[str, Tol] = {
     "cross_chip_sum_all_reduce": Tol("cross-chip ttnn.all_reduce (fallback)", rel_fro=2e-3, doc_tokens=("**2e-3**",)),
     # Phase 2 composites (measured 2026-11-11, tests/tt/test_tt_modules.py; ~3x the measured floor)
     "mlp_forward": Tol("MLP forward (actor mean / critic value), 1-4 layers, hidden up to 256", rel_fro=1.5e-2, abs_floor_rms=0.1, doc_tokens=("**1.5e-2**",)),
+    "mlp_backward": Tol("MLP layer gradients (ELU/tanh) for a given output gradient", rel_fro=1.5e-2, abs_floor_rms=1e-4, doc_tokens=("**1.5e-2**",)),
+    "mlp_backward_relu": Tol("MLP layer gradients with ReLU (gate flips near z = 0)", rel_fro=1.2e-1, abs_floor_rms=1e-4, doc_tokens=("**1.2e-1**",)),
+    "ppo_loss_formulas": Tol("PPO loss values and gradients given identical network outputs", rel_fro=2e-5, abs_floor_rms=1e-6, doc_tokens=("**2e-5**",)),
+    "ppo_gradients_e2e": Tol("PPO parameter gradients end to end (forward noise + clip-gate effects)", rel_fro=8e-2, abs_floor_rms=1e-4, doc_tokens=("**8e-2**",)),
+    "gae_returns": Tol("GAE returns / advantages (incl. global unbiased-std normalisation)", rel_fro=1e-6, abs_floor_rms=1e-6, doc_tokens=("**1e-6**",)),
+    "update_value_loss": Tol("PPO.update value loss (mean over the update's mini-batches)", rel_fro=5e-3, abs_floor_rms=1e-3, doc_tokens=("**5e-3**",)),
+    "update_entropy": Tol("PPO.update entropy (mean over the update's mini-batches)", rel_fro=2e-5, doc_tokens=("**2e-5**",)),
+    "update_surrogate": Tol("PPO.update surrogate loss (advantages are O(1))", max_abs=2e-3, doc_tokens=("**2e-3**",)),
+    "adam_step": Tol("Adam step (fp32, torch.optim.Adam formulas)", rel_fro=1e-7, doc_tokens=("**1e-7**",)),
+    "clip_grad_norm": Tol("clip_grad_norm_: total norm and clipped gradients", rel_fro=2e-7, doc_tokens=("**2e-7**",)),
     "normalizer_update": Tol("EmpiricalNormalization running mean/var after an update", rel_fro=1e-6, doc_tokens=("**1e-6**",)),
 }
 
@@ -159,3 +169,17 @@ def assert_parity(out, ref, tol: Tol | str, name: str = "") -> ParityReport:
     if not rep.passed:
         raise AssertionError("\n" + str(rep))
     return rep
+
+
+# Function-space tolerances of a whole PPO.update / of 20 updates (Phase 3). "Deviation" = ||f(TT params) - f(reference params)|| / ||f(reference) - f(initial)||
+# for the actor mean and the critic value on the rollout observations, i.e. the fraction of the update that differs (a parameter-by-parameter comparison
+# is meaningless after Adam: near-zero gradient components flip sign and take full-size steps). Derived in docs/porting/TOLERANCES.md.
+UPDATE_TOLERANCES = {
+    "noise_factor": 10.0,  # smooth objective / one step: deviation <= noise_factor x (same update with 4e-3-rms-relative noise injected into upstream's gradients) + noise_abs
+    "noise_abs": 1e-3,
+    "full_update_clipped": 8e-2,  # one full update (20 Adam steps) of the clipped objective: the discontinuous clip gates make a few samples take the other branch
+    "drift20_smooth": 3e-2,  # 20 consecutive updates on identical data, smooth objective (clip_param = 1e3, unclipped value loss)
+    "drift20_clipped": 2.5e-1,  # the same with the standard clipped objective
+}
+
+UPDATE_TOLERANCE_DOC = {"full_update_clipped": "**8e-2**", "drift20_smooth": "**3e-2**", "drift20_clipped": "**2.5e-1**"}  # how TOLERANCES.md prints them

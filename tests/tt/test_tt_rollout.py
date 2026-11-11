@@ -52,12 +52,13 @@ def test_runner_builds_ttppo_and_rollout_matches_the_upstream_models_step_by_ste
     obs = env.get_observations()
     n_obs_uploads = 1 if cfg["obs_groups"]["actor"] == cfg["obs_groups"]["critic"] else 2
 
+    dl = lambda t: ctx.download(t, op="H-6")  # test-side downloads of device-resident step data (counted as H-6)
     with torch.inference_mode():
         for step in range(STEPS):
             rng = torch.get_rng_state()
             actions = alg.act(obs)
-            t = alg.transition
-            tt = {"mean": t.distribution_params[0].clone(), "std": t.distribution_params[1].clone(), "value": t.values.clone(), "logp": t.actions_log_prob.clone(), "actions": actions.clone()}
+            pend = alg._pending
+            tt = {"mean": dl(pend["mean"])[:, : env.num_actions], "std": alg._std_host.reshape(1, -1).expand(env.num_envs, -1), "value": dl(pend["value"])[:, :1], "logp": dl(pend["logp"])[:, 0], "actions": actions.clone()}
             torch.set_rng_state(rng)
             ref_actions = ref_actor(obs, stochastic_output=True)
             ref = {"mean": ref_actor.output_mean, "std": ref_actor.output_std, "value": ref_critic(obs), "logp": ref_actor.get_output_log_prob(ref_actions), "actions": ref_actions}
@@ -75,25 +76,34 @@ def test_runner_builds_ttppo_and_rollout_matches_the_upstream_models_step_by_ste
         alg.compute_returns(obs)
 
     st = alg.storage
-    for name_, tensor in (("rewards", st.rewards), ("values", st.values), ("returns", st.returns), ("advantages", st.advantages), ("actions", st.actions)):
-        assert torch.isfinite(tensor).all(), name_
-    assert st.values.shape == (STEPS, env.num_envs, 1) and st.actions.shape == (STEPS, env.num_envs, env.num_actions)
-    # only allow-listed transfers happened, with exactly the expected counts (compute_returns uploads the critic's obs once; no H-5: the std is cached)
+    n = STEPS * env.num_envs
+    for name_, tensor in (("returns", st.returns), ("advantages", st.advantages)):
+        host = dl(tensor)
+        assert host.shape == (n, 1) and torch.isfinite(host).all(), name_
+    assert torch.isfinite(dl(st.packed_table())).all()
+    # only allow-listed transfers happened, with exactly the expected counts: per step the obs uploads (actor [+ critic]), one noise upload,
+    # one action download, ONE packed (reward, done, time_out) upload; compute_returns uploads the critic's obs once; no H-5 (std is cached)
     calls = dict(ctx.host_ops.calls)
-    assert calls == {"H-1": STEPS * n_obs_uploads + 1, "H-3": STEPS * n_obs_uploads + 1, "H-4": STEPS, "H-2": STEPS, "H-7": STEPS * 3 + 1}, calls
+    assert calls == {"H-1": STEPS * (n_obs_uploads + 1) + 1, "H-3": STEPS * n_obs_uploads + 1, "H-4": STEPS, "H-2": STEPS, "H-6": 3 * STEPS + 2 + 1 + 4}, calls
 
 
 @pytest.mark.parametrize("name", ENV_NAMES)
-def test_runner_learn_runs_the_rollout_then_stops_at_the_phase3_update(tt_mesh, name, tmp_path):
+def test_runner_learn_trains_end_to_end_with_the_device_update(tt_mesh, name, tmp_path):
     runner, env, _ = build_tt_runner(name, tmp_path)
-    with pytest.raises(NotImplementedError, match="Phase 3"):
-        runner.learn(num_learning_iterations=1)
-    st = runner.alg.storage
-    assert st.step == STEPS  # the rollout ran to the end; the update (Phase 3) is where it stops
-    assert torch.isfinite(st.rewards).all() and torch.isfinite(st.advantages).all()
-    # the runner's per-iteration logging read still works: get_policy().output_std is served from the cached host mirror
-    std = runner.alg.get_policy().output_std
+    runner.learn(num_learning_iterations=3)  # rollout (TT inference) + TT update + logging, driven by the unmodified OnPolicyRunner
+    alg = runner.alg
+    assert alg.storage.step == 0  # cleared by the update
+    assert 1e-5 <= alg.learning_rate <= 1e-2 and alg.learning_rate == alg.learning_rate
+    std = alg.get_policy().output_std
     assert std.shape[-1] == env.num_actions and torch.isfinite(std).all()
+    rows = [line.split(",") for line in (tmp_path / "metrics.csv").read_text().splitlines()]
+    header = rows[0]
+    for col in ("Loss/value", "Loss/surrogate", "Loss/entropy", "Loss/learning_rate", "Policy/mean_std"):
+        k = header.index(col)
+        assert len(rows) == 4 and all(torch.isfinite(torch.tensor(float(r[k]))) for r in rows[1:]), col
+    runner.save(str(tmp_path / "model.pt"))  # device -> mirror sync, then upstream's own save()
+    sd = torch.load(tmp_path / "model.pt", weights_only=False)
+    assert {"actor_state_dict", "critic_state_dict", "optimizer_state_dict", "iter"} <= set(sd)
 
 
 def test_std_mirror_and_policy_export_path_work_without_an_update(tt_mesh, tmp_path):

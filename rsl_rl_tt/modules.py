@@ -159,6 +159,58 @@ class TTMLP:
                 x = ttnn.tanh(x)
         return x
 
+    def forward_train(self, x: Any) -> tuple[Any, list]:
+        """Forward pass that keeps what the backward pass needs: per layer (input, pre-activation, activation output)."""
+        ttnn = self.ctx.ttnn
+        cache = []
+        for layer, act in zip(self.layers, self.acts):
+            z = layer.forward(x)
+            if act == "elu":
+                a = ttnn.elu(z, alpha=1.0)
+            elif act == "relu":
+                a = ttnn.relu(z)
+            elif act == "tanh":
+                a = ttnn.tanh(z)
+            else:
+                a = z
+            cache.append((x, z, a))
+            x = a
+        return x, cache
+
+    def backward(self, cache: list, grad_out: Any) -> list[tuple[Any, Any]]:
+        """Hand-written VJP of the Linear + activation stack: returns [(dW [in_p, out_p], db [1, out_p])] per layer.
+
+        Padding stays inert: padded inputs are zero (so padded rows of dW are zero), grad_out has zero padded columns (masked by the
+        caller), and padded weight rows are zero (so no gradient leaks into padded hidden units)."""
+        ctx = self.ctx
+        ttnn = ctx.ttnn
+        cfg = ctx.compute_cfg
+        grads: list = [None] * len(self.layers)
+        g = grad_out
+        for i in reversed(range(len(self.layers))):
+            x_in, z, a = cache[i]
+            act = self.acts[i]
+            if act == "elu":
+                g = ttnn.elu_bw(g, z, alpha=1.0)[0]
+            elif act == "tanh":
+                g = ttnn.multiply(g, ttnn.subtract(1.0, ttnn.square(a)))  # d tanh = 1 - tanh^2
+            elif act == "relu":
+                g = ttnn.multiply(g, ttnn.gt(z, 0.0))  # torch: zero gradient at z == 0
+            dw = ttnn.matmul(x_in, g, transpose_a=True, compute_kernel_config=cfg)
+            db = ttnn.sum(g, dim=0, keepdim=True, compute_kernel_config=cfg)
+            grads[i] = (dw, db)
+            if i > 0:
+                g = ttnn.matmul(g, self.layers[i].w, transpose_b=True, compute_kernel_config=cfg)
+        return grads
+
+    def parameters(self) -> list:
+        """Device parameter tensors in torch order: weight0, bias0, weight1, bias1, ..."""
+        return [t for layer in self.layers for t in (layer.w, layer.b)]
+
+    def set_parameters(self, values: list) -> None:
+        for k, layer in enumerate(self.layers):
+            layer.w, layer.b = values[2 * k], values[2 * k + 1]
+
     def sync_from_torch(self) -> None:
         for layer in self.layers:
             layer.sync_from_torch()
@@ -231,6 +283,19 @@ class TTGaussianDistribution:
         # entropy per sample = sum_real (0.5 + 0.5 log(2 pi) + log std): identical for every row
         ent = ttnn.add(self.log_std, 0.5 + HALF_LOG_2PI, **_acc(ttnn))
         self.entropy_dev = ttnn.sum(ttnn.multiply(ent, self.mask), dim=-1, keepdim=True, compute_kernel_config=ctx.compute_cfg)
+        # rows used by the backward pass (all masked, so padded action columns never receive a gradient)
+        self.inv_std = ttnn.multiply(ttnn.reciprocal(self.std), self.mask)
+        self.inv_var = ttnn.multiply(ttnn.reciprocal(self.var), self.mask)
+        self.inv_std3 = ttnn.multiply(self.inv_var, self.inv_std)
+        # d(param) = d(std) * dstd/dparam * [param inside the clamp range] (torch clamp backward is inclusive)
+        if self.std_type == "scalar":
+            lo, hi = self.std_range
+            inside = ttnn.multiply(ttnn.ge(self.param, lo), ttnn.le(self.param, hi))
+            self.param_gate = ttnn.multiply(inside, self.mask)
+        else:
+            lo, hi = self.log_std_range
+            inside = ttnn.multiply(ttnn.ge(self.param, lo), ttnn.le(self.param, hi))
+            self.param_gate = ttnn.multiply(ttnn.multiply(inside, self.std), self.mask)  # dstd/dlog_std = std
 
     # -- compute ----------------------------------------------------------------------------------------------------------
     def sample(self, mean: Any, noise: Any) -> Any:
@@ -242,6 +307,12 @@ class TTGaussianDistribution:
         """Sum over the real action dims of  -(a - mean)^2 / (2 var) - log std - 0.5 log(2 pi); returns [rows, 1]."""
         ttnn = self.ctx.ttnn
         diff = ttnn.subtract(actions, mean, **_acc(ttnn))
+        term = ttnn.subtract(ttnn.neg(ttnn.divide(ttnn.square(diff), self.two_var, **_acc(ttnn))), self.log_prob_const, **_acc(ttnn))
+        return ttnn.sum(ttnn.multiply(term, self.mask), dim=-1, keepdim=True, compute_kernel_config=self.ctx.compute_cfg)
+
+    def log_prob_from_diff(self, diff: Any) -> Any:
+        """`log_prob` given diff = actions - mean (the backward pass needs diff as well)."""
+        ttnn = self.ctx.ttnn
         term = ttnn.subtract(ttnn.neg(ttnn.divide(ttnn.square(diff), self.two_var, **_acc(ttnn))), self.log_prob_const, **_acc(ttnn))
         return ttnn.sum(ttnn.multiply(term, self.mask), dim=-1, keepdim=True, compute_kernel_config=self.ctx.compute_cfg)
 
@@ -280,6 +351,9 @@ class TTMLPModel:
     def forward(self, obs_dev: Any) -> Any:
         """MLP output on device ([rows, out_p]): the distribution mean for an actor, the value (column 0) for a critic."""
         return self.mlp.forward(self.latent(obs_dev))
+
+    def forward_train(self, obs_dev: Any) -> tuple[Any, list]:
+        return self.mlp.forward_train(self.latent(obs_dev))
 
     def update_normalization(self, obs_dev: Any, rows: int) -> None:
         if self.normalizer is not None:

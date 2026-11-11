@@ -2,7 +2,7 @@
 """Shared plumbing of the TT training path: tile padding, the compute-kernel config, and the ONLY host<->device transfer helpers.
 
 Every upload/download of the TT path goes through `TTContext.upload` / `TTContext.download` (a test forbids `ttnn.from_torch` /
-`ttnn.to_torch` anywhere else in `rsl_rl_tt/`), and every transfer names the allow-list entry of docs/porting/DECISIONS.md (H-1 ... H-7) it
+`ttnn.to_torch` anywhere else in `rsl_rl_tt/`), and every transfer names the allow-list entry of docs/porting/DECISIONS.md (H-1 ... H-8) it
 belongs to. `HostOpCounter` counts them (calls and bytes); an unknown id raises, so a host fallback that is not on the list cannot happen
 silently (BRIEF 2-8). This module is the only place of the TT path that may touch torch tensors for staging.
 
@@ -21,7 +21,8 @@ from typing import Any
 
 TILE = 32
 
-# docs/porting/DECISIONS.md "Host-computation allow-list"; keep in sync (tests/tt/test_tt_common.py checks the ids against the document).
+# docs/porting/DECISIONS.md "Host-computation allow-list"; keep in sync (tests/tt/test_tt_invariants.py checks the ids against the document). H-7 (temporary host rollout
+# storage, Phase 2) was retired in Phase 3 when storage, GAE and mini-batches moved to the device.
 HOST_OPS = {
     "H-1": "upload obs / reward / done / time_out per env step",
     "H-2": "download actions per env step (the one per-step sync point)",
@@ -29,7 +30,6 @@ HOST_OPS = {
     "H-4": "parity mode: action noise / randperm from the host torch generator",
     "H-5": "per-iteration scalars for logging",
     "H-6": "weight / statistics download for get_policy(), save(), export",
-    "H-7": "TEMPORARY (Phase 2 only): rollout storage on the host",
     "H-8": "upload per-iteration scalars as device tensors (normalizer update rate, learning rate, Adam bias corrections)",
 }
 
@@ -47,7 +47,7 @@ class HostOpCounter:
 
     def count(self, op_id: str, nbytes: int = 0) -> None:
         if op_id not in HOST_OPS:
-            raise RuntimeError(f"host operation {op_id!r} is not on the allow-list (DECISIONS.md H-1..H-7); add it there first or remove the fallback")
+            raise RuntimeError(f"host operation {op_id!r} is not on the allow-list (DECISIONS.md H-1..H-6, H-8); add it there first or remove the fallback")
         self.calls[op_id] += 1
         self.bytes[op_id] += nbytes
 
@@ -88,11 +88,12 @@ class TTContext:
 
     # -- transfers (the only ones) -----------------------------------------------------------------------------------------
     def upload(self, host: torch.Tensor, *, op: str, batch_sharded: bool) -> Any:
-        """2D float32 host tensor (both dims multiples of 32; or a replicated [1, cols] row) -> device TILE tensor, batch-sharded over dim 0 or replicated."""
+        """2D float32 host tensor (both dims multiples of 32; or a replicated [1, cols] row; or a [rows, 1] column) -> device TILE tensor, batch-sharded over dim 0 or replicated."""
         ttnn = self.ttnn
         assert host.dim() == 2 and host.dtype == torch.float32, (host.shape, host.dtype)
         row_vector = host.shape[0] == 1 and not batch_sharded  # replicated [1, cols] parameter rows (bias, mean, std) keep their logical shape
-        assert (host.shape[0] % TILE == 0 or row_vector) and host.shape[1] % TILE == 0, f"upload shape {tuple(host.shape)} is not tile aligned"
+        col_vector = host.shape[1] == 1 and host.shape[0] % TILE == 0  # [rows, 1] per-sample scalars (value, log-prob, advantage, ...) keep theirs
+        assert (host.shape[0] % TILE == 0 or row_vector) and (host.shape[1] % TILE == 0 or col_vector), f"upload shape {tuple(host.shape)} is not tile aligned"
         self.host_ops.count(op, host.numel() * 4)
         mapper = ttnn.ShardTensorToMesh(self.mesh, dim=0) if batch_sharded else ttnn.ReplicateTensorToMesh(self.mesh)
         return ttnn.from_torch(host.contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh, mesh_mapper=mapper)
@@ -111,6 +112,13 @@ class TTContext:
         ttnn = self.ttnn
         self.host_ops.count(op, 4)
         return ttnn.from_torch(torch.full((1, 1), float(value)), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
+
+    def upload_index(self, host_idx: torch.Tensor, *, op: str) -> Any:
+        """A UINT32 [1, N] index row (N a multiple of 32) for `tosa_gather`; the permutation itself is drawn on the host (allow-list H-4)."""
+        ttnn = self.ttnn
+        assert host_idx.dim() == 1 and host_idx.numel() % TILE == 0, host_idx.shape
+        self.host_ops.count(op, host_idx.numel() * 4)
+        return ttnn.from_torch(host_idx.to(torch.int64).reshape(1, -1), dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=self.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
 
     def zeros(self, rows: int, cols: int, *, batch_sharded: bool, op: str = "H-6") -> Any:
         return self.upload(torch.zeros(rows, cols), op=op, batch_sharded=batch_sharded)
@@ -159,4 +167,22 @@ def stage_obs(obs: Any, groups: list[str], dim_p: int) -> torch.Tensor:
         part = obs[group]
         buf[:, col : col + part.shape[1]] = part
         col += part.shape[1]
+    return buf
+
+
+def unit_row(col: int, width: int = TILE) -> torch.Tensor:
+    """[1, width] row with a 1 in column `col` (selects / places a scalar column when per-sample scalars are assembled into a block)."""
+    row = torch.zeros(1, width)
+    row[0, col] = 1.0
+    return row
+
+
+def pack_step_scalars(reward: torch.Tensor, done: torch.Tensor, time_out: torch.Tensor | None) -> torch.Tensor:
+    """H-1 staging of one env step: [num_envs, 32] with column 0 = reward, 1 = done, 2 = time_out (a single upload per step)."""
+    n = reward.shape[0]
+    buf = torch.zeros(n, TILE)
+    buf[:, 0] = reward.to(torch.float32).reshape(n)
+    buf[:, 1] = done.to(torch.float32).reshape(n)
+    if time_out is not None:
+        buf[:, 2] = time_out.to(torch.float32).reshape(n)
     return buf
