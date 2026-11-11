@@ -1,0 +1,20 @@
+{
+  "act_ms": 18.80575902760029,
+  "env_ms": 0.025507062673568726,
+  "process_ms": 3.111528232693672,
+  "returns_ms": 1.2250691652297974,
+  "update_ms": 117.29077994823456,
+  "total_ms": 140.52894106134772,
+  "env_steps_per_s": 43720.53154031699,
+  "backend": "cpu",
+  "num_envs": 256,
+  "hidden": [
+    64,
+    64
+  ],
+  "num_steps": 24,
+  "trace": false,
+  "profile": false,
+  "mini_batches": 4,
+  "fidelity": "HiFi4"
+}

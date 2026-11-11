@@ -41,6 +41,7 @@ class TTRolloutStorage:
         self.step = 0
         self._steps: list[dict] = []
         self._slots: list[dict] | None = None
+        self._out: dict = {}  # persistent returns / advantages of a traced GAE
         self.returns = self.advantages = None
         # column layout of the packed table
         self.col_actor = 0
@@ -111,6 +112,14 @@ class TTRolloutStorage:
         self.advantages = ttnn.subtract(self.returns, self._cat("value"))
         if normalize_advantages and self.batch_size > 1:
             self.advantages = self.normalize(self.advantages, self.batch_size)
+        if self.persistent:  # a (traced) GAE writes its results in place into persistent buffers (adopted on the first pass)
+            for key in ("returns", "advantages"):
+                self._out[key] = self.ctx.put(self._out.get(key), getattr(self, key))
+                setattr(self, key, self._out[key])
+
+    def bind_outputs(self) -> None:
+        """After a replay of the traced GAE: point `returns` / `advantages` at the persistent buffers the trace wrote (`clear()` drops the references)."""
+        self.returns, self.advantages = self._out["returns"], self._out["advantages"]
 
     def normalize(self, x: Any, rows: int) -> Any:
         """(x - mean) / (std + 1e-8) with torch's unbiased std over `rows` samples (two-pass variance)."""

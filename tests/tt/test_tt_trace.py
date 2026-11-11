@@ -82,7 +82,7 @@ def test_traced_training_is_bit_identical_to_eager(traced_mesh, name, tmp_path):
         eager.learn(num_learning_iterations=4)
         torch.manual_seed(4242)
         traced.learn(num_learning_iterations=4)
-        assert set(traced.alg._traces) >= {"act", "update.step.0", "update.step.3"}, "the traces were not captured"
+        assert set(traced.alg._traces) >= {"act", "gae", "update.step.0", "update.step.3"}, "the traces were not captured"
         # logged scalars first: a mismatch then names the first iteration that differs
         ea, ta = (tmp_path / "eager" / "metrics.csv").read_text().splitlines(), (tmp_path / "traced" / "metrics.csv").read_text().splitlines()
         cols = ea[0].split(",")

@@ -1,0 +1,32 @@
+{
+ "4096": {
+  "tile: upload_into obs [N,64]": 0.7790490053594112,
+  "tile: upload_into noise [N,32]": 0.4182220436632633,
+  "rm: copy_host_to_device obs [N,64]": 0.3739050589501858,
+  "rm: copy_host_to_device noise [N,32]": 0.2641887404024601,
+  "rm: copy_host_to_device noise [N,12]": 0.26632286608219147,
+  "rm: device tilize obs [N,64]": 0.07797684520483017,
+  "host only: from_torch RM obs (mapper)": 0.06222398951649666,
+  "device write only: RM obs": 0.3696694038808346,
+  "host only: from_torch TILE obs (mapper)": 1.2254337780177593,
+  "device write only: TILE obs": 0.3538648597896099,
+  "tile: download actions [N,32]": 0.45358622446656227,
+  "rm: device slice+untilize actions [N,12]": 0.09224982932209969,
+  "rm: download actions [N,12]": 0.1993924379348755
+ },
+ "65536": {
+  "tile: upload_into obs [N,64]": 25.324251037091017,
+  "tile: upload_into noise [N,32]": 5.974427796900272,
+  "rm: copy_host_to_device obs [N,64]": 5.214317701756954,
+  "rm: copy_host_to_device noise [N,32]": 2.7341563254594803,
+  "rm: copy_host_to_device noise [N,12]": 2.0261448808014393,
+  "rm: device tilize obs [N,64]": 0.23253122344613075,
+  "host only: from_torch RM obs (mapper)": 0.06191292777657509,
+  "device write only: RM obs": 5.174597725272179,
+  "host only: from_torch TILE obs (mapper)": 7.277668919414282,
+  "device write only: TILE obs": 5.152213852852583,
+  "tile: download actions [N,32]": 4.2548272758722305,
+  "rm: device slice+untilize actions [N,12]": 0.25883130729198456,
+  "rm: download actions [N,12]": 3.8528693839907646
+ }
+}

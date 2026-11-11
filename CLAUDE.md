@@ -57,6 +57,12 @@ scripts/tt_run.sh --timeout 600 -- python scripts/<script>.py
 # Phase 2/3 device tests share one mesh fixture, so run the files that use it in ONE process (about 30 s warm):
 scripts/tt_run.sh --chips 16 --timeout 900 --tag p3 -- python -m pytest -m tt tests/tt/test_tt_modules.py tests/tt/test_tt_rollout.py tests/tt/test_tt_backward.py tests/tt/test_tt_update.py -q -p no:cacheprovider
 
+# Phase 5: the traced path opens its OWN mesh with a trace region -> run this file on its own (traced == eager bit for bit)
+scripts/tt_run.sh --chips 16 --timeout 600 --tag p5t -- python -m pytest -m tt tests/tt/test_tt_trace.py -q -p no:cacheprovider
+# Phase 5: benchmarks / profiles / traced end-to-end training, fail-fast (~25 min); results in docs/porting/PERF.md
+scripts/run_phase5_final.sh
+# TRACED-PATH RULE (TTNN_ISSUES T-15): everything that keeps a value across trace replays is allocated BEFORE the first capture; one TTPPO per process.
+
 # stop only jobs started by this repo (reads .run/pids)
 scripts/kill_my_jobs.sh
 

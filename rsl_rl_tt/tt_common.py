@@ -73,10 +73,12 @@ class TTContext:
     host_ops: HostOpCounter = field(default_factory=HostOpCounter)
 
     @classmethod
-    def create(cls, mesh: Any) -> TTContext:
+    def create(cls, mesh: Any, math_fidelity: str = "HiFi4") -> TTContext:
+        """`math_fidelity` ("HiFi4" = the fp32 policy of BRIEF 3.4 / TOLERANCES.md; "HiFi3", "HiFi2", "LoFi" only for the Phase 5 precision experiments)."""
         import ttnn
 
-        cfg = ttnn.WormholeComputeKernelConfig(math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True)
+        fidelity = getattr(ttnn.MathFidelity, math_fidelity)
+        cfg = ttnn.WormholeComputeKernelConfig(math_fidelity=fidelity, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True)
         return cls(ttnn=ttnn, mesh=mesh, n_chips=mesh.get_num_devices(), compute_cfg=cfg)
 
     # -- checks ------------------------------------------------------------------------------------------------------------
@@ -124,6 +126,17 @@ class TTContext:
         self.host_ops.count(op, host.numel() * 4)
         mapper = ttnn.ShardTensorToMesh(self.mesh, dim=0) if batch_sharded else ttnn.ReplicateTensorToMesh(self.mesh)
         ttnn.copy_host_to_device_tensor(ttnn.from_torch(host.contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper), current)
+        return current
+
+    def upload_rm_into(self, current: Any, host: torch.Tensor, *, op: str, batch_sharded: bool = False) -> Any:
+        """Like `upload_into`, but the device tensor is ROW_MAJOR: no tilize on the host (a TILE host tensor costs ~5x more per byte, Phase 5 probe
+        `scripts/probe_upload_device.py`); the consumer tilizes on the device (`ttnn.to_layout`, 0.2 ms for 65536 x 64 fp32), e.g. inside a trace."""
+        ttnn = self.ttnn
+        self.host_ops.count(op, host.numel() * 4)
+        mapper = ttnn.ShardTensorToMesh(self.mesh, dim=0) if batch_sharded else ttnn.ReplicateTensorToMesh(self.mesh)
+        if current is None:
+            return ttnn.from_torch(host.contiguous(), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh, mesh_mapper=mapper)
+        ttnn.copy_host_to_device_tensor(ttnn.from_torch(host.contiguous(), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=mapper), current)
         return current
 
     def upload_scalar_into(self, current: Any, value: float, *, op: str) -> Any:
@@ -222,6 +235,7 @@ class SectionTimer:
 
     def __init__(self, ctx: "TTContext | None" = None, enabled: bool = False) -> None:
         self.ctx, self.enabled = ctx, enabled
+        self.paused = False  # True while a trace is being captured: a device synchronisation is a TT_FATAL inside a capture
         self.totals: dict[str, float] = {}
         self.counts: dict[str, int] = {}
 
@@ -230,7 +244,8 @@ class SectionTimer:
 
         class _Section:
             def __enter__(self_inner):
-                if timer.enabled:
+                self_inner.on = timer.enabled and not timer.paused
+                if self_inner.on:
                     timer.ctx.ttnn.synchronize_device(timer.ctx.mesh)
                     import time
 
@@ -238,7 +253,7 @@ class SectionTimer:
                 return self_inner
 
             def __exit__(self_inner, *exc):
-                if timer.enabled:
+                if self_inner.on:
                     import time
 
                     timer.ctx.ttnn.synchronize_device(timer.ctx.mesh)

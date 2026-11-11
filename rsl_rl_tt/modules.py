@@ -192,7 +192,9 @@ class TTMLP:
             x_in, z, a = cache[i]
             act = self.acts[i]
             if act == "elu":
-                g = ttnn.elu_bw(g, z, alpha=1.0)[0]
+                # d elu(z)/dz = 1 for z > 0 and exp(z) otherwise = exp(min(z, 0)) (torch: also 1 at z == 0). `ttnn.elu_bw` takes 15.5 ms per call at 393216 x 512
+                # (Phase 5 op profile: 29 % of a whole update step, 5x its own forward); this two-op form takes ~1 ms.
+                g = ttnn.multiply(g, ttnn.exp(ttnn.minimum(z, 0.0)))
             elif act == "tanh":
                 g = ttnn.multiply(g, ttnn.subtract(1.0, ttnn.square(a)))  # d tanh = 1 - tanh^2
             elif act == "relu":
@@ -349,6 +351,14 @@ class TTMLPModel:
         buf = stage_obs(obs, self.obs_groups, self.obs_dim_p)
         ctx.host_ops.count("H-3", buf.numel() * 4)
         return ctx.upload_into(into, buf, op="H-1", batch_sharded=True)
+
+    def obs_to_device_rm(self, obs: Any, into: Any = None) -> Any:
+        """Like `obs_to_device`, but into a ROW_MAJOR persistent tensor (cheap upload); the traced act step tilizes it on the device."""
+        ctx = self.ctx
+        ctx.check_batch(obs[self.obs_groups[0]].shape[0], "number of environments / samples")
+        buf = stage_obs(obs, self.obs_groups, self.obs_dim_p)
+        ctx.host_ops.count("H-3", buf.numel() * 4)
+        return ctx.upload_rm_into(into, buf, op="H-1", batch_sharded=True)
 
     # -- compute ----------------------------------------------------------------------------------------------------------
     def latent(self, obs_dev: Any) -> Any:

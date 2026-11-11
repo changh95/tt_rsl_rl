@@ -1,0 +1,114 @@
+{
+ "envs": 65536,
+ "hidden": [
+  512,
+  256,
+  128
+ ],
+ "mini_batch_rows": 393216,
+ "profiled_step_ms": 346.0223311558366,
+ "sum_op_ms": 302.6218647137284,
+ "plain_eager_step_ms": 216.3885310292244,
+ "ops": {
+  "matmul": {
+   "calls": 14,
+   "total_ms": 58.82411217316985
+  },
+  "multiply": {
+   "calls": 149,
+   "total_ms": 54.48274593800306
+  },
+  "linear": {
+   "calls": 8,
+   "total_ms": 31.721333041787148
+  },
+  "square": {
+   "calls": 40,
+   "total_ms": 21.38482080772519
+  },
+  "exp": {
+   "calls": 7,
+   "total_ms": 20.718364976346493
+  },
+  "elu": {
+   "calls": 6,
+   "total_ms": 19.327194429934025
+  },
+  "minimum": {
+   "calls": 9,
+   "total_ms": 18.768401816487312
+  },
+  "add": {
+   "calls": 97,
+   "total_ms": 17.837087623775005
+  },
+  "sum": {
+   "calls": 30,
+   "total_ms": 12.95140665024519
+  },
+  "subtract": {
+   "calls": 29,
+   "total_ms": 12.14764779433608
+  },
+  "sqrt": {
+   "calls": 19,
+   "total_ms": 9.486549999564886
+  },
+  "divide": {
+   "calls": 20,
+   "total_ms": 7.27343512699008
+  },
+  "copy": {
+   "calls": 65,
+   "total_ms": 3.2454808242619038
+  },
+  "maximum": {
+   "calls": 4,
+   "total_ms": 2.1075448021292686
+  },
+  "neg": {
+   "calls": 3,
+   "total_ms": 2.03225901350379
+  },
+  "clamp": {
+   "calls": 3,
+   "total_ms": 2.0307376980781555
+  },
+  "gt": {
+   "calls": 5,
+   "total_ms": 1.869244035333395
+  },
+  "reciprocal": {
+   "calls": 4,
+   "total_ms": 1.656973734498024
+  },
+  "mean": {
+   "calls": 3,
+   "total_ms": 1.3672150671482086
+  },
+  "ge": {
+   "calls": 3,
+   "total_ms": 0.9855874814093113
+  },
+  "le": {
+   "calls": 3,
+   "total_ms": 0.969273503869772
+  },
+  "eq": {
+   "calls": 1,
+   "total_ms": 0.521467998623848
+  },
+  "log": {
+   "calls": 1,
+   "total_ms": 0.5077468231320381
+  },
+  "where": {
+   "calls": 2,
+   "total_ms": 0.23779040202498436
+  },
+  "lt": {
+   "calls": 1,
+   "total_ms": 0.1674429513514042
+  }
+ }
+}

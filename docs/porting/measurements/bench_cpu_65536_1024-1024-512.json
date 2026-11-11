@@ -1,0 +1,20 @@
+{
+  "act_ms": 14183.436990249902,
+  "env_ms": 0.10872911661863327,
+  "process_ms": 18.815138610079885,
+  "returns_ms": 293.7882726546377,
+  "update_ms": 223976.0250726249,
+  "total_ms": 238472.264458891,
+  "env_steps_per_s": 6595.584620999553,
+  "backend": "cpu",
+  "num_envs": 65536,
+  "hidden": [
+    1024,
+    1024,
+    512
+  ],
+  "num_steps": 24,
+  "trace": false,
+  "profile": false,
+  "mini_batches": 4
+}

@@ -1,0 +1,5 @@
+{
+  "num_envs": 16384,
+  "num_steps": 24,
+  "env_step_ms_per_iteration": 120.75834767892957
+}

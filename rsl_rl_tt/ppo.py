@@ -52,11 +52,14 @@ class TTPPO(PPO):
         tt_cfg = dict(tt_cfg or {})
         mesh_shape = tuple(tt_cfg.pop("mesh_shape", (1, 1)))
         self.trace_enabled = bool(tt_cfg.pop("trace", False))  # capture/replay the act step and the mini-batch step (Phase 5); results are bit-identical to eager
+        self.math_fidelity = str(tt_cfg.pop("math_fidelity", "HiFi4"))  # anything but HiFi4 is a Phase 5 precision EXPERIMENT (docs/porting/PERF.md)
         self._mesh_kwargs = {k: tt_cfg.pop(k) for k in ("fabric_config", "trace_region_size", "l1_small_size") if k in tt_cfg}
         if tt_cfg:
             raise ValueError(f"unknown tt_cfg keys: {sorted(tt_cfg)}")
         if self.trace_enabled:
-            self._mesh_kwargs.setdefault("trace_region_size", 128 * 1024 * 1024)
+            # one trace per mini-batch step plus the act step; a trace of this graph takes ~8.3 MB regardless of the tensor sizes (it records commands, not data;
+            # measured at 16 mini-batches, hidden [1024, 1024, 512]), so the region grows with num_mini_batches (default 12 MiB per trace, at least 128 MiB)
+            self._mesh_kwargs.setdefault("trace_region_size", max(128, 12 * (self.num_mini_batches + 2)) * 1024 * 1024)
         self.tray = acquire_tray_mesh(mesh_shape, **self._mesh_kwargs)
         if _CAPTURED_TRACES.get(id(self.tray), 0):
             # T-15: the intermediates of a captured trace are freed after the capture, and every replay rewrites them. Device state that this algorithm
@@ -65,7 +68,7 @@ class TTPPO(PPO):
                 "a captured trace is alive on this mesh: construct every TTPPO BEFORE the first trace is captured, or call release_traces() on the "
                 "algorithm that owns them (TTNN_ISSUES T-15)"
             )
-        self.ctx = TTContext.create(self.tray.mesh_device)
+        self.ctx = TTContext.create(self.tray.mesh_device, math_fidelity=self.math_fidelity)
         if self.trace_enabled:
             self.tray.add_close_hook(self.release_traces)  # captured traces must be released before the device is closed
         self._validate_batch_alignment(storage)
@@ -232,6 +235,7 @@ class TTPPO(PPO):
         during trace capture" and hung the process until the job timeout: docs/porting/incidents/2026-11-11_trace_capture_left_open.md)."""
         ttnn = self.ctx.ttnn
         trace_id = ttnn.begin_trace_capture(self.ctx.mesh, cq_id=0)
+        self.timer.paused = True  # the profiling timer synchronises the device, which is not allowed inside a capture
         try:
             fn()
         except BaseException:
@@ -241,6 +245,8 @@ class TTPPO(PPO):
             except BaseException as exc:
                 print(f"rsl_rl_tt.ppo: could not end the failed trace capture cleanly: {exc!r}", file=__import__("sys").stderr)
             raise
+        finally:
+            self.timer.paused = False
         ttnn.end_trace_capture(self.ctx.mesh, trace_id, cq_id=0)
         self._traces[name] = trace_id
         _CAPTURED_TRACES[id(self.tray)] = _CAPTURED_TRACES.get(id(self.tray), 0) + 1
@@ -255,17 +261,29 @@ class TTPPO(PPO):
         self._traces.clear()
 
     def _act_graph(self, actor_in, critic_in, noise, persist: bool) -> dict:
-        """The device ops of one act step (forward passes, sample, log-prob, value). With persist=True the results are written in place into
-        persistent buffers (what a trace needs); otherwise they are fresh tensors."""
+        """The device ops of one act step (forward passes, sample, log-prob, value).
+
+        persist=False (eager): TILE inputs, fresh output tensors. persist=True (the traced step): the inputs are ROW_MAJOR persistent tensors (a cheap host
+        upload, `TTContext.upload_rm_into`) that are tilized here on the device, and the results - including the tilized observations that the storage
+        keeps - are written in place into persistent buffers."""
         ctx = self.ctx
+        ttnn = ctx.ttnn
         actor, critic = self.tt_actor, self.tt_critic
         dist = actor.distribution
+        share = self.storage.share_obs
+        if persist:
+            actor_in = ttnn.to_layout(actor_in, ttnn.TILE_LAYOUT)
+            critic_in = actor_in if share else ttnn.to_layout(critic_in, ttnn.TILE_LAYOUT)
+            noise = ttnn.to_layout(noise, ttnn.TILE_LAYOUT)
         mean = actor.forward(actor_in)
         action = dist.sample(mean, noise)
         logp = dist.log_prob(action, mean)
         value = critic.forward(critic_in)[:, 0:1]
         out = dict(action=action, mean=mean, logp=logp, value=value)
         if persist:
+            out["actor_obs"] = actor_in
+            if not share:
+                out["critic_obs"] = critic_in
             out = {k: ctx.put(self._buf.get("act." + k), v) for k, v in out.items()}
             for k, v in out.items():
                 self._buf["act." + k] = v
@@ -284,15 +302,15 @@ class TTPPO(PPO):
         # (randn of shape [rows, A]); padded action columns get zero noise.
         noise_host = pad_matrix(torch.randn(rows, actor.output_dim), rows, dist.dim_p)
         with self.timer.section("act.upload_obs"):
-            if traced:  # persistent input buffers, written in place (copy_host_to_device_tensor)
-                actor_in = actor.obs_to_device(obs, into=self._buf.get("act.actor_in"))
+            if traced:  # persistent ROW_MAJOR input buffers, written in place (copy_host_to_device_tensor); the trace tilizes them
+                actor_in = actor.obs_to_device_rm(obs, into=self._buf.get("act.actor_in"))
                 self._buf["act.actor_in"] = actor_in
                 if share:
                     critic_in = actor_in
                 else:
-                    critic_in = critic.obs_to_device(obs, into=self._buf.get("act.critic_in"))
+                    critic_in = critic.obs_to_device_rm(obs, into=self._buf.get("act.critic_in"))
                     self._buf["act.critic_in"] = critic_in
-                noise = ctx.upload_into(self._buf.get("act.noise"), noise_host, op="H-4", batch_sharded=True)
+                noise = ctx.upload_rm_into(self._buf.get("act.noise"), noise_host, op="H-4", batch_sharded=True)
                 self._buf["act.noise"] = noise
             else:
                 actor_in = actor.obs_to_device(obs)
@@ -301,7 +319,7 @@ class TTPPO(PPO):
         with self.timer.section("act.compute"):
             if traced and "act" in self._traces:
                 self._replay("act")
-                out = {k: self._buf["act." + k] for k in ("action", "mean", "logp", "value")}
+                out = {k: self._buf["act." + k] for k in ("action", "mean", "logp", "value", "actor_obs") + (() if share else ("critic_obs",))}
             else:
                 out = self._act_graph(actor_in, critic_in, noise, persist=traced)
                 if traced:
@@ -311,6 +329,8 @@ class TTPPO(PPO):
                     self._capture("act", lambda: self._act_graph(actor_in, critic_in, noise, persist=True))
         # Traced: these are the trace's persistent buffers, overwritten by the next replay; `process_env_step` -> `add_transition` copies them into this
         # step's preallocated storage slot before that happens (no tensor is allocated here: see the persistent-state rule in __init__).
+        if traced:  # the (tilized) observations are outputs of the trace
+            actor_in, critic_in = out["actor_obs"], (out["actor_obs"] if share else out["critic_obs"])
         self._pending = dict(actor_obs=actor_in, critic_obs=critic_in, action=out["action"], mean=out["mean"], value=out["value"], logp=out["logp"])
         with self.timer.section("act.download_actions"):
             return ctx.download(out["action"], op="H-2")[:, : actor.output_dim].contiguous()  # the one per-step sync point (H-2)
@@ -328,11 +348,29 @@ class TTPPO(PPO):
             self.storage.add_transition(reward=reward, done=done, **pending)
 
     def compute_returns(self, obs: TensorDict) -> None:
-        """GAE on the device (storage.compute_returns); the last value comes from the device critic."""
+        """GAE on the device (storage.compute_returns); the last value comes from the device critic. Traced: the whole thing (critic forward on the last
+        observation, GAE over the stored steps, advantage normalisation) is one captured trace that writes persistent `returns` / `advantages`."""
         critic = self.tt_critic
         with self.timer.section("compute_returns"):
-            last_values = critic.forward(critic.obs_to_device(obs))[:, 0:1]
-            self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantages=not self.normalize_advantage_per_mini_batch)
+            if not self.trace_enabled:
+                last_values = critic.forward(critic.obs_to_device(obs))[:, 0:1]
+                self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantages=not self.normalize_advantage_per_mini_batch)
+                return
+            critic_in = critic.obs_to_device_rm(obs, into=self._buf.get("gae.critic_in"))
+            self._buf["gae.critic_in"] = critic_in
+            if "gae" in self._traces:
+                self._replay("gae")
+                self.storage.bind_outputs()
+            else:
+                self._gae_graph(critic_in)  # warm-up 1: adopts the persistent outputs
+                self._gae_graph(critic_in)  # warm-up 2: runs the in-place copy programs (they must be in the program cache before a capture)
+                self._capture("gae", lambda: self._gae_graph(critic_in))
+
+    def _gae_graph(self, critic_in_rm) -> None:
+        """The device ops of `compute_returns` (traced): tilize the last observation, critic forward, GAE, advantage normalisation."""
+        ttnn = self.ctx.ttnn
+        last_values = self.tt_critic.forward(ttnn.to_layout(critic_in_rm, ttnn.TILE_LAYOUT))[:, 0:1]
+        self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantages=not self.normalize_advantage_per_mini_batch)
 
     # -- update -------------------------------------------------------------------------------------------------------------
     def _params(self) -> list:

@@ -56,13 +56,19 @@ def main() -> None:
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--iterations", type=int, default=None)
     ap.add_argument("--threads", type=int, default=4, help="torch threads for the host-side work (env, noise, permutation)")
+    ap.add_argument("--trace", action="store_true", help="use the traced path (Phase 5: act step and mini-batch step captured once and replayed)")
+    ap.add_argument("--fidelity", default="HiFi4", help="matmul/reduction math fidelity; anything but HiFi4 is a Phase 5 precision experiment")
     ap.add_argument("--out", default=str(REPO / "docs" / "porting" / "tt_runs"))
     ap.add_argument("--runs-dir", default=str(REPO / ".run" / "tt_runs"))
     args = ap.parse_args()
+    tt_cfg = {"trace": args.trace, "math_fidelity": args.fidelity}
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    summary: dict = {"backend": "TTPPO on one Blackhole chip (tray 3, node 16), fp32, unmodified OnPolicyRunner", "envs": {}}
+    summary: dict = {
+        "backend": f"TTPPO on one Blackhole chip (tray 3, node 16), fp32 policy, math fidelity {args.fidelity}, {'traced' if args.trace else 'eager'}, unmodified OnPolicyRunner",
+        "envs": {},
+    }
     t_all = time.time()
     for env_name in args.envs:
         (out / env_name).mkdir(exist_ok=True)
@@ -71,7 +77,7 @@ def main() -> None:
             log_dir = os.path.join(args.runs_dir, env_name, f"seed{seed}")
             if os.path.isdir(log_dir):
                 shutil.rmtree(log_dir)  # our own output directory under --runs-dir
-            info = train_reference(env_name, seed, log_dir, iterations=args.iterations, num_threads=args.threads, tt=True)
+            info = train_reference(env_name, seed, log_dir, iterations=args.iterations, num_threads=args.threads, tt=True, tt_cfg=tt_cfg)
             shutil.copyfile(os.path.join(log_dir, "metrics.csv"), out / env_name / f"seed{seed}.csv")
             rows = load_curve(env_name, seed, out)
             per_seed[str(seed)] = {"iterations": info["iterations"], "wall_s": round(info["wall_s"], 1), "final_reward": final_reward(rows)}

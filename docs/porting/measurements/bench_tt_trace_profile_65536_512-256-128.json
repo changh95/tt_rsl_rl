@@ -1,0 +1,88 @@
+{
+  "act_ms": 1019.5110333152115,
+  "env_ms": 0.1081652007997036,
+  "process_ms": 132.9181669279933,
+  "returns_ms": 36.34778829291463,
+  "update_ms": 4572.931380011141,
+  "total_ms": 5767.067164182663,
+  "env_steps_per_s": 272732.0412996983,
+  "sections": {
+    "update.minibatch.replay": {
+      "total_ms": 12930.05257146433,
+      "calls": 60,
+      "ms_per_call": 215.50087619107217
+    },
+    "act.upload_obs": {
+      "total_ms": 1151.833367999643,
+      "calls": 72,
+      "ms_per_call": 15.99768566666171
+    },
+    "act.compute": {
+      "total_ms": 785.0265284068882,
+      "calls": 72,
+      "ms_per_call": 10.903146227873448
+    },
+    "act.download_actions": {
+      "total_ms": 559.8185872659087,
+      "calls": 72,
+      "ms_per_call": 7.775258156470954
+    },
+    "update.shuffle_gather": {
+      "total_ms": 548.1623485684395,
+      "calls": 3,
+      "ms_per_call": 182.72078285614649
+    },
+    "process_env_step": {
+      "total_ms": 389.96637100353837,
+      "calls": 72,
+      "ms_per_call": 5.416199597271366
+    },
+    "update.pack_table": {
+      "total_ms": 117.88968555629253,
+      "calls": 3,
+      "ms_per_call": 39.29656185209751
+    },
+    "compute_returns": {
+      "total_ms": 108.81143528968096,
+      "calls": 3,
+      "ms_per_call": 36.27047842989365
+    },
+    "update.normalizers": {
+      "total_ms": 80.81498788669705,
+      "calls": 3,
+      "ms_per_call": 26.938329295565683
+    }
+  },
+  "backend": "tt",
+  "num_envs": 65536,
+  "hidden": [
+    512,
+    256,
+    128
+  ],
+  "num_steps": 24,
+  "trace": true,
+  "profile": true,
+  "mini_batches": 4,
+  "fidelity": "HiFi4",
+  "host_ops": {
+    "calls": {
+      "H-6": 219,
+      "H-8": 216,
+      "H-5": 26,
+      "H-3": 245,
+      "H-1": 365,
+      "H-4": 125,
+      "H-2": 120
+    },
+    "bytes": {
+      "H-6": 1436132736,
+      "H-8": 864,
+      "H-5": 848,
+      "H-3": 5158993920,
+      "H-1": 6165626880,
+      "H-4": 1038090240,
+      "H-2": 1006632960
+    }
+  }
+}

@@ -51,15 +51,31 @@ class NullEnv(VecEnv):
         return self._obs, self._rewards, self._dones, dict(self._extras)
 
 
-def build(backend: str, num_envs: int, hidden: list[int], steps: int = 24, trace: bool = False):
-    spec = RefSpec(num_envs=num_envs, num_steps=steps, iterations=1, hidden=tuple(hidden), algorithm=REF_SPECS["tracking12"].algorithm)
+def env_step_cost_ms(num_envs: int, steps: int = 24, repeats: int = 3) -> float:
+    """Median wall time (ms) of `steps` steps of the real CPU tracking12 environment at this size (host only; what a real env adds to an iteration)."""
+    from rsl_rl_tt.testing.envs import make_env
+
+    env = make_env("tracking12", num_envs, seed=0)
+    actions = torch.zeros(num_envs, env.num_actions)
+    times = []
+    for _ in range(repeats + 1):
+        t0 = time.perf_counter()
+        for _ in range(steps):
+            env.step(actions)
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times[1:]) * 1e3
+
+
+def build(backend: str, num_envs: int, hidden: list[int], steps: int = 24, trace: bool = False, mini_batches: int | None = None, fidelity: str = "HiFi4"):
+    algorithm = {**REF_SPECS["tracking12"].algorithm, **({"num_mini_batches": mini_batches} if mini_batches else {})}
+    spec = RefSpec(num_envs=num_envs, num_steps=steps, iterations=1, hidden=tuple(hidden), algorithm=algorithm)
     torch.manual_seed(0)
     env = NullEnv(num_envs)
     cfg = make_train_cfg("tracking12", spec, logger=None)
     cfg["check_for_nan"] = False  # the real runner checks env tensors on the host; not part of the algorithm cost
     if backend == "tt":
         cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"
-        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [1, 1], **({"trace": True} if trace else {})}
+        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [1, 1], "math_fidelity": fidelity, **({"trace": True} if trace else {})}
     return OnPolicyRunner(env, cfg, log_dir=None, device="cpu"), env, spec
 
 
@@ -110,15 +126,24 @@ def main() -> None:
     ap.add_argument("--profile", action="store_true", help="TT only: time the sections of the TT path (adds device syncs; use for the breakdown, not for headline numbers)")
     ap.add_argument("--trace", action="store_true", help="TT only: use the traced path (Phase 5)")
     ap.add_argument("--threads", type=int, default=16, help="torch threads (CPU backend and host-side work)")
+    ap.add_argument("--mini-batches", type=int, default=None, help="override num_mini_batches (upstream default 4); the matrix at 65536 envs may need more to fit the device memory")
+    ap.add_argument("--fidelity", default="HiFi4", help="TT only: math fidelity of matmuls/reductions (precision experiment when not HiFi4)")
+    ap.add_argument("--env-cost", action="store_true", help="host only: time the real CPU tracking12 environment at this size instead of the algorithm")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
-    runner, env, spec = build(args.backend, args.envs, args.hidden, args.steps, args.trace)
+    if args.env_cost:
+        res = {"num_envs": args.envs, "num_steps": args.steps, "env_step_ms_per_iteration": env_step_cost_ms(args.envs, args.steps)}
+        print(json.dumps(res, indent=1))
+        if args.out:
+            Path(args.out).write_text(json.dumps(res, indent=2))
+        return
+    runner, env, spec = build(args.backend, args.envs, args.hidden, args.steps, args.trace, args.mini_batches, args.fidelity)
     if args.backend == "tt" and args.profile:
         runner.alg.timer.enabled = True
-    print(f"backend={args.backend} envs={args.envs} hidden={args.hidden} steps={args.steps} trace={args.trace} profile={args.profile}", flush=True)
+    print(f"backend={args.backend} envs={args.envs} hidden={args.hidden} steps={args.steps} trace={args.trace} profile={args.profile} mini_batches={args.mini_batches or 4}", flush=True)
     res = run_iterations(runner.alg, env, spec, args.iters, args.warmup)
-    res.update({"backend": args.backend, "num_envs": args.envs, "hidden": args.hidden, "num_steps": args.steps, "trace": args.trace, "profile": args.profile})
+    res.update({"backend": args.backend, "num_envs": args.envs, "hidden": args.hidden, "num_steps": args.steps, "trace": args.trace, "profile": args.profile, "mini_batches": args.mini_batches or 4, "fidelity": args.fidelity})
     if args.backend == "tt":
         res["host_ops"] = runner.alg.ctx.host_ops.snapshot()
     print(json.dumps({k: v for k, v in res.items() if k != "sections"}, indent=1))

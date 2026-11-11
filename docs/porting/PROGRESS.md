@@ -3,19 +3,22 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
-## 2026-11-11 — Phase 5 IN PROGRESS (device work paused after a job timeout, BRIEF 2-6)
-**Done so far (branch `tt/phase-5`)**
-- Baselines (null env, algorithm cost only, `scripts/bench_matrix.py`): 4096 envs x 24 steps, hidden [512,256,128]: upstream CPU 3.2 s per iteration (update 3.0 s); TT untraced 2.34 s
-  (update 2.2 s, of which the shuffle gather 1.25 s = 57 %).
-- Shuffle: exact fp32 row gather through 3 x bf16 pieces + `ttnn.embedding` (probe: bit exact, 5.9 ms for 24576 rows vs 237 ms for `tosa_gather`); in `TTRolloutStorage.shuffle`.
-  TT iteration 2.34 s -> 1.05 s (update 0.92 s). Remaining per-mini-batch cost is per-op dispatch (adam 17 ms, backward 10 ms, clip 7 ms, loss 4 ms, forward 3.5 ms).
-- Trace probe: replay of ~120 ops 0.67 ms vs 10.2 ms eager (15x); persistent inputs, in-place outputs/parameters and allocations between replays behave (`scripts/probe_trace.py`).
-- Refactor to PERSISTENT device state updated in place (weights, normalizer statistics, Gaussian derived rows, Adam moments and scalars, learning rate, loss accumulators), a single
-  `_minibatch_step` used eagerly and as a captured trace, traced `act` step, `trace` option in `tt_cfg`. Eager path: 130 device tests passed after the refactor.
-**Incident (rules 2-6)**: the first traced test run hit `TT_FATAL ... not yet in program cache` during capture, the exception left the capture open and the job ran into its timeout (exit 124).
-Root cause and fixes (host side): `docs/porting/incidents/2026-11-11_trace_capture_left_open.md`. No device job has been started since; the hardware state is unverified.
-**Next (when device work resumes)**: plain open/close smoke of chip 16, then `tests/tt/test_tt_trace.py` (traced == eager bit for bit), the Phase 2-4 suites on the traced path, the benchmark matrix
-(num_envs 4096/16384/65536 x hidden [512,256,128]/[1024,1024,512]), `PERF.md`.
+## 2026-11-11 — Phase 5 DONE: 1-chip performance, traced path (tag `phase-5-done`)
+**Done**
+- act step, mini-batch update step and GAE are captured once as Metal traces and replayed, with persistent in-place device state. Traced == eager BIT FOR BIT (cartpole, tracking12, 4 iterations, all
+  device state; after `load()`; `tests/tt/test_tt_trace.py`, 5 device tests). Phase 2-4 suites pass again (157 device tests, 373 host tests) and the Phase 4 criterion is met on the TRACED path
+  (`docs/porting/tt_runs_trace/`, 3 envs x 3 seeds): cartpole 500.0 (golden 500.0), pendulum -152.2 (-152.1), tracking12 191.6 (190.7), no NaN/Inf; 14 / 36 / 77 s per run (eager 68 / 143 / 322 s, CPU 20 / 50 / 230 s).
+- Benchmark matrix (null env, algorithm cost per iteration, TT traced vs upstream CPU 32 threads): num_envs 4096 / 16384 / 65536 x hidden [512,256,128] / [1024,1024,512]: 7.3x / 13.6x / 13.3x and
+  17.7x / 17.4x / 19.0x faster (0.45 s vs 3.3 s at 4096 x [512,256,128]; 12.5 s vs 238 s at 65536 x [1024,1024,512]); 105-285 k env-steps/s. Unfavourable regimes: break-even with one CPU thread at 256 envs x [64,64].
+  Full tables, iteration breakdown, op profile, precision experiments (HiFi2/LoFi: no speed-up, so no learning-parity runs; bf16 not tried), reproduce commands: `docs/porting/PERF.md`.
+- Optimisations found by profiling: exact bf16-split `embedding` shuffle (T-12, 40x), ROW_MAJOR uploads tilized on the device (act upload 74 -> 16 ms/step at 65536 envs), `elu_bw` replaced by
+  `g * exp(min(z,0))` (15.5 ms per call, 29 % of an update step), persistent state + traces.
+- Findings recorded: **T-15** (a trace's intermediates are freed after capture but rewritten by every replay: tensors allocated afterwards that keep a value across replays are silently overwritten) with the
+  persistent-state rule and a construction guard in `TTPPO`; **T-16** (capture preconditions). Incident of the first traced run (rule 2-6, capture left open -> timeout): record in `docs/porting/incidents/`; the chip was
+  verified with the open/close smoke afterwards, no reset was ever needed.
+- CI of this fork switched off at the owner's request (workflows run by hand only; `gh workflow` / repo settings stay out of scope, rule 2-10).
+**Next**: Phase 6 (tray multi-chip data parallel: 1x2 -> 2x4, synchronous gradient/statistics exchange by all_gather + sum, ADR-0004 A-1; the normalizer's multi-chip statistics and the batch-sharded
+tensors of the traced path are the open items; the persistent-state rule T-15 applies to every new buffer).
 
 ## 2026-11-11 — Phase 4 DONE: 1-chip end-to-end training and checkpoint compatibility (tag `phase-4-done`)
 **Done**

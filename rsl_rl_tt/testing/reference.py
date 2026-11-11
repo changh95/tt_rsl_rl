@@ -73,30 +73,36 @@ def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | No
     return cfg
 
 
-def build_reference_runner(env_name: str, seed: int, log_dir: str | None, spec: RefSpec | None = None, num_envs: int | None = None, tt: bool = False):
+def build_reference_runner(env_name: str, seed: int, log_dir: str | None, spec: RefSpec | None = None, num_envs: int | None = None, tt: bool = False, tt_cfg: dict | None = None):
     """Seed torch and the env, build env + the UNMODIFIED upstream OnPolicyRunner (device cpu). Returns (runner, env, spec).
 
-    tt=True swaps only the algorithm class (`rsl_rl_tt.ppo:TTPPO`, single chip); everything else, including the runner, is upstream's.
-    That needs an open tray mesh, i.e. a process started through scripts/tt_run.sh."""
+    tt=True swaps only the algorithm class (`rsl_rl_tt.ppo:TTPPO`, single chip; `tt_cfg` adds e.g. {"trace": True}); everything else, including the
+    runner, is upstream's. That needs an open tray mesh, i.e. a process started through scripts/tt_run.sh."""
     spec = spec or REF_SPECS[env_name]
     torch.manual_seed(seed)
     env = make_env(env_name, num_envs or spec.num_envs, seed=seed)
     cfg = make_train_cfg(env_name, spec)
     if tt:
         cfg["algorithm"]["class_name"] = "rsl_rl_tt.ppo:TTPPO"
-        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [1, 1]}
+        cfg["algorithm"]["tt_cfg"] = {"mesh_shape": [1, 1], **(tt_cfg or {})}
     runner = OnPolicyRunner(env, cfg, log_dir=log_dir, device="cpu")
     return runner, env, spec
 
 
-def train_reference(env_name: str, seed: int, log_dir: str, iterations: int | None = None, spec: RefSpec | None = None, num_threads: int | None = None, tt: bool = False) -> dict:
+def train_reference(
+    env_name: str, seed: int, log_dir: str, iterations: int | None = None, spec: RefSpec | None = None, num_threads: int | None = None, tt: bool = False, tt_cfg: dict | None = None
+) -> dict:
     """Train with the unmodified upstream runner (algorithm = upstream PPO, or TTPPO with tt=True); the CSV metrics land in `log_dir/metrics.csv`."""
     if num_threads is not None:
         torch.set_num_threads(num_threads)
     os.makedirs(log_dir, exist_ok=True)
-    runner, _, spec = build_reference_runner(env_name, seed, log_dir, spec, tt=tt)
+    runner, _, spec = build_reference_runner(env_name, seed, log_dir, spec, tt=tt, tt_cfg=tt_cfg)
     n_it = iterations if iterations is not None else spec.iterations
     t0 = time.time()
-    runner.learn(num_learning_iterations=n_it, init_at_random_ep_len=True)
+    try:
+        runner.learn(num_learning_iterations=n_it, init_at_random_ep_len=True)
+    finally:
+        if tt and hasattr(runner.alg, "release_traces"):
+            runner.alg.release_traces()  # the next run builds a new TTPPO on the same mesh (it refuses to while captured traces are alive, T-15)
     wall = time.time() - t0
     return {"env": env_name, "seed": seed, "backend": "tt" if tt else "upstream-cpu", "iterations": n_it, "wall_s": wall, "num_threads": torch.get_num_threads(), "num_envs": spec.num_envs, "num_steps": spec.num_steps}
