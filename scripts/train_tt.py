@@ -24,7 +24,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from rsl_rl_tt.testing.envs import ENV_NAMES  # noqa: E402
+from rsl_rl_tt.testing.envs import ENV_NAMES, RECURRENT_ENV_CLASSES  # noqa: E402
 from rsl_rl_tt.testing.golden import GOLDEN_DIR, final_reward, load_curve, tt_vs_golden  # noqa: E402
 from rsl_rl_tt.testing.reference import DISTILL_ITERATIONS, REF_SPECS, train_distillation, train_reference, with_rnd, with_symmetry  # noqa: E402
 
@@ -56,7 +56,7 @@ def plot(env_name: str, seeds, tt_dir: Path, out_png: Path, golden_dir: Path = G
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--envs", nargs="+", default=list(ENV_NAMES), choices=ENV_NAMES)
+    ap.add_argument("--envs", nargs="+", default=None, choices=ENV_NAMES + tuple(RECURRENT_ENV_CLASSES), help="default: the three standard envs (with --rnn: the partially observable cart-pole)")
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--iterations", type=int, default=None)
     ap.add_argument("--threads", type=int, default=4, help="torch threads for the host-side work (env, noise, permutation)")
@@ -67,12 +67,14 @@ def main() -> None:
     ap.add_argument("--std-type", default="scalar", choices=("scalar", "log"))
     ap.add_argument("--rnd", action="store_true", help="Random Network Distillation (Phase 8.2: reference.with_rnd; the golden curves must have been made with the same flag)")
     ap.add_argument("--symmetry", action="store_true", help="symmetry augmentation + mirror loss (Phase 8.3: reference.with_symmetry; the golden curves must have been made with the same flag)")
+    ap.add_argument("--rnn", choices=("gru", "lstm"), default=None, help="recurrent actor and critic (Phase 8.5: the partially observable cart-pole with a GRU / LSTM; the golden curves must have been made with the same flag)")
     ap.add_argument("--distill", action="store_true", help="distillation (Phase 8.4: `rsl_rl_tt.distillation:TTDistillation`; the golden curves must have been made with the same flag and teachers)")
     ap.add_argument("--teachers", default=str(REPO / ".run" / "teachers"), help="directory of the teacher checkpoints <env>.pt (made by `scripts/train_reference.py --distill`)")
     ap.add_argument("--golden", default=str(GOLDEN_DIR), help="directory of the upstream reference curves to compare with (must have been produced with the same --distribution / --std-type)")
     ap.add_argument("--out", default=str(REPO / "docs" / "porting" / "tt_runs"))
     ap.add_argument("--runs-dir", default=str(REPO / ".run" / "tt_runs"))
     args = ap.parse_args()
+    args.envs = args.envs or (["cartpole_po"] if args.rnn else list(ENV_NAMES))
     rows, cols = (int(v) for v in args.mesh.split("x"))
     chips = rows * cols
     tt_cfg = {"trace": args.trace, "math_fidelity": args.fidelity, "mesh_shape": [rows, cols], **({"replica_check_interval": 10} if chips > 1 else {})}
@@ -94,6 +96,10 @@ def main() -> None:
             if os.path.isdir(log_dir):
                 shutil.rmtree(log_dir)  # our own output directory under --runs-dir
             spec = dataclasses.replace(REF_SPECS[env_name], distribution=args.distribution, std_type=args.std_type)
+            if args.rnn:
+                from rsl_rl_tt.testing.reference import recurrent_e2e_spec
+
+                spec = recurrent_e2e_spec(env_name, args.rnn)
             if args.rnd:
                 spec = with_rnd(env_name, spec)
             if args.symmetry:
@@ -107,7 +113,7 @@ def main() -> None:
             rows = load_curve(env_name, seed, out)
             per_seed[str(seed)] = {"iterations": info["iterations"], "wall_s": round(info["wall_s"], 1), "final_reward": final_reward(rows)}
             print(f"done {env_name} seed {seed}: {info['wall_s']:.0f} s, final reward {per_seed[str(seed)]['final_reward']:.2f}", flush=True)
-        entry = {"seeds": per_seed, "num_envs": REF_SPECS[env_name].num_envs, "num_steps_per_env": REF_SPECS[env_name].num_steps}
+        entry = {"seeds": per_seed, "num_envs": spec.num_envs, "num_steps_per_env": spec.num_steps}
         entry["criterion"] = tt_vs_golden(env_name, args.seeds, out, Path(args.golden))
         summary["envs"][env_name] = entry
         plot(env_name, args.seeds, out, out / f"{env_name}_vs_golden.png", Path(args.golden))

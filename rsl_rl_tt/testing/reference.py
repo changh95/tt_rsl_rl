@@ -14,7 +14,7 @@ import torch
 from dataclasses import dataclass
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
-from rsl_rl_tt.testing.envs import ENV_CLASSES, make_env
+from rsl_rl_tt.testing.envs import ENV_CLASSES, env_class, make_env
 
 CSV_LOGGER = {"class_name": "rsl_rl_tt.testing.csv_writer:CsvLogWriter"}
 
@@ -31,6 +31,8 @@ class RefSpec:
     distribution: str = "GaussianDistribution"  # or "HeteroscedasticGaussianDistribution" (the std is an output of the actor MLP)
     std_type: str = "scalar"
     obs_groups: dict | None = None  # overrides the env's default observation sets (e.g. adds "rnd_state")
+    model: dict | None = None  # extra keys of the actor's (and, unless `critic_model` is given, the critic's) model config, e.g. {"class_name": "RNNModel", "rnn_type": "gru", "rnn_hidden_dim": 64, "rnn_num_layers": 1}
+    critic_model: dict | None = None  # the critic's extra keys when they differ from `model` ({} = a plain MLP critic)
 
 
 _PPO = {
@@ -99,7 +101,7 @@ _DISTILLATION = {"class_name": "Distillation", "num_learning_epochs": 2, "gradie
 
 def teacher_train_cfg(env_name: str) -> dict:
     """The RL configuration that trains the teacher of `env_name`: the standard spec with the teacher's observation groups as the ACTOR's (so its `actor_state_dict` loads into the teacher)."""
-    spec = dataclasses.replace(REF_SPECS[env_name], obs_groups={"actor": list(DISTILL_GROUPS[env_name]["teacher"]), "critic": list(ENV_CLASSES[env_name].obs_groups_cfg["critic"])})
+    spec = dataclasses.replace(REF_SPECS[env_name], obs_groups={"actor": list(DISTILL_GROUPS[env_name]["teacher"]), "critic": list(env_class(env_name).obs_groups_cfg["critic"])})
     return make_train_cfg(env_name, spec)
 
 
@@ -135,6 +137,22 @@ def make_teacher_checkpoint(env_name: str, path: str, seed: int = 0, iterations:
     return path
 
 
+# ---- recurrent models (Phase 8.5) -----------------------------------------------------------------------------------------------------------------
+# the partially observable cart-pole (no velocities): a feed-forward policy cannot solve it, a GRU / LSTM policy can
+REF_SPECS["cartpole_po"] = RefSpec(num_envs=1024, num_steps=24, iterations=150, hidden=(64,), algorithm=_PPO, model={"class_name": "RNNModel", "rnn_type": "gru", "rnn_hidden_dim": 64, "rnn_num_layers": 1})
+
+
+def with_rnn(spec: RefSpec, rnn_type: str = "gru", hidden_dim: int = 64, num_layers: int = 1, actor: bool = True, critic: bool = True) -> RefSpec:
+    """`spec` with RNN models (`rnn_type` "gru" / "lstm"); `actor` / `critic` False keeps that model a plain MLP."""
+    model = {"class_name": "RNNModel", "rnn_type": rnn_type, "rnn_hidden_dim": hidden_dim, "rnn_num_layers": num_layers}
+    return dataclasses.replace(spec, model=model if actor else {}, critic_model=model if critic else {})
+
+
+def recurrent_e2e_spec(env_name: str, rnn_type: str) -> RefSpec:
+    """The end-to-end run of Phase 8.5 (`--rnn` of the scripts): the partially observable cart-pole, GRU / LSTM actor and critic of 64 units, 512 environments x 24 steps, 150 iterations."""
+    return with_rnn(dataclasses.replace(REF_SPECS[env_name], num_envs=512, iterations=150), rnn_type, 64, 1)
+
+
 def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | None = CSV_LOGGER) -> dict:
     spec = spec or REF_SPECS[env_name]
     dist = {"class_name": spec.distribution, "init_std": spec.init_std, "std_type": spec.std_type}
@@ -142,9 +160,9 @@ def make_train_cfg(env_name: str, spec: RefSpec | None = None, logger: dict | No
         "num_steps_per_env": spec.num_steps,
         "save_interval": 10_000,
         "check_for_nan": True,
-        "obs_groups": copy.deepcopy(spec.obs_groups if spec.obs_groups is not None else ENV_CLASSES[env_name].obs_groups_cfg),
-        "actor": {"class_name": "MLPModel", "hidden_dims": list(spec.hidden), "activation": "elu", "obs_normalization": spec.obs_normalization, "distribution_cfg": dist},
-        "critic": {"class_name": "MLPModel", "hidden_dims": list(spec.hidden), "activation": "elu", "obs_normalization": spec.obs_normalization},
+        "obs_groups": copy.deepcopy(spec.obs_groups if spec.obs_groups is not None else env_class(env_name).obs_groups_cfg),
+        "actor": {"class_name": "MLPModel", "hidden_dims": list(spec.hidden), "activation": "elu", "obs_normalization": spec.obs_normalization, "distribution_cfg": dist, **(spec.model or {})},
+        "critic": {"class_name": "MLPModel", "hidden_dims": list(spec.hidden), "activation": "elu", "obs_normalization": spec.obs_normalization, **((spec.model or {}) if spec.critic_model is None else spec.critic_model)},
         "algorithm": copy.deepcopy(spec.algorithm),
     }
     if logger is not None:

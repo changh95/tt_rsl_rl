@@ -187,6 +187,7 @@ UPDATE_TOLERANCES = {
     "full_update_clipped": 8e-2,  # one full update (20 Adam steps) of the clipped objective: the discontinuous clip gates make a few samples take the other branch
     "drift20_smooth": 3e-2,  # 20 consecutive updates on identical data, smooth objective (clip_param = 1e3, unclipped value loss)
     "drift20_clipped": 2.5e-1,  # the same with the standard clipped objective
+    "rnn_noise_factor": 20.0,  # Phase 8.5: recurrent models, smooth objective / one step: deviation <= rnn_noise_factor x (the noise baseline) + noise_abs (the baseline cannot see the noise that accumulates inside the sequence)
     "distill_many_steps": 3e-2,  # Phase 8.4: a distillation update with >= 3 Adam steps on a smooth regression loss with consistent gradients (the noise-floor sign flips of the first step stay and compound)
 }
 

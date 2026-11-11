@@ -26,6 +26,7 @@ inference + PPO update) to Tenstorrent Blackhole using TTNN, as a plugin package
 | 8.2 | Post-v1: Random Network Distillation (`rnd_cfg`: intrinsic reward, predictor / target on the device) | done (tag `phase-8-2-done`): 1 chip, 1x2, 2x4; +31 % per iteration |
 | 8.3 | Post-v1: symmetry (`symmetry_cfg`: data augmentation and mirror loss for affine mirror functions) | done (tag `phase-8-3-done`): 1 chip, 1x2, 2x4; +38 % per iteration with 2 copies |
 | 8.4 | Post-v1: distillation (`Distillation`: a student MLP imitates a teacher; behaviour cloning on the device) | done (tag `phase-8-4-done`): 1 chip, 1x2, 2x4; 1.7-2.4x faster than upstream CPU end to end |
+| 8.5 | Post-v1: `RNNModel` (GRU, LSTM) actor / critic in PPO, hand-written BPTT on the device | done (tag `phase-8-5-done`): 1 chip, 1x2, 2x4; 6-7x faster than upstream CPU at 4096 environments |
 
 > This is a work in progress on shared hardware; it only ever touches one dedicated 8-chip tray (see `CLAUDE.md`).
 

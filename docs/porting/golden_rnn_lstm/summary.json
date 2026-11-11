@@ -1,0 +1,65 @@
+{
+  "rsl_rl_tag": "v5.5.2",
+  "distribution": "GaussianDistribution",
+  "std_type": "scalar",
+  "rnd": false,
+  "symmetry": false,
+  "distillation": false,
+  "rnn": "lstm",
+  "torch": "2.11.0+cpu",
+  "python": "3.10.12",
+  "machine": {
+    "cpu_count": 64,
+    "threads_per_run": 5,
+    "parallel_runs": 6,
+    "platform": "Linux-6.8.0-107-generic-x86_64-with-glibc2.35"
+  },
+  "final_window_iterations": 10,
+  "total_wall_s": 56.1,
+  "envs": {
+    "cartpole_po": {
+      "num_envs": 512,
+      "num_steps_per_env": 24,
+      "seeds": {
+        "0": {
+          "iterations": 150,
+          "wall_s": 52.3,
+          "final_reward": 125.83200000000001,
+          "first_reward": 21.53
+        },
+        "1": {
+          "iterations": 150,
+          "wall_s": 53.8,
+          "final_reward": 202.164,
+          "first_reward": 21.39
+        },
+        "2": {
+          "iterations": 150,
+          "wall_s": 50.4,
+          "final_reward": 500.0,
+          "first_reward": 21.98
+        },
+        "3": {
+          "iterations": 150,
+          "wall_s": 51.4,
+          "final_reward": 429.738,
+          "first_reward": 21.38
+        },
+        "4": {
+          "iterations": 150,
+          "wall_s": 54.1,
+          "final_reward": 497.156,
+          "first_reward": 21.76
+        },
+        "5": {
+          "iterations": 150,
+          "wall_s": 48.8,
+          "final_reward": 492.01800000000003,
+          "first_reward": 20.96
+        }
+      },
+      "final_reward_mean": 374.48466666666667,
+      "final_reward_std": 152.31104742890088
+    }
+  }
+}

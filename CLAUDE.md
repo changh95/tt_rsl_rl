@@ -79,7 +79,7 @@ MUJOCO_GL=egl python examples/g1_walk/play.py --checkpoint random .run/examples/
 # MULTI-CHIP RULE (ADR-0004): chip-local loss / advantage normalisation / shuffle, gradients and KL averaged over the chips (gather + fp32 sum, never ttnn.all_reduce), global normalizer statistics.
 # TRACED-PATH RULE (TTNN_ISSUES T-15): everything that keeps a value across trace replays is allocated BEFORE the first capture; one TTPPO per process.
 
-# Phase 8.1 - 8.4 (heteroscedastic Gaussian, RND, symmetry, distillation): all device suites (v1 + 8.x) on 1 chip, 1x2 and 2x4, fail-fast (~10 min); the 1-chip references of the multi-chip tests: scripts/mc_step_reference.py --hetero / --rnd / --symmetry, scripts/mc_distill_reference.py
+# Phase 8.1 - 8.5 (heteroscedastic Gaussian, RND, symmetry, distillation, recurrent models): all device suites (v1 + 8.x) on 1 chip, 1x2 and 2x4, fail-fast (~10 min); the 1-chip references of the multi-chip tests: scripts/mc_step_reference.py --hetero / --rnd / --symmetry, scripts/mc_distill_reference.py
 scripts/run_phase8_final.sh
 python scripts/train_reference.py --distribution HeteroscedasticGaussianDistribution --out docs/porting/golden_hetero --runs-dir .run/golden_hetero_runs     # upstream CPU curves (host only)
 scripts/tt_run.sh --chips 16 --timeout 3600 --tag p8e -- python scripts/train_tt.py --distribution HeteroscedasticGaussianDistribution --golden docs/porting/golden_hetero --out docs/porting/tt_runs_hetero --runs-dir .run/tt_runs_hetero --trace
@@ -89,6 +89,8 @@ python scripts/train_reference.py --symmetry --out docs/porting/golden_sym --run
 scripts/tt_run.sh --chips 16 --timeout 3600 --tag p8se -- python scripts/train_tt.py --symmetry --golden docs/porting/golden_sym --out docs/porting/tt_runs_sym --runs-dir .run/tt_runs_sym --trace
 python scripts/train_reference.py --distill --out docs/porting/golden_distill --runs-dir .run/golden_distill_runs     # teachers (upstream PPO, CPU) + upstream distillation curves (host only)
 scripts/tt_run.sh --chips 16 --timeout 3600 --tag p8de -- python scripts/train_tt.py --distill --golden docs/porting/golden_distill --out docs/porting/tt_runs_distill --runs-dir .run/tt_runs_distill --trace
+python scripts/train_reference.py --rnn gru --seeds 0 1 2 3 4 5 --out docs/porting/golden_rnn_gru --runs-dir .run/golden_rnn_gru_runs     # upstream CPU curves of the recurrent cart-pole (host only)
+scripts/tt_run.sh --chips 16 --timeout 3600 --tag p8ne -- python scripts/train_tt.py --rnn gru --seeds 0 1 2 3 4 5 --golden docs/porting/golden_rnn_gru --out docs/porting/tt_runs_rnn_gru --runs-dir .run/tt_runs_rnn_gru --trace
 
 # stop only jobs started by this repo (reads .run/pids)
 scripts/kill_my_jobs.sh
