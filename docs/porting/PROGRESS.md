@@ -3,6 +3,12 @@
 Newest entry first. Each entry: date, phase, done / next / blocked / key numbers, related commits.
 Read order for a new session: `BRIEF.md` -> `CLAUDE.md` -> this file.
 
+## 2026-11-12 — Phase 8.6 still BLOCKED: chip 16 opened again, then a second timeout (exit 124) on the `load()` scenario (branch `tt/phase-8-6-cnn`, not merged)
+**Done**: the owner approved a reset of chip 16 ("do the reset yourself, continue"); I started `tt-smi -r 16` inside the one-chip namespace of `tt_run.sh --chips 16` (only node 16 exists there; the number is the /dev node number, checked in the tt_umd bindings). The session ended during that call and the log has no tt-smi output,
+so it is unknown whether the reset ran; a smoke test then passed (`test_smoke_device.py`, 1 passed in 0.99 s) and no second reset was issued. The CNN trace file (`tests/tt/test_tt_cnn_trace.py`) completed in 6.7 s (bit identity passes, `survives_load` still fails its assertion).
+**Blocked (BRIEF 2-6)**: `survives_load` run ALONE (`-k`) in a fresh process hit the 120 s timeout (exit 124); stopped, no follow-up job, no reset, chip state unknown. The incident note (second section) has the commands, the hypothesis (T-15 family, two traced `TTPPO` in one process) and the rules for the next debug jobs.
+**Host-only finding**: the encoder's `sync_from_torch` writes in place (`upload_into`) like the MLP layers, so stale weights after `load()` is not the cause; it stays open. **Needs the owner**: a go for one smoke test on chip 16 (or a reset); then debug with the whole file and captured output, multi-chip, checkpoints, e2e `cartpole_img`, merge + tag `phase-8-6-done`; then 8.7 SAC.
+
 ## 2026-11-11 — Phase 8.6 IN PROGRESS, BLOCKED on the device (branch `tt/phase-8-6-cnn`, not merged): `CNNModel`; chip 16 does not open after a hung debug job
 **Blocked**: a scratch debug job (`scripts/tt_run.sh --chips 16 --timeout 600`) hit its timeout (exit 124); afterwards chip 16 cannot be opened (`MMIO per-op timeout: 4B load took 55484 us`, `Setting power state failed on device 16`). BRIEF 2-6: no reset, no hardware tool, no job on another node, stopped and reported;
 details, logs and the proposed next steps: `docs/porting/incidents/2026-11-11_cnn_debug_job_timeout_chip16_mmio.md`. **Needs the owner**: check / reset chip 16.
