@@ -191,6 +191,33 @@ Galaxy 호스트에는 NVIDIA GPU가 없을 가능성이 높으니 Isaac Sim은 
 - Isaac Lab 태스크의 agent cfg는 GPU 호스트에서 dict/YAML로 내보내 TT 호스트에서 그대로 로드한다(설정 일치 보장).
 - 같은 호스트 loopback(서버가 CPU 테스트 환경을 래핑)으로 먼저 검증한 뒤, 내가 GPU 호스트에서 돌릴 runbook과 스크립트를 준다: Isaac-Cartpole → 보행 태스크 하나(예: Anymal-D 또는 Go2 flat). GPU 레퍼런스 대비 곡선 비교, TT 체크포인트를 GPU 호스트의 Isaac Lab play로 재생하는 절차 포함.
 
+## 4-b. 소유자 추가 요구 (2026-11-19): 새 하드웨어와 남은 목표
+
+**배경.** 2026-11-12에 Galaxy 서버(`~/experiments`)의 작업 트리가 삭제되어, 소스는 GitHub(`changh95/tt_rsl_rl`)과 Claude Code 기록에서 복구했다(마지막 미커밋 변경: 8.6 incident 문서). 이후 작업은 다음 두 환경으로 옮긴다.
+
+| 환경 | 구성 | 이 프로젝트에서의 역할 |
+| --- | --- | --- |
+| A. 데스크톱 | RTX 5090 + Blackhole p150a 1장 (PCIe x16) | Phase 7 (Isaac Lab이 같은 호스트에서 돈다), 1칩 경로 전체 |
+| B. QuietBox2 | Blackhole 여러 칩 (칩 수와 연결 구조는 Phase 0-b에서 확인) | 멀티칩 data-parallel, G1 데모 멀티칩 |
+
+**Phase 0-b — 새 호스트 이전 (A, B 각각, 디바이스를 열기 전에)**
+- 0절의 값(`ALLOWED_DEV_NODES`, `ALLOWED_PCI_BDFS`, `TRAY_MESH_SHAPE`, `TT_METAL`, `ISAAC_HOST`, `ISAACLAB_VERSION`)을 새 호스트 기준으로 다시 채운다. 추측하지 말고 확인되지 않으면 묻는다.
+- `.claude/hooks/tray_guard.*`, `scripts/tray_env.sh`, `scripts/tt_run.sh`의 Galaxy 전용 가정(tray 3, chip 16 등)을 호스트별 설정으로 바꾼다. 가드는 없애지 말고 허용 목록만 바꾼다.
+- tt-metal v0.81.1이 새 호스트의 펌웨어/KMD와 맞는지 확인한다. 안 맞으면 버전 변경은 소유자 승인 후 ADR로 남긴다.
+- 완료 기준: 1칩 smoke, Phase 2-5 테스트 전체가 A에서 통과. B에서 1칩 + 사용 가능한 최대 mesh의 Phase 6 동치 테스트 통과. 측정값은 PERF.md에 호스트 이름을 붙여 새 행으로 추가한다(Galaxy 수치는 그대로 둔다).
+
+**Phase 7 — Isaac Lab 연동: 진행한다 (환경 A)**
+- `ISAAC_HOST` = 환경 A(같은 호스트). 3.8절의 "별도 GPU 호스트" 가정 대신 같은 호스트 경로를 먼저 한다. 이미 만든 env 브릿지(`scripts/isaac_env_server.py`, `docs/porting/ISAAC_RUNBOOK.md`)는 다른 Python 환경 사이의 연결용으로 유지한다.
+- 순서: Isaac-Cartpole → 보행 태스크 하나(Anymal-D 또는 Go2 flat) → (선택) G1.
+- 완료 기준: (1) 같은 태스크와 seed로 GPU(RTX 5090) 위 upstream rsl_rl과 TT 학습 곡선을 비교한다(Phase 4 규칙). (2) TT 체크포인트를 Isaac Lab play로 재생한다. (3) 스텝당 지연을 env / 브릿지 / TT 정책 추론 / 업데이트로 나눠 PERF.md에 기록한다. GPU 학습 시간도 같은 표에 기록한다.
+
+**G1 데모 — single chip과 multi-chip 모두에서 동작해야 한다**
+- 지금은 칩 8개(2x4)로만 확인했다. 같은 스크립트(`examples/g1_walk/`)가 칩 수 인자 하나로 1칩, 1x2, 1x4(그리고 Galaxy에서는 2x4)에서 돌아야 한다.
+- 1칩에서는 메모리와 시간에 맞게 `num_envs`를 줄이는 것을 허용한다. 줄인 값과 이유는 README와 PERF.md에 적는다. 알고리즘 의미론(PPO 설정, 전역 배치 정의)은 바꾸지 않는다.
+- 완료 기준: (1) 각 구성에서 걷는 정책을 학습하고 영상을 만든다. (2) 같은 전역 배치에서 1칩과 N칩이 Phase 6 동치 규칙을 만족한다. (3) 구성별 학습 시간을 표로 남긴다. A(p150a)에서 1칩, B(QuietBox2)에서 멀티칩을 검증한다.
+
+**남아 있는 순서:** Phase 0-b → 8.6 CNN 마무리(Galaxy chip 16 문제는 새 호스트에서 재현되는지부터 확인) → Phase 7 → G1 1칩/멀티칩 → 8.7 SAC.
+
 ## 5. 작업 방식과 보고
 - 진행 상황은 `changh95/tt_rsl_rl`의 `docs/porting/PROGRESS.md`에 기록하고, 작업 단위마다 갱신해 커밋·push한다: 날짜, Phase, 완료 / 다음 / 막힌 것 / 핵심 수치, 관련 커밋 해시. README에는 Phase별 상태 표(대기/진행/완료)를 두고 PROGRESS.md와 함께 갱신한다.
 - Phase 완료 시: 기능 브랜치를 `main`에 병합하고, `phase-N-done` 태그를 달고, PROGRESS.md에 완료 기준 충족 근거(테스트 결과, 수치, 그래프 경로)를 남긴다.
