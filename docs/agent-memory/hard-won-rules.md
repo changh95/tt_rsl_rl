@@ -1,0 +1,11 @@
+# Hard-won rules (details in docs/porting/TTNN_ISSUES.md, TOLERANCES.md)
+
+- **T-15 (trace state):** a trace's intermediates are freed after capture but rewritten by every replay. Anything that must survive across replays (rollout slots, Adam state, accumulators, staging buffers) is allocated BEFORE the first capture. One `TTPPO` per process; never interleave two algorithms' replays.
+- A replay overwrites tensors allocated after its capture that live across it: do traced work first (e.g. the RND reward first in `process_env_step`), stage into persistent buffers. Eager storage keeps REFERENCES: never hand it a persistent staging buffer.
+- **No `ttnn.all_reduce` for fp32** (5.5e-4 error): cross-chip sums = all_gather on every mesh axis + fp32 `ttnn.sum` (`TTContext.sum_over_chips`).
+- **Multi-chip semantics = upstream multi-GPU:** chip-local loss / advantage normalisation / shuffle; gradients and KL averaged over chips; global normaliser stats.
+- Bit identity of rows holds only for the same chip count (matmul config depends on rows per chip); N-vs-1 comparisons are in function space.
+- Tolerances are never loosened to pass; a failing assumption is root-caused and documented. A hand-written noise baseline must match the noise that matters (forward noise for regression losses). A group that hardly changes between steps hides storage bugs in parity tests.
+- State-dependent std makes entropy depend on matmul noise (own tolerance row); gradient tests keep the std away from clamp boundaries.
+- **Device debugging:** debug inside pytest with a SHORT timeout (120 s), never scratch scripts with long timeouts; run whole test files (never `survives_load` alone with `-k`); tee output into `.run/incidents/`. Exit 124 = timeout = stop and report.
+- **Hooks (`.claude/hooks/tray_guard.*`):** device jobs only through `scripts/tt_run.sh` (chips written literally, no variables); the hook blocks command TEXT that mentions the mesh-opening function (write device scripts with the Write tool), `-m tt` outside `tt_run.sh` (even `--collect-only`), listing the device directory, `rm` under /tmp, killing unrecorded PIDs. Poll loops must remove the old log first. Mesh shape of device tests via `TT_TEST_MESH` matching `--chips`. `*.pt` is git-ignored: fixtures use `.npz`.

@@ -105,3 +105,7 @@ git diff v5.5.2 -- rsl_rl/        # must be empty (also tested)
 - `docs/porting/UPSTREAM_MAP.md`, `UPSTREAM_SEMANTICS.md`, `TTRL_NOTES.md`, `TTNN_OP_SURVEY.md`, `ENV.md`
 - `examples/` runnable examples (`g1_walk/`) · `rsl_rl/` upstream (untouched) · `rsl_rl_tt/` TT implementation (`device.py` = the only place that opens devices; `testing/` = host-only CPU envs, reference runs, golden access, parity utilities) · `tests/tt/` · `scripts/` · `.claude/`
 - `docs/porting/golden/` golden baselines of the upstream reference (regenerate: `python scripts/train_reference.py`)
+
+## Agent memory
+Durable notes for Claude Code (owner preferences, project state, lessons) are in `docs/agent-memory/` — read `MEMORY.md` there at the start of a session and keep it updated (no machine identifiers, see its README).
+@docs/agent-memory/MEMORY.md

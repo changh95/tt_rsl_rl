@@ -1,0 +1,4 @@
+- [Owner preferences](owner-preferences.md) — Korean reports (3-line → numbers → decisions), English code/docs/commits; proceed phase to phase without asking; merge/tag/push rules
+- [Project state](project-state.md) — phases 0-7 and 8.1-8.5 done; 8.6 CNN blocked on a device timeout; next: new hosts, Phase 7 on the GPU host, G1 on 1 and N chips, 8.7 SAC
+- [Hard-won rules](hard-won-rules.md) — trace state (T-15), multi-chip semantics, fp32 reductions, tolerances, debugging device jobs, hook quirks
+- [Hosts](hosts.md) — Galaxy era is over; what must be redone on each new host before opening a device
