@@ -68,3 +68,11 @@ No process of mine is left. **The chip state after this second timeout is UNKNOW
 
 **Needed from the owner**: a go for ONE smoke test on chip 16 (to see whether the node still opens) and, if it does not open, a reset (by the owner, or approved again).
 Rules for the debug jobs after that: never run `survives_load` alone, run the whole file; capture the output with `tee` into `.run/incidents/` and use `-s`; 120 s timeout.
+
+## Owner decision after the second timeout (2026-11-12)
+
+The owner allowed one smoke test and, if the node does not open, a reset of chip 16 by me. Smoke test (`.run/incidents/2026-11-12_chip16_smoke_after_second_timeout.log`): FAILED in 4.8 s with the signature of the first incident,
+`MMIO per-op timeout: 4B load took 55518 us (budget=2 ms)` and `Setting power state failed on device 16: Invalid argument`. So both timeouts left chip 16 unopenable (and the earlier recovery was not stable or not caused by the interrupted reset).
+Reset started as the same narrow job, in the background so that a cut session cannot interrupt it, output in `.run/incidents/2026-11-12_chip16_reset_2.log`:
+
+    scripts/tt_run.sh --chips 16 --timeout 300 --tag p8creset2 -- tt-smi -r 16
